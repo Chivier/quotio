@@ -52,6 +52,11 @@ nonisolated struct CodexQuotaAccountIdentity: Sendable {
     let accountID: String?
 }
 
+nonisolated struct CodexAccountQuotaResult: Sendable {
+    let accountKey: String
+    let quota: ProviderQuotaData
+}
+
 /// Fetches quota from Codex CLI auth file
 actor CodexCLIQuotaFetcher {
     private let usageURL = "https://chatgpt.com/backend-api/wham/usage"
@@ -328,6 +333,11 @@ actor CodexCLIQuotaFetcher {
                     accessToken = refreshed.accessToken
                     refreshToken = refreshed.refreshToken ?? currentRefresh
                     try persistRefresh(refreshed, originalRefreshToken: currentRefresh, path: source.path)
+                    if let refreshedClaims = refreshed.idToken.flatMap(decodeJWT) {
+                        email = refreshedClaims.email ?? email
+                        planType = refreshedClaims.planType ?? planType
+                        accountId = accountId ?? refreshedClaims.accountId
+                    }
                 } catch {
                     Log.quota("Failed to refresh Codex token")
                 }
@@ -348,16 +358,29 @@ actor CodexCLIQuotaFetcher {
                     let latestClaims = latestTokens?.idToken.flatMap(decodeJWT)
                     let refreshed = try await refreshAccessToken(refreshToken: currentRefresh)
                     try persistRefresh(refreshed, originalRefreshToken: currentRefresh, path: source.path)
+                    let refreshedClaims = refreshed.idToken.flatMap(decodeJWT) ?? latestClaims
+                    email = refreshedClaims?.email ?? email
+                    planType = refreshedClaims?.planType ?? planType
+                    accountId = latestTokens?.accountId ?? refreshedClaims?.accountId ?? accountId
                     quota = try await fetchQuota(
                         accessToken: refreshed.accessToken,
-                        accountId: latestTokens?.accountId ?? latestClaims?.accountId ?? accountId,
-                        identity: CodexQuotaIdentity(planType: latestClaims?.planType ?? planType)
+                        accountId: accountId,
+                        identity: CodexQuotaIdentity(planType: planType)
                     )
                 }
 #if DEBUG
                 Log.quota("finalPlan=\(quota.planType ?? "<nil>") jwt=\(planType ?? "<nil>")")
 #endif
-                if results[email] == nil { results[email] = quota }
+                let key = canonicalLocalKey(
+                    email: email,
+                    accountID: accountId,
+                    fallback: "Codex User"
+                )
+                if results[key] == nil {
+                    var displayedQuota = quota
+                    displayedQuota.accountDisplayName = email
+                    results[key] = displayedQuota
+                }
             } catch {
                 Log.quota("Failed to fetch Codex quota for local credential: \(error.localizedDescription)")
             }
@@ -370,11 +393,51 @@ actor CodexCLIQuotaFetcher {
 
     /// Fetches only the credential represented by the canonical account key.
     func fetchQuota(forAccountKey accountKey: String) async -> ProviderQuotaData? {
-        if let account = await MonitorCredentialVault.shared.accounts().first(where: {
-            $0.provider == .codex && !$0.isDisabled && $0.accountKey == accountKey
-        }), let quota = await fetchOwnedQuota(account) {
-            return quota
+        await fetchQuotaResult(forAccountKey: accountKey)?.quota
+    }
+
+    /// Foreground Monitor refreshes may ask macOS to authorize an existing
+    /// Quotio-owned Keychain item. All scheduled/provider-wide paths continue to
+    /// use `fetchAsProviderQuota()` and therefore remain strictly prompt-free.
+    func fetchQuotaResult(
+        forAccountKey accountKey: String,
+        allowUserInteraction: Bool = false
+    ) async -> CodexAccountQuotaResult? {
+        var matchedOwnedAccount = false
+        for account in await MonitorCredentialVault.shared.accounts() where account.provider == .codex && !account.isDisabled {
+            let mayIdentifyAccount = Self.accountKeyMayIdentifyStoredAccount(
+                accountKey,
+                metadataKey: account.accountKey,
+                displayName: account.displayName
+            )
+            matchedOwnedAccount = matchedOwnedAccount || mayIdentifyAccount
+            var credential = await MonitorCredentialVault.shared.credential(for: account.id)
+            if credential == nil,
+               allowUserInteraction,
+               mayIdentifyAccount {
+                credential = await MonitorCredentialVault.shared.credentialForUserInitiatedAccess(for: account.id)
+            }
+            guard let credential else { continue }
+            let claims = credential.idToken.flatMap(decodeJWT)
+            let key = canonicalLocalKey(
+                email: claims?.email ?? account.displayName,
+                accountID: credential.accountID ?? claims?.accountId,
+                fallback: account.accountKey
+            )
+            if (Self.accountKeysMatch(account.accountKey, accountKey) || Self.accountKeysMatch(key, accountKey)),
+               let quota = await fetchOwnedQuota(
+                   account,
+                   initialCredential: credential,
+                   allowUserInteractionForPersistence: allowUserInteraction
+               ) {
+                return CodexAccountQuotaResult(accountKey: key, quota: quota)
+            }
         }
+
+        // Once an account key identifies an app-owned login, never satisfy that
+        // request with a same-named credential from another source. That would
+        // silently show one workspace's quota on another workspace's row.
+        if matchedOwnedAccount { return nil }
 
         if let record = KeychainHelper.readExternalCredentialRecord(service: "Codex Auth"),
            let auth = try? JSONDecoder().decode(CodexCLIAuthFile.self, from: record.data),
@@ -385,8 +448,9 @@ actor CodexCLIQuotaFetcher {
                 accountID: tokens.accountId ?? claims?.accountId,
                 fallback: "Codex"
             )
-            if key == accountKey, let quota = await fetchNativeKeychainQuotas().values.first {
-                return quota
+            if Self.accountKeysMatch(key, accountKey),
+               let quota = await fetchNativeKeychainQuotas().values.first {
+                return CodexAccountQuotaResult(accountKey: key, quota: quota)
             }
         }
 
@@ -398,8 +462,10 @@ actor CodexCLIQuotaFetcher {
                 accountID: tokens.accountId ?? claims?.accountId,
                 fallback: "Codex User"
             )
-            guard key == accountKey else { continue }
-            return await fetchLocalAuthQuota(source: source, claims: claims)
+            guard Self.accountKeysMatch(key, accountKey),
+                  let quota = await fetchLocalAuthQuota(source: source, claims: claims)
+            else { continue }
+            return CodexAccountQuotaResult(accountKey: key, quota: quota)
         }
 
         let directory = NSString(string: "~/.cli-proxy-api").expandingTildeInPath
@@ -407,13 +473,75 @@ actor CodexCLIQuotaFetcher {
             $0.hasPrefix("codex-") && $0.hasSuffix(".json") && $0.codexFilenameKey == accountKey
         }) else { return nil }
         let path = (directory as NSString).appendingPathComponent(filename)
-        return await fetchLegacyQuota(at: path)
+        guard let quota = await fetchLegacyQuota(at: path) else { return nil }
+        return CodexAccountQuotaResult(accountKey: accountKey, quota: quota)
+    }
+
+    nonisolated static func accountKeysMatch(_ lhs: String, _ rhs: String) -> Bool {
+        lhs.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            == rhs.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    /// Older Monitor metadata used only the email while quota snapshots may
+    /// already contain the newer `email • fingerprint` key. Recognize that
+    /// narrow migration shape before asking Keychain for the credential; the
+    /// exact canonical key is still verified after the credential is decoded.
+    nonisolated static func accountKeyMayIdentifyStoredAccount(
+        _ requestedKey: String,
+        metadataKey: String,
+        displayName: String
+    ) -> Bool {
+        if accountKeysMatch(requestedKey, metadataKey) { return true }
+
+        // A metadata key that already carries a fingerprint identifies exactly
+        // one workspace. Its plain display email and sibling fingerprints must
+        // remain available to their own credential sources.
+        if hasFingerprintSuffix(metadataKey) { return false }
+        if accountKeysMatch(requestedKey, displayName) { return true }
+
+        let normalizedRequested = requestedKey
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        for base in [metadataKey, displayName] {
+            let normalizedBase = base
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            let prefix = normalizedBase + " • "
+            guard normalizedRequested.hasPrefix(prefix) else { continue }
+            let suffix = normalizedRequested.dropFirst(prefix.count)
+            if suffix.count == 8, suffix.allSatisfy(\.isHexDigit) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private nonisolated static func hasFingerprintSuffix(_ accountKey: String) -> Bool {
+        guard let delimiter = accountKey.range(of: " • ", options: .backwards) else { return false }
+        let suffix = accountKey[delimiter.upperBound...]
+        return suffix.count == 8 && suffix.allSatisfy(\.isHexDigit)
     }
 
     private func canonicalLocalKey(email: String?, accountID: String?, fallback: String) -> String {
-        guard let accountID, !accountID.isEmpty else { return email ?? fallback }
-        let aliases = readLegacyIdentities().filter { $0.accountID == accountID }.map(\.key)
-        return Set(aliases).count == 1 ? aliases[0] : (email ?? accountID)
+        let normalizedAccountID = accountID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        var aliases: [String: String] = [:]
+        if let normalizedAccountID, !normalizedAccountID.isEmpty {
+            let matchingAliases = Set(readLegacyIdentities().compactMap { identity -> String? in
+                guard identity.accountID?.trimmingCharacters(in: .whitespacesAndNewlines) == normalizedAccountID else {
+                    return nil
+                }
+                return identity.key
+            })
+            if matchingAliases.count == 1, let alias = matchingAliases.first {
+                aliases[normalizedAccountID] = alias
+            }
+        }
+        return CodexAccountKey.canonical(
+            email: email,
+            accountID: accountID,
+            aliases: aliases,
+            fallback: fallback
+        )
     }
 
     private func fetchLocalAuthQuota(
@@ -429,22 +557,26 @@ actor CodexCLIQuotaFetcher {
             refreshToken = refreshed.refreshToken ?? currentRefreshToken
         }
         do {
-            return try await fetchQuota(
+            var quota = try await fetchQuota(
                 accessToken: accessToken,
                 accountId: tokens.accountId ?? claims?.accountId,
                 identity: CodexQuotaIdentity(planType: claims?.planType)
             )
+            quota.accountDisplayName = claims?.email
+            return quota
         } catch CodexCLIQuotaError.httpError(let status) where status == 401 || status == 403 {
             guard let latest = readAuthFile(at: source.path)?.tokens,
                   let refresh = latest.refreshToken ?? refreshToken,
                   let refreshed = try? await refreshAccessToken(refreshToken: refresh) else { return nil }
             try? persistRefresh(refreshed, originalRefreshToken: refresh, path: source.path)
             let latestClaims = latest.idToken.flatMap(decodeJWT)
-            return try? await fetchQuota(
+            guard var quota = try? await fetchQuota(
                 accessToken: refreshed.accessToken,
                 accountId: latest.accountId ?? latestClaims?.accountId ?? claims?.accountId,
                 identity: CodexQuotaIdentity(planType: latestClaims?.planType ?? claims?.planType)
-            )
+            ) else { return nil }
+            quota.accountDisplayName = latestClaims?.email ?? claims?.email
+            return quota
         } catch {
             return nil
         }
@@ -511,10 +643,15 @@ actor CodexCLIQuotaFetcher {
     private func currentAccountIdentities() async -> [CodexQuotaAccountIdentity] {
         var current = readAuthSources().map { source in
             let claims = source.auth.tokens?.idToken.flatMap(decodeJWT)
+            let accountID = source.auth.tokens?.accountId ?? claims?.accountId
             return CodexQuotaAccountIdentity(
-                key: claims?.email ?? source.auth.tokens?.accountId ?? "Codex User",
+                key: canonicalLocalKey(
+                    email: claims?.email,
+                    accountID: accountID,
+                    fallback: "Codex User"
+                ),
                 email: claims?.email,
-                accountID: source.auth.tokens?.accountId ?? claims?.accountId
+                accountID: accountID
             )
         }
 
@@ -522,20 +659,30 @@ actor CodexCLIQuotaFetcher {
            let auth = try? JSONDecoder().decode(CodexCLIAuthFile.self, from: record.data),
            let tokens = auth.tokens {
             let claims = tokens.idToken.flatMap(decodeJWT)
+            let accountID = tokens.accountId ?? claims?.accountId
             current.append(CodexQuotaAccountIdentity(
-                key: claims?.email ?? tokens.accountId ?? "Codex",
+                key: canonicalLocalKey(
+                    email: claims?.email,
+                    accountID: accountID,
+                    fallback: "Codex"
+                ),
                 email: claims?.email,
-                accountID: tokens.accountId ?? claims?.accountId
+                accountID: accountID
             ))
         }
 
         for account in await MonitorCredentialVault.shared.accounts().filter({ $0.provider == .codex }) {
             guard let credential = await MonitorCredentialVault.shared.credential(for: account.id) else { continue }
             let claims = credential.idToken.flatMap(decodeJWT)
+            let accountID = credential.accountID ?? claims?.accountId
             current.append(CodexQuotaAccountIdentity(
-                key: account.accountKey,
-                email: claims?.email,
-                accountID: credential.accountID ?? claims?.accountId
+                key: canonicalLocalKey(
+                    email: claims?.email ?? account.displayName,
+                    accountID: accountID,
+                    fallback: account.accountKey
+                ),
+                email: claims?.email ?? account.displayName,
+                accountID: accountID
             ))
         }
         return current
@@ -591,6 +738,27 @@ actor CodexCLIQuotaFetcher {
                 reconciled.removeValue(forKey: key)
             }
         }
+
+        // Versions that keyed a Quotio-owned or native Codex login by email can
+        // leave that old snapshot row beside the new account-ID-qualified key.
+        // Remove only an email alias that is no longer a canonical current key
+        // and is not the real filename key of a distinct legacy account.
+        let currentByEmail = Dictionary(grouping: current.compactMap { identity -> (String, CodexQuotaAccountIdentity)? in
+            guard let email = identity.email?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                  !email.isEmpty else { return nil }
+            return (email, identity)
+        }, by: \.0)
+        for (email, entries) in currentByEmail {
+            let currentIdentities = entries.map(\.1)
+            guard currentIdentities.allSatisfy({ $0.key.lowercased() != email }) else { continue }
+            let emailIsLegacyFilenameKey = legacyByEmail[email, default: []]
+                .map(\.1)
+                .contains { $0.key.lowercased() == email }
+            guard !emailIsLegacyFilenameKey else { continue }
+            for key in reconciled.keys where key.lowercased() == email {
+                reconciled.removeValue(forKey: key)
+            }
+        }
         return reconciled
     }
 
@@ -637,7 +805,9 @@ actor CodexCLIQuotaFetcher {
 
             do {
                 do {
-                    results[key] = try await fetchQuota(accessToken: accessToken, accountId: accountID, identity: identity)
+                    var quota = try await fetchQuota(accessToken: accessToken, accountId: accountID, identity: identity)
+                    quota.accountDisplayName = claims?.email
+                    results[key] = quota
                 } catch CodexCLIQuotaError.httpError(let status) where status == 401 || status == 403 {
                     guard let latestData = try? Data(contentsOf: URL(fileURLWithPath: path)),
                           let latest = try? JSONDecoder().decode(CodexAuthFile.self, from: latestData),
@@ -645,11 +815,13 @@ actor CodexCLIQuotaFetcher {
                     let latestClaims = latest.idToken.flatMap(decodeJWT)
                     let refreshed = try await refreshAccessToken(refreshToken: latestRefreshToken)
                     persistLegacyRefresh(refreshed, originalRefreshToken: latestRefreshToken, path: path)
-                    results[key] = try await fetchQuota(
+                    var quota = try await fetchQuota(
                         accessToken: refreshed.accessToken,
                         accountId: latest.accountId ?? latestClaims?.accountId ?? accountID,
                         identity: CodexQuotaIdentity(planType: latestClaims?.planType ?? claims?.planType)
                     )
+                    quota.accountDisplayName = latestClaims?.email ?? claims?.email
+                    results[key] = quota
                 }
             } catch {
                 Log.quota("Failed to fetch Codex quota for legacy credential: \(error.localizedDescription)")
@@ -671,11 +843,13 @@ actor CodexCLIQuotaFetcher {
             refreshToken = refreshed.refreshToken ?? currentRefreshToken
         }
         do {
-            return try await fetchQuota(
+            var quota = try await fetchQuota(
                 accessToken: accessToken,
                 accountId: auth.accountId ?? claims?.accountId,
                 identity: CodexQuotaIdentity(planType: claims?.planType)
             )
+            quota.accountDisplayName = claims?.email
+            return quota
         } catch CodexCLIQuotaError.httpError(let status) where status == 401 || status == 403 {
             guard let latestData = try? Data(contentsOf: URL(fileURLWithPath: path)),
                   let latest = try? JSONDecoder().decode(CodexAuthFile.self, from: latestData),
@@ -683,11 +857,13 @@ actor CodexCLIQuotaFetcher {
                   let refreshed = try? await refreshAccessToken(refreshToken: refresh) else { return nil }
             persistLegacyRefresh(refreshed, originalRefreshToken: refresh, path: path)
             let latestClaims = latest.idToken.flatMap(decodeJWT)
-            return try? await fetchQuota(
+            guard var quota = try? await fetchQuota(
                 accessToken: refreshed.accessToken,
                 accountId: latest.accountId ?? latestClaims?.accountId ?? claims?.accountId,
                 identity: CodexQuotaIdentity(planType: latestClaims?.planType ?? claims?.planType)
-            )
+            ) else { return nil }
+            quota.accountDisplayName = latestClaims?.email ?? claims?.email
+            return quota
         } catch {
             return nil
         }
@@ -698,8 +874,7 @@ actor CodexCLIQuotaFetcher {
               var auth = try? JSONDecoder().decode(CodexCLIAuthFile.self, from: record.data),
               var tokens = auth.tokens,
               var accessToken = tokens.accessToken else { return [:] }
-        let claims = tokens.idToken.flatMap(decodeJWT)
-        let key = claims?.email ?? tokens.accountId ?? "Codex"
+        var claims = tokens.idToken.flatMap(decodeJWT)
         do {
             if isTokenExpired(accessToken: accessToken), let refresh = tokens.refreshToken {
                 let refreshed = try await refreshAccessToken(refreshToken: refresh)
@@ -707,6 +882,7 @@ actor CodexCLIQuotaFetcher {
                 tokens.accessToken = refreshed.accessToken
                 tokens.refreshToken = refreshed.refreshToken ?? refresh
                 tokens.idToken = refreshed.idToken ?? tokens.idToken
+                claims = tokens.idToken.flatMap(decodeJWT)
                 auth.tokens = tokens
                 if let data = try? JSONEncoder().encode(auth) {
                     _ = KeychainHelper.compareAndSwapExternalCredential(
@@ -718,11 +894,18 @@ actor CodexCLIQuotaFetcher {
                 }
             }
             do {
-                return [key: try await fetchQuota(
+                let key = canonicalLocalKey(
+                    email: claims?.email,
+                    accountID: tokens.accountId ?? claims?.accountId,
+                    fallback: "Codex"
+                )
+                var quota = try await fetchQuota(
                     accessToken: accessToken,
                     accountId: tokens.accountId ?? claims?.accountId,
                     identity: CodexQuotaIdentity(planType: claims?.planType)
-                )]
+                )
+                quota.accountDisplayName = claims?.email
+                return [key: quota]
             } catch CodexCLIQuotaError.httpError(let status) where status == 401 || status == 403 {
                 guard let latest = KeychainHelper.readExternalCredentialRecord(service: "Codex Auth", account: record.account),
                       let latestAuth = try? JSONDecoder().decode(CodexCLIAuthFile.self, from: latest.data),
@@ -731,11 +914,19 @@ actor CodexCLIQuotaFetcher {
                 let latestClaims = latestTokens.idToken.flatMap(decodeJWT)
                 let refreshed = try await refreshAccessToken(refreshToken: refresh)
                 persistNativeKeychainRefresh(refreshed, originalRefreshToken: refresh, account: record.account)
-                return [key: try await fetchQuota(
+                let refreshedClaims = refreshed.idToken.flatMap(decodeJWT) ?? latestClaims
+                let key = canonicalLocalKey(
+                    email: refreshedClaims?.email ?? claims?.email,
+                    accountID: latestTokens.accountId ?? refreshedClaims?.accountId ?? claims?.accountId,
+                    fallback: "Codex"
+                )
+                var quota = try await fetchQuota(
                     accessToken: refreshed.accessToken,
-                    accountId: latestTokens.accountId ?? latestClaims?.accountId,
-                    identity: CodexQuotaIdentity(planType: latestClaims?.planType)
-                )]
+                    accountId: latestTokens.accountId ?? refreshedClaims?.accountId,
+                    identity: CodexQuotaIdentity(planType: refreshedClaims?.planType)
+                )
+                quota.accountDisplayName = refreshedClaims?.email ?? claims?.email
+                return [key: quota]
             }
         } catch {
             return [:]
@@ -779,12 +970,20 @@ actor CodexCLIQuotaFetcher {
                     try await MonitorCredentialVault.shared.save(credential, metadata: account)
                 }
                 let claims = credential.idToken.flatMap(decodeJWT)
+                let displayName = claims?.email ?? account.displayName
+                let key = canonicalLocalKey(
+                    email: displayName,
+                    accountID: credential.accountID ?? claims?.accountId,
+                    fallback: account.accountKey
+                )
                 do {
-                    results[account.accountKey] = try await fetchQuota(
+                    var quota = try await fetchQuota(
                         accessToken: credential.accessToken,
                         accountId: credential.accountID ?? claims?.accountId,
                         identity: CodexQuotaIdentity(planType: claims?.planType)
                     )
+                    quota.accountDisplayName = displayName
+                    results[key] = quota
                 } catch CodexCLIQuotaError.httpError(let status) where status == 401 || status == 403 {
                     if let latest = await MonitorCredentialVault.shared.reloadLatest(accountID: account.id) {
                         credential = latest
@@ -796,11 +995,20 @@ actor CodexCLIQuotaFetcher {
                     credential.idToken = refreshed.idToken ?? credential.idToken
                     credential.expiresAt = refreshed.expiresIn.map { Date().addingTimeInterval(TimeInterval($0)) }
                     try await MonitorCredentialVault.shared.save(credential, metadata: account)
-                    results[account.accountKey] = try await fetchQuota(
-                        accessToken: credential.accessToken,
-                        accountId: credential.accountID ?? claims?.accountId,
-                        identity: CodexQuotaIdentity(planType: claims?.planType)
+                    let latestClaims = credential.idToken.flatMap(decodeJWT)
+                    let latestDisplayName = latestClaims?.email ?? displayName
+                    let latestKey = canonicalLocalKey(
+                        email: latestDisplayName,
+                        accountID: credential.accountID ?? latestClaims?.accountId,
+                        fallback: key
                     )
+                    var quota = try await fetchQuota(
+                        accessToken: credential.accessToken,
+                        accountId: credential.accountID ?? latestClaims?.accountId,
+                        identity: CodexQuotaIdentity(planType: latestClaims?.planType ?? claims?.planType)
+                    )
+                    quota.accountDisplayName = latestDisplayName
+                    results[latestKey] = quota
                 }
             } catch {
                 Log.quota("Failed to fetch Codex quota for Quotio credential")
@@ -809,8 +1017,18 @@ actor CodexCLIQuotaFetcher {
         return results
     }
 
-    private func fetchOwnedQuota(_ account: MonitorAccount) async -> ProviderQuotaData? {
-        guard var credential = await MonitorCredentialVault.shared.credential(for: account.id) else { return nil }
+    private func fetchOwnedQuota(
+        _ account: MonitorAccount,
+        initialCredential: MonitorOAuthCredential? = nil,
+        allowUserInteractionForPersistence: Bool = false
+    ) async -> ProviderQuotaData? {
+        let storedCredential: MonitorOAuthCredential?
+        if let initialCredential {
+            storedCredential = initialCredential
+        } else {
+            storedCredential = await MonitorCredentialVault.shared.credential(for: account.id)
+        }
+        guard var credential = storedCredential else { return nil }
         do {
             if credential.expiresAt.map({ $0.timeIntervalSinceNow < 300 }) ?? isTokenExpired(accessToken: credential.accessToken),
                let refresh = credential.refreshToken {
@@ -819,7 +1037,11 @@ actor CodexCLIQuotaFetcher {
                 credential.refreshToken = refreshed.refreshToken ?? refresh
                 credential.idToken = refreshed.idToken ?? credential.idToken
                 credential.expiresAt = refreshed.expiresIn.map { Date().addingTimeInterval(TimeInterval($0)) }
-                try await MonitorCredentialVault.shared.save(credential, metadata: account)
+                try await persistOwnedCredential(
+                    credential,
+                    metadata: account,
+                    allowUserInteraction: allowUserInteractionForPersistence
+                )
             }
             let claims = credential.idToken.flatMap(decodeJWT)
             do {
@@ -838,7 +1060,11 @@ actor CodexCLIQuotaFetcher {
                 credential.refreshToken = refreshed.refreshToken ?? refresh
                 credential.idToken = refreshed.idToken ?? credential.idToken
                 credential.expiresAt = refreshed.expiresIn.map { Date().addingTimeInterval(TimeInterval($0)) }
-                try await MonitorCredentialVault.shared.save(credential, metadata: account)
+                try await persistOwnedCredential(
+                    credential,
+                    metadata: account,
+                    allowUserInteraction: allowUserInteractionForPersistence
+                )
                 let latestClaims = credential.idToken.flatMap(decodeJWT)
                 return try await fetchQuota(
                     accessToken: credential.accessToken,
@@ -848,6 +1074,18 @@ actor CodexCLIQuotaFetcher {
             }
         } catch {
             return nil
+        }
+    }
+
+    private func persistOwnedCredential(
+        _ credential: MonitorOAuthCredential,
+        metadata account: MonitorAccount,
+        allowUserInteraction: Bool
+    ) async throws {
+        if allowUserInteraction {
+            try await MonitorCredentialVault.shared.saveUserInitiated(credential, metadata: account)
+        } else {
+            try await MonitorCredentialVault.shared.save(credential, metadata: account)
         }
     }
 

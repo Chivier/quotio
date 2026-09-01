@@ -149,4 +149,47 @@ final class AccountSortingTests: XCTestCase {
         let ordered = StatusBarMenuBuilder.orderedAccounts([:], provider: .antigravity) { _ in true }
         XCTAssertTrue(ordered.isEmpty)
     }
+
+    // MARK: - Tracked accounts without quota
+
+    private func trackedAccount(_ key: String, disabled: Bool = false) -> MonitorAccount {
+        var account = MonitorAccount.make(
+            provider: .codex,
+            accountKey: key,
+            source: .quotioKeychain,
+            canDelete: true
+        )
+        account.isDisabled = disabled
+        return account
+    }
+
+    func testMenuBarListsTrackedAccountWithoutQuotaAfterQuotaRows() {
+        let quotas: [String: ProviderQuotaData] = [
+            "first@example.com": quota(displayName: "first@example.com"),
+        ]
+        let ordered = StatusBarMenuBuilder.orderedAccounts(quotas, provider: .codex) { _ in false }
+
+        let rows = StatusBarMenuBuilder.accountRows(
+            quotaRows: ordered,
+            trackedAccounts: [
+                trackedAccount("first@example.com"),
+                trackedAccount("second@example.com"),
+            ]
+        ) { _ in "sign in again" }
+
+        XCTAssertEqual(rows.map(\.accountKey), ["first@example.com", "second@example.com"])
+        XCTAssertNotNil(rows[0].data)
+        XCTAssertNil(rows[0].statusMessage)
+        XCTAssertNil(rows[1].data)
+        XCTAssertEqual(rows[1].statusMessage, "sign in again")
+    }
+
+    func testMenuBarSkipsDisabledTrackedAccountWithoutQuota() {
+        let rows = StatusBarMenuBuilder.accountRows(
+            quotaRows: [],
+            trackedAccounts: [trackedAccount("hidden@example.com", disabled: true)]
+        ) { _ in nil }
+
+        XCTAssertTrue(rows.isEmpty)
+    }
 }

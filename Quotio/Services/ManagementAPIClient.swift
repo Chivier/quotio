@@ -213,7 +213,7 @@ actor ManagementAPIClient {
         var endpoint = provider.oauthEndpoint
         var queryParams: [String] = []
         
-        let webUIProviders: [AIProvider] = [.antigravity, .claude, .codex, .iflow, .kiro]
+        let webUIProviders: [AIProvider] = [.antigravity, .claude, .codex, .iflow, .kiro, .kimi]
         if webUIProviders.contains(provider) {
             queryParams.append("is_webui=true")
         }

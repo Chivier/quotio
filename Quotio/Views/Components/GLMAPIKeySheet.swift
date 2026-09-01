@@ -246,7 +246,7 @@ enum GLMEndpoint: String, CaseIterable, Codable, Identifiable, Sendable {
     var baseURL: String {
         switch self {
         case .zai: return "https://api.z.ai"
-        case .bigmodel: return "https://bigmodel.cn"
+        case .bigmodel: return "https://open.bigmodel.cn"
         }
     }
 }

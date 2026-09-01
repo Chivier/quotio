@@ -92,6 +92,23 @@ nonisolated struct MonitorAccount: Identifiable, Codable, Hashable, Sendable {
 nonisolated struct MonitorRefreshIssue: Codable, Hashable, Sendable {
     let message: String
     let occurredAt: Date
+    /// When present, only these account keys failed during a partial provider refresh.
+    /// A provider-wide failure leaves this nil so every account can surface the issue.
+    let affectedAccountKeys: Set<String>?
+
+    init(message: String, occurredAt: Date, affectedAccountKeys: Set<String>? = nil) {
+        self.message = message
+        self.occurredAt = occurredAt
+        self.affectedAccountKeys = affectedAccountKeys
+    }
+
+    func affects(accountKey: String) -> Bool {
+        guard let affectedAccountKeys else { return true }
+        let normalized = accountKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return affectedAccountKeys.contains {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == normalized
+        }
+    }
 }
 
 nonisolated struct MonitorRefreshBatch: Sendable {
@@ -106,12 +123,39 @@ nonisolated protocol MonitorProviderRuntime: Sendable {
     func refresh(force: Bool) async -> [String: ProviderQuotaData]
 }
 
+/// Whether a Quotio-owned credential is usable, gone, or present-but-unreadable.
+///
+/// The last case matters on its own: the prompt-free Keychain read fails closed
+/// when the item's ACL is bound to another code identity, and mapping that to
+/// "no credential" makes the account vanish from every quota surface with no
+/// error anywhere.
+nonisolated enum MonitorStoredCredentialState: Equatable, Sendable {
+    case available
+    case absent
+    case unreadable
+}
+
 nonisolated protocol MonitorCredentialStore: Sendable {
     func accounts() async -> [MonitorAccount]
     func credential(for accountID: String) async -> MonitorOAuthCredential?
+    /// Read an existing credential in direct response to a foreground user action.
+    /// Production Keychain storage may use this path to present an ACL prompt;
+    /// background refreshes must continue to call `credential(for:)` instead.
+    func credentialForUserInitiatedAccess(for accountID: String) async -> MonitorOAuthCredential?
     func reloadLatest(accountID: String) async -> MonitorOAuthCredential?
     func save(_ credential: MonitorOAuthCredential, metadata: MonitorAccount) async throws
     func delete(accountID: String) async
+    func credentialState(for accountID: String) async -> MonitorStoredCredentialState
+}
+
+extension MonitorCredentialStore {
+    func credentialForUserInitiatedAccess(for accountID: String) async -> MonitorOAuthCredential? {
+        await credential(for: accountID)
+    }
+
+    func credentialState(for accountID: String) async -> MonitorStoredCredentialState {
+        await credential(for: accountID) == nil ? .absent : .available
+    }
 }
 
 nonisolated struct MonitorOAuthCredential: Codable, Sendable {
@@ -123,11 +167,41 @@ nonisolated struct MonitorOAuthCredential: Codable, Sendable {
     var extra: [String: String]
 }
 
+/// Codex exposes both a user-facing email and a ChatGPT account ID. One email can
+/// belong to multiple ChatGPT workspaces, so using the email alone as the quota or
+/// Keychain key silently collapses distinct accounts.
+nonisolated enum CodexAccountKey {
+    static func canonical(
+        email: String?,
+        accountID: String?,
+        aliases: [String: String] = [:],
+        fallback: String
+    ) -> String {
+        let normalizedAccountID = accountID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank
+        if let normalizedAccountID, let alias = aliases[normalizedAccountID]?.nilIfBlank {
+            return alias
+        }
+
+        let base = email?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank
+            ?? fallback
+        guard let normalizedAccountID else { return base }
+        return base + " • " + String(MonitorIdentity.fingerprint(normalizedAccountID).prefix(8))
+    }
+}
+
 actor MonitorCredentialVault: MonitorCredentialStore {
     static let shared = MonitorCredentialVault()
 
     private let metadata: MonitorMetadataStore
     private var loadedGenerations: [String: String] = [:]
+    /// A foreground Keychain authorization may grant this process access without
+    /// rewriting the item. Keep that decoded credential only in memory so later
+    /// background refreshes in the same run remain prompt-free.
+    private var sessionCredentials: [String: MonitorOAuthCredential] = [:]
 
     init(metadata: MonitorMetadataStore = .shared) {
         self.metadata = metadata
@@ -138,9 +212,33 @@ actor MonitorCredentialVault: MonitorCredentialStore {
     }
 
     func credential(for accountID: String) -> MonitorOAuthCredential? {
-        guard let data = KeychainHelper.getMonitorCredential(account: accountID) else { return nil }
+        if case let .success(data) = KeychainHelper.readMonitorCredential(account: accountID),
+           let credential = try? JSONDecoder().decode(MonitorOAuthCredential.self, from: data) {
+            loadedGenerations[accountID] = MonitorIdentity.fingerprint(data.base64EncodedString())
+            return credential
+        }
+        return sessionCredentials[accountID]
+    }
+
+    /// This is intentionally separate from `credential(for:)`: only a direct
+    /// foreground account refresh may call it because macOS can show an access
+    /// authorization prompt.
+    func credentialForUserInitiatedAccess(for accountID: String) -> MonitorOAuthCredential? {
+        guard case let .success(data) = KeychainHelper.readMonitorCredentialUserInitiated(account: accountID),
+              let credential = try? JSONDecoder().decode(MonitorOAuthCredential.self, from: data)
+        else { return nil }
         loadedGenerations[accountID] = MonitorIdentity.fingerprint(data.base64EncodedString())
-        return try? JSONDecoder().decode(MonitorOAuthCredential.self, from: data)
+        sessionCredentials[accountID] = credential
+        return credential
+    }
+
+    func credentialState(for accountID: String) -> MonitorStoredCredentialState {
+        if sessionCredentials[accountID] != nil { return .available }
+        switch KeychainHelper.readMonitorCredential(account: accountID) {
+        case .success: return .available
+        case .absent: return .absent
+        case .unreadable: return .unreadable
+        }
     }
 
     func reloadLatest(accountID: String) -> MonitorOAuthCredential? {
@@ -148,9 +246,29 @@ actor MonitorCredentialVault: MonitorCredentialStore {
     }
 
     func save(_ credential: MonitorOAuthCredential, metadata account: MonitorAccount) async throws {
+        try await save(credential, metadata: account, userInitiated: false)
+    }
+
+    /// Persist a credential produced by a foreground action the user explicitly
+    /// started. This is the only path allowed to surface a macOS Keychain trust
+    /// prompt; automatic refresh and discovery remain prompt-free.
+    func saveUserInitiated(_ credential: MonitorOAuthCredential, metadata account: MonitorAccount) async throws {
+        try await save(credential, metadata: account, userInitiated: true)
+    }
+
+    private func save(
+        _ credential: MonitorOAuthCredential,
+        metadata account: MonitorAccount,
+        userInitiated: Bool
+    ) async throws {
         let data = try JSONEncoder().encode(credential)
         let saved: Bool
-        if let expected = loadedGenerations[account.id] {
+        if userInitiated {
+            // The just-completed login is authoritative for this deterministic
+            // account ID. In particular, it may replace an item owned by an old
+            // ad-hoc Debug signature that background code is unable to read.
+            saved = KeychainHelper.saveMonitorCredentialUserInitiated(data, account: account.id)
+        } else if let expected = loadedGenerations[account.id] {
             saved = KeychainHelper.compareAndSwapMonitorCredential(
                 data,
                 account: account.id,
@@ -160,15 +278,21 @@ actor MonitorCredentialVault: MonitorCredentialStore {
             saved = KeychainHelper.saveMonitorCredential(data, account: account.id)
         }
         guard saved else {
+            if userInitiated,
+               KeychainHelper.monitorCredentialBackend(vaultEnabled: YubiKeySecretVault.isEnabled) == .keychain {
+                throw MonitorRuntimeError.keychainAuthorizationRequired
+            }
             throw MonitorRuntimeError.credentialWriteFailed
         }
         loadedGenerations[account.id] = MonitorIdentity.fingerprint(data.base64EncodedString())
+        sessionCredentials[account.id] = credential
         try await self.metadata.saveAccount(account)
     }
 
     func delete(accountID: String) async {
         KeychainHelper.deleteMonitorCredential(account: accountID)
         loadedGenerations.removeValue(forKey: accountID)
+        sessionCredentials.removeValue(forKey: accountID)
         try? await metadata.deleteAccount(accountID)
     }
 }
@@ -179,6 +303,8 @@ actor MonitorMetadataStore {
     private struct Payload: Codable {
         var accounts: [MonitorAccount] = []
         var disabledAccountIDs: Set<String> = []
+        // Optional so existing accounts-v1.json files decode without a migration.
+        var removedAccountIDs: Set<String>?
     }
 
     private let url: URL
@@ -190,11 +316,13 @@ actor MonitorMetadataStore {
 
     func accounts() -> [MonitorAccount] { load().accounts }
     func disabledAccountIDs() -> Set<String> { load().disabledAccountIDs }
+    func removedAccountIDs() -> Set<String> { load().removedAccountIDs ?? [] }
 
     func saveAccount(_ account: MonitorAccount) throws {
         var payload = load()
         payload.accounts.removeAll { $0.id == account.id }
         payload.accounts.append(account)
+        payload.removedAccountIDs?.remove(account.id)
         try save(payload)
     }
 
@@ -202,6 +330,7 @@ actor MonitorMetadataStore {
         var payload = load()
         payload.accounts.removeAll { $0.id == accountID }
         payload.disabledAccountIDs.remove(accountID)
+        payload.removedAccountIDs?.remove(accountID)
         try save(payload)
     }
 
@@ -210,6 +339,29 @@ actor MonitorMetadataStore {
         if disabled { payload.disabledAccountIDs.insert(accountID) }
         else { payload.disabledAccountIDs.remove(accountID) }
         try save(payload)
+    }
+
+    func setRemoved(_ removed: Bool, accountID: String) throws {
+        var payload = load()
+        var removedIDs = payload.removedAccountIDs ?? []
+        if removed {
+            removedIDs.insert(accountID)
+            payload.disabledAccountIDs.remove(accountID)
+        } else {
+            removedIDs.remove(accountID)
+        }
+        payload.removedAccountIDs = removedIDs.isEmpty ? nil : removedIDs
+        try save(payload)
+    }
+
+    @discardableResult
+    func restoreRemovedAccounts() throws -> Int {
+        var payload = load()
+        let count = payload.removedAccountIDs?.count ?? 0
+        guard count > 0 else { return 0 }
+        payload.removedAccountIDs = nil
+        try save(payload)
+        return count
     }
 
     private func load() -> Payload {
@@ -345,7 +497,10 @@ actor MonitorAccountDiscovery {
         candidates.append(contentsOf: legacy)
 
         let disabled = await metadata.disabledAccountIDs()
-        return Self.selectPreferred(candidates, disabledIDs: disabled)
+        let removed = await metadata.removedAccountIDs()
+        return Self.selectPreferred(candidates, disabledIDs: disabled).filter {
+            !removed.contains($0.id)
+        }
     }
 
     nonisolated static func selectPreferred(
@@ -376,7 +531,13 @@ actor MonitorAccountDiscovery {
     ) -> MonitorAccount {
         guard account.provider == .codex,
               let accountID = accountID?.trimmingCharacters(in: .whitespacesAndNewlines),
-              let canonicalKey = aliases[accountID] else { return account }
+              !accountID.isEmpty else { return account }
+        let canonicalKey = CodexAccountKey.canonical(
+            email: account.displayName,
+            accountID: accountID,
+            aliases: aliases,
+            fallback: account.accountKey
+        )
         return MonitorAccount(
             id: account.id,
             provider: account.provider,
@@ -439,6 +600,39 @@ actor MonitorAccountDiscovery {
         await metadata.disabledAccountIDs()
     }
 
+    func removedAccountIDs() async -> Set<String> {
+        await metadata.removedAccountIDs()
+    }
+
+    func setRemoved(_ removed: Bool, accountID: String) async {
+        try? await metadata.setRemoved(removed, accountID: accountID)
+    }
+
+    func restoreRemovedAccounts() async -> Int {
+        (try? await metadata.restoreRemovedAccounts()) ?? 0
+    }
+
+    func filteringRemovedAccounts(
+        from quotas: [AIProvider: [String: ProviderQuotaData]]
+    ) async -> [AIProvider: [String: ProviderQuotaData]] {
+        let removed = await metadata.removedAccountIDs()
+        guard !removed.isEmpty else { return quotas }
+
+        return quotas.reduce(into: [:]) { result, entry in
+            let visible = entry.value.filter { accountKey, _ in
+                let account = MonitorAccount.make(
+                    provider: entry.key,
+                    accountKey: accountKey,
+                    source: .nativeCredential
+                )
+                return !removed.contains(account.id)
+            }
+            if !visible.isEmpty {
+                result[entry.key] = visible
+            }
+        }
+    }
+
     private func discoverNativeFiles(codexAliases: [String: String]) async -> [MonitorAccount] {
         var accounts: [MonitorAccount] = []
         accounts.append(contentsOf: discoverCodexFiles(aliases: codexAliases))
@@ -457,6 +651,7 @@ actor MonitorAccountDiscovery {
         accounts.append(contentsOf: discoverAmpCredential())
         accounts.append(contentsOf: discoverDevinCredential())
         accounts.append(contentsOf: discoverGrokCredentials())
+        accounts.append(contentsOf: KimiCredentialReader.loadAll().map(\.account))
         let antigravityDatabase = MonitorIdentity.expand("~/Library/Application Support/Antigravity/User/globalStorage/state.vscdb")
         if let token = try? await AntigravityDatabaseService().getCurrentTokenInfo(),
            token.accessToken?.nilIfBlank != nil || token.refreshToken?.nilIfBlank != nil {
@@ -528,9 +723,19 @@ actor MonitorAccountDiscovery {
             let email = MonitorIdentity.jwtString(tokens["id_token"] as? String, claim: "email")
             let accountID = (tokens["account_id"] as? String)
                 ?? MonitorIdentity.jwtNestedString(tokens["id_token"] as? String, namespace: "https://api.openai.com/auth", claim: "chatgpt_account_id")
-            let key = email ?? accountID ?? "Codex"
-            let account = MonitorAccount.make(provider: .codex, accountKey: key, source: .nativeCredential, credentialReference: path)
-            return Self.canonicalizeCodexAccount(account, accountID: accountID, aliases: aliases)
+            let key = CodexAccountKey.canonical(
+                email: email,
+                accountID: accountID,
+                aliases: aliases,
+                fallback: "Codex"
+            )
+            return MonitorAccount.make(
+                provider: .codex,
+                accountKey: key,
+                displayName: email ?? key,
+                source: .nativeCredential,
+                credentialReference: path
+            )
         }
     }
 
@@ -574,8 +779,19 @@ actor MonitorAccountDiscovery {
             let email = MonitorIdentity.jwtString(idToken, claim: "email") ?? "Codex"
             let accountID = (tokens["account_id"] as? String)
                 ?? MonitorIdentity.jwtNestedString(idToken, namespace: "https://api.openai.com/auth", claim: "chatgpt_account_id")
-            let account = MonitorAccount.make(provider: .codex, accountKey: email, source: .nativeCredential, credentialReference: "keychain:Codex Auth")
-            accounts.append(Self.canonicalizeCodexAccount(account, accountID: accountID, aliases: codexAliases))
+            let key = CodexAccountKey.canonical(
+                email: email,
+                accountID: accountID,
+                aliases: codexAliases,
+                fallback: "Codex"
+            )
+            accounts.append(.make(
+                provider: .codex,
+                accountKey: key,
+                displayName: email,
+                source: .nativeCredential,
+                credentialReference: "keychain:Codex Auth"
+            ))
         }
         if let data = KeychainHelper.readExternalCredential(service: "Claude Code-credentials"),
            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -617,7 +833,7 @@ actor MonitorRefreshCoordinator {
     }
 
     func bootstrap() async -> MonitorRefreshBatch {
-        let quotas = await snapshots.load()
+        let quotas = await discovery.filteringRemovedAccounts(from: await snapshots.load())
         return MonitorRefreshBatch(
             accounts: await discoverAccounts(merging: quotas),
             quotas: quotas,
@@ -629,6 +845,7 @@ actor MonitorRefreshCoordinator {
         var accounts = await discovery.discover()
         accounts = Self.applyingQuotaDisplayNames(accounts, quotas: quotas)
         let disabledIDs = await discovery.disabledAccountIDs()
+        let removedIDs = await discovery.removedAccountIDs()
         let existingKeys = Set(accounts.map(\.deduplicationKey))
         var appendedKeys = existingKeys
 
@@ -636,7 +853,7 @@ actor MonitorRefreshCoordinator {
             let source: MonitorAccountSource
             switch provider {
             case .cursor, .trae: source = .localIDE
-            case .glm, .warp, .clinePass, .factoryDroid, .openRouter, .amp: source = .apiKey
+            case .glm, .minimax, .warp, .clinePass, .factoryDroid, .openRouter, .amp: source = .apiKey
             default: source = .nativeCredential
             }
             for (accountKey, quota) in accountQuotas {
@@ -647,6 +864,7 @@ actor MonitorRefreshCoordinator {
                     source: source,
                     disabledIDs: disabledIDs
                 )
+                guard !removedIDs.contains(account.id) else { continue }
                 guard appendedKeys.insert(account.deduplicationKey).inserted else { continue }
                 accounts.append(account)
             }
@@ -718,14 +936,21 @@ actor MonitorRefreshCoordinator {
         credentialAvailability: MonitorCredentialAvailability = .unknown,
         operation: @escaping @Sendable () async -> [String: ProviderQuotaData]
     ) async -> [String: ProviderQuotaData] {
+        let visiblePrevious = await discovery.filteringRemovedAccounts(
+            from: [provider: previous]
+        )[provider] ?? [:]
         if !force, let retry = retryAfter[provider], retry > Date() {
-            return previous
+            return visiblePrevious
         }
         if let task = inFlight[provider] {
             return await task.value
         }
 
-        let task = Task { await operation() }
+        let task = Task {
+            await self.discovery.filteringRemovedAccounts(
+                from: [provider: await operation()]
+            )[provider] ?? [:]
+        }
         inFlight[provider] = task
         let fresh = await task.value
         inFlight[provider] = nil
@@ -736,22 +961,30 @@ actor MonitorRefreshCoordinator {
             return [:]
         }
 
-        if fresh.isEmpty, !previous.isEmpty {
+        if fresh.isEmpty, !visiblePrevious.isEmpty {
             issues[provider] = MonitorRefreshIssue(
                 message: "monitor.refresh.failed".localizedStatic(),
-                occurredAt: Date()
+                occurredAt: Date(),
+                affectedAccountKeys: Set(visiblePrevious.keys)
             )
             retryAfter[provider] = Date().addingTimeInterval(60)
-            return previous
+            return visiblePrevious
         }
 
         if !fresh.isEmpty {
-            var merged = previous
+            var merged = visiblePrevious
             merged.merge(fresh) { _, new in new }
-            if fresh.count < previous.count {
+            if fresh.count < visiblePrevious.count {
+                let refreshedKeys = Set(fresh.keys.map {
+                    $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                })
+                let failedKeys = Set(visiblePrevious.keys.filter {
+                    !refreshedKeys.contains($0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+                })
                 issues[provider] = MonitorRefreshIssue(
                     message: "monitor.refresh.partial".localizedStatic(),
-                    occurredAt: Date()
+                    occurredAt: Date(),
+                    affectedAccountKeys: failedKeys
                 )
                 retryAfter[provider] = Date().addingTimeInterval(60)
             } else {
@@ -767,7 +1000,13 @@ actor MonitorRefreshCoordinator {
     }
 
     func finish(quotas: [AIProvider: [String: ProviderQuotaData]]) async {
-        await snapshots.store(quotas)
+        await snapshots.store(await discovery.filteringRemovedAccounts(from: quotas))
+    }
+
+    func filteringRemovedAccounts(
+        from quotas: [AIProvider: [String: ProviderQuotaData]]
+    ) async -> [AIProvider: [String: ProviderQuotaData]] {
+        await discovery.filteringRemovedAccounts(from: quotas)
     }
 
     /// Forget every Monitor-owned trace of a single account: its persisted snapshot
@@ -799,6 +1038,19 @@ actor MonitorRefreshCoordinator {
 
     func setDisabled(_ disabled: Bool, accountID: String) async {
         await discovery.setDisabled(disabled, accountID: accountID)
+    }
+
+    func removeDiscoveredAccount(accountID: String) async {
+        await discovery.setRemoved(true, accountID: accountID)
+    }
+
+    func removedAccountCount() async -> Int {
+        await discovery.removedAccountIDs().count
+    }
+
+    @discardableResult
+    func restoreRemovedAccounts() async -> Int {
+        await discovery.restoreRemovedAccounts()
     }
 
     func deleteOwnedAccount(accountID: String) async {
@@ -866,15 +1118,17 @@ nonisolated enum MonitorIdentity {
 }
 
 nonisolated enum MonitorRuntimeError: LocalizedError {
+    case keychainAuthorizationRequired
     case credentialWriteFailed
     case invalidCredential
     case symbolicLinkRefused
 
     var errorDescription: String? {
         switch self {
-        case .credentialWriteFailed: "Could not save the Monitor credential in Keychain."
-        case .invalidCredential: "The Monitor credential file is invalid."
-        case .symbolicLinkRefused: "Refusing to write credentials through a symbolic link."
+        case .keychainAuthorizationRequired: "monitor.error.keychainAuthorizationRequired".localizedStatic()
+        case .credentialWriteFailed: "monitor.error.credentialWriteFailed".localizedStatic()
+        case .invalidCredential: "monitor.error.invalidCredential".localizedStatic()
+        case .symbolicLinkRefused: "monitor.error.symbolicLinkRefused".localizedStatic()
         }
     }
 }

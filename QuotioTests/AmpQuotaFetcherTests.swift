@@ -86,11 +86,11 @@ final class AmpQuotaFetcherTests: XCTestCase {
         XCTAssertEqual(quota.planType, "Megawatt")
         XCTAssertEqual(agent.percentage, 64)
         XCTAssertEqual(agent.usedPercentage, 36)
-        XCTAssertEqual(agent.displayName, "Agent Usage")
+        XCTAssertEqual(agent.displayName, "amp.quota.agent".localizedStatic())
         XCTAssertEqual(agent.resetTime, "2026-09-02T12:00:00Z")
         XCTAssertEqual(orb.percentage, 98)
         XCTAssertEqual(orb.usedPercentage, 2)
-        XCTAssertEqual(orb.displayName, "Orb Usage")
+        XCTAssertEqual(orb.displayName, "amp.quota.orb".localizedStatic())
         XCTAssertEqual(orb.resetTime, "2026-09-02T12:00:00Z")
     }
 

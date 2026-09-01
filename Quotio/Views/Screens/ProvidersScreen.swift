@@ -28,6 +28,7 @@ struct ProvidersScreen: View {
     @State private var editingMonitorAPIKeyAccount: MonitorAccount?
     @State private var showAddProviderPopover = false
     @State private var switchingAccount: AccountRowData?
+    @State private var recoveryHelpAccount: AccountRowData?
     @State private var modeManager = OperatingModeManager.shared
 
     private let customProviderService = CustomProviderService.shared
@@ -39,7 +40,7 @@ struct ProvidersScreen: View {
     private var addableProviders: [AIProvider] {
         if modeManager.isLocalProxyMode {
             return AIProvider.allCases.filter {
-                ![.factoryDroid, .openRouter, .amp].contains($0) && ($0.supportsManualAuth || $0 == .clinePass)
+                !$0.isQuotaTrackingOnly && ($0.supportsManualAuth || $0 == .clinePass)
             }
         } else {
             return AIProvider.allCases.filter {
@@ -266,6 +267,18 @@ struct ProvidersScreen: View {
                         apiKey: apiKey,
                         existingAccountID: editingMonitorAPIKeyAccount?.id
                     )
+                } else if provider == .kimi {
+                    try await viewModel.saveKimiAccount(
+                        label: label,
+                        apiKey: apiKey,
+                        existingAccountID: editingMonitorAPIKeyAccount?.id
+                    )
+                } else if provider == .minimax {
+                    try await viewModel.saveMiniMaxAccount(
+                        label: label,
+                        apiKey: apiKey,
+                        existingAccountID: editingMonitorAPIKeyAccount?.id
+                    )
                 } else {
                     try await viewModel.saveOpenRouterAccount(
                         label: label,
@@ -280,6 +293,7 @@ struct ProvidersScreen: View {
             AddProviderPopover(
                 providers: addableProviders,
                 existingCounts: providerAccountCounts,
+                removedAccountCount: modeManager.isMonitorMode ? viewModel.removedMonitorAccountCount : 0,
                 onSelectProvider: { provider in
                     handleAddProvider(provider)
                 },
@@ -288,6 +302,9 @@ struct ProvidersScreen: View {
                 },
                 onAddCustomProvider: {
                     customProviderSheetMode = .add(.openaiCompatibility)
+                },
+                onRestoreRemovedAccounts: {
+                    Task { await viewModel.restoreRemovedMonitorAccounts() }
                 },
                 onDismiss: {
                     showAddProviderPopover = false
@@ -302,6 +319,20 @@ struct ProvidersScreen: View {
                 }
             )
             .environment(viewModel)
+        }
+        .sheet(item: $recoveryHelpAccount) { account in
+            AccountRecoveryHelpSheet(account: account) {
+                recoveryHelpAccount = nil
+                Task {
+                    if modeManager.isMonitorMode {
+                        await viewModel.manualRefresh()
+                    } else {
+                        await viewModel.refreshQuotaForProvider(account.provider)
+                    }
+                }
+            } onDismiss: {
+                recoveryHelpAccount = nil
+            }
         }
     }
     
@@ -384,9 +415,24 @@ struct ProvidersScreen: View {
                                 handleEditClinePassAccount(account)
                             } else if provider == .warp {
                                 handleEditWarpAccount(account)
-                            } else if [.factoryDroid, .openRouter, .amp].contains(provider) {
+                            } else if [.factoryDroid, .openRouter, .amp, .kimi, .minimax].contains(provider) {
                                 handleEditMonitorAPIKeyAccount(account)
                             }
+                        },
+                        onRefreshAccount: viewModel.supportsScopedRefresh(for: provider) ? { account in
+                            let accountID = QuotaAccountID(
+                                provider: account.provider,
+                                accountKey: account.menuBarAccountKey
+                            )
+                            Task {
+                                await viewModel.refreshQuota(
+                                    for: accountID,
+                                    allowCredentialAccessPrompt: true
+                                )
+                            }
+                        } : nil,
+                        onReconnectAccount: { account in
+                            handleReconnectAccount(account)
                         },
                         onSwitchAccount: provider == .antigravity ? { account in
                             switchingAccount = account
@@ -396,6 +442,18 @@ struct ProvidersScreen: View {
                         },
                         onDownloadAccount: { account in
                             Task { await downloadAccountAuthFile(account) }
+                        },
+                        isAccountRefreshing: { account in
+                            viewModel.isRefreshing(account: QuotaAccountID(
+                                provider: account.provider,
+                                accountKey: account.menuBarAccountKey
+                            ))
+                        },
+                        isAccountRefreshBlocked: { account in
+                            viewModel.isRefreshBlocked(for: QuotaAccountID(
+                                provider: account.provider,
+                                accountKey: account.menuBarAccountKey
+                            ))
                         },
                         isAccountActive: provider == .antigravity ? { account in
                             viewModel.isAntigravityAccountActive(email: account.displayName)
@@ -484,7 +542,8 @@ struct ProvidersScreen: View {
             showGLMConnectionSheet = true
             return
         }
-        if [.factoryDroid, .openRouter, .amp].contains(provider) {
+        if [.factoryDroid, .openRouter, .amp, .minimax].contains(provider)
+            || (modeManager.isMonitorMode && provider == .kimi) {
             editingMonitorAPIKeyAccount = nil
             monitorAPIKeyProvider = provider
             return
@@ -506,9 +565,45 @@ struct ProvidersScreen: View {
             selectedProvider = provider
         }
     }
+
+    private func handleReconnectAccount(_ account: AccountRowData) {
+        if account.canEdit {
+            if account.provider == .glm {
+                handleEditGlmAccount(account)
+            } else if account.provider == .clinePass {
+                handleEditClinePassAccount(account)
+            } else if account.provider == .warp {
+                handleEditWarpAccount(account)
+            } else {
+                handleEditMonitorAPIKeyAccount(account)
+            }
+            return
+        }
+
+        // A credential discovered from Claude Code, Codex CLI, Copilot, Kiro, an IDE,
+        // or a legacy CLIProxy file is owned by that source. Quotio OAuth cannot update
+        // it in place and may authenticate whichever account is active in the browser,
+        // creating an unrelated duplicate. Guide the user back to the real owner.
+        if account.requiresSourceRecovery {
+            recoveryHelpAccount = account
+            return
+        }
+
+        let builtInMonitorLoginProviders: Set<AIProvider> = [
+            .claude, .codex, .copilot, .kiro, .antigravity,
+        ]
+        if modeManager.isMonitorMode, builtInMonitorLoginProviders.contains(account.provider) {
+            viewModel.oauthState = nil
+            selectedProvider = account.provider
+        } else if account.provider.supportsManualAuth {
+            handleAddProvider(account.provider)
+        } else {
+            recoveryHelpAccount = account
+        }
+    }
     
     private func deleteAccount(_ account: AccountRowData) async {
-        // Only proxy accounts can be deleted via API
+        // AccountRowData exposes only source-safe destructive actions.
         guard account.canDelete else { return }
 
         if modeManager.isMonitorMode, case .monitor = account.source {
@@ -639,6 +734,38 @@ struct ProvidersScreen: View {
         // Silent failure - custom provider sync is non-critical
         // Config will be synced on next proxy start
         try? customProviderService.syncToConfigFile(configPath: viewModel.proxyManager.configPath)
+    }
+}
+
+private struct AccountRecoveryHelpSheet: View {
+    let account: AccountRowData
+    let onRefresh: () -> Void
+    let onDismiss: () -> Void
+
+    var body: some View {
+        VStack(spacing: 20) {
+            ProviderIcon(provider: account.provider, size: 48)
+
+            Text("providers.recoveryHelp.title".localized())
+                .font(.title3.bold())
+
+            Text(String(
+                format: "providers.recoveryHelp.message".localized(),
+                account.provider.displayName,
+                account.source.displayName
+            ))
+            .multilineTextAlignment(.center)
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: 380)
+
+            HStack {
+                Button("action.cancel".localized(), role: .cancel, action: onDismiss)
+                Button("providers.recoveryHelp.refresh".localized(), action: onRefresh)
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(32)
+        .frame(width: 460)
     }
 }
 

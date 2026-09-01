@@ -17,6 +17,8 @@ struct MonitorAPIKeyConnectionSheet: View {
         switch provider {
         case .factoryDroid: "factory"
         case .amp: "amp"
+        case .kimi: "kimi"
+        case .minimax: "minimax"
         default: "openrouter"
         }
     }

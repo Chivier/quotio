@@ -59,14 +59,19 @@ Quotio est une application macOS native pour gérer **CLIProxyAPI** - un serveur
 | Antigravity | OAuth |
 | Kiro | OAuth |
 | GitHub Copilot | OAuth |
+| Kimi Code | OAuth |
+| Z.ai | Clé API |
 
-### Suivi de Quota IDE (Surveillance uniquement)
-| IDE | Description |
-|-----|-------------|
+### Suivi des quotas des services de programmation
+| Service | Description |
+|---------|-------------|
 | Cursor | Détecté automatiquement lorsqu'installé et connecté |
 | Trae | Détecté automatiquement lorsqu'installé et connecté |
+| Z.ai | Limites de session, quotidiennes, hebdomadaires, mensuelles et de recherche web |
+| Kimi Code | Identifiants CLI détectés ou clé API ; limites glissantes et hebdomadaires |
+| MiniMax | Clé d’abonnement Token Plan ; limites de 5 heures et hebdomadaires |
 
-> **Note** : Ces IDE sont uniquement utilisés pour la surveillance de l'utilisation des quotas. Ils ne peuvent pas être utilisés comme fournisseurs pour le proxy.
+> **Note** : Cursor, Trae et MiniMax sont réservés à la surveillance. Kimi Code peut aussi être connecté à CLIProxyAPI via OAuth.
 
 ### Agents CLI Compatibles
 Quotio peut configurer automatiquement ces outils pour utiliser votre proxy centralisé :

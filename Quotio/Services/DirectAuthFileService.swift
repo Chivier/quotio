@@ -40,7 +40,7 @@ struct DirectAuthFile: Identifiable, Sendable, Hashable {
     }
     
     /// Check if token is expired
-    var isExpired: Bool {
+    nonisolated var isExpired: Bool {
         guard let expired = expired else { return false }
         return expired < Date()
     }
@@ -235,7 +235,8 @@ actor DirectAuthFileService {
             "kiro": .kiro,
             "vertex": .vertex,
             "cursor": .cursor,
-            "trae": .trae
+            "trae": .trae,
+            "kimi": .kimi
         ]
         return typeMap[type.lowercased()]
     }
@@ -267,7 +268,8 @@ actor DirectAuthFileService {
             ("qwen-", .qwen),
             ("iflow-", .iflow),
             ("kiro-", .kiro),
-            ("vertex-", .vertex)
+            ("vertex-", .vertex),
+            ("kimi-", .kimi)
         ]
         
         for (prefix, provider) in prefixes {
@@ -353,6 +355,20 @@ actor DirectAuthFileService {
             // Anthropic OAuth
             if let sessionKey = json["session_key"] as? String ?? json["access_token"] as? String {
                 return AuthTokenData(accessToken: sessionKey, refreshToken: nil, expiresAt: nil, clientId: nil, clientSecret: nil, authMethod: nil, extras: nil)
+            }
+
+        case .kimi:
+            if let accessToken = json["access_token"] as? String {
+                let extras = (json["device_id"] as? String).map { ["device_id": $0] }
+                return AuthTokenData(
+                    accessToken: accessToken,
+                    refreshToken: json["refresh_token"] as? String,
+                    expiresAt: json["expired"] as? String,
+                    clientId: nil,
+                    clientSecret: nil,
+                    authMethod: nil,
+                    extras: extras
+                )
             }
             
         case .kiro:

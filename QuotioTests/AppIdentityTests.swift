@@ -6,6 +6,28 @@ final class AppIdentityTests: XCTestCase {
         XCTAssertEqual(AppIdentity.productionBundleIdentifier, "app.bytrong.quotio")
     }
 
+    func testDevelopmentBuildUsesSeparateKeychainNamespace() {
+        XCTAssertEqual(
+            AppIdentity.keychainService(
+                suffix: "local-management",
+                bundleIdentifier: AppIdentity.productionBundleIdentifier,
+                isDevelopmentBuild: true
+            ),
+            "app.bytrong.quotio.debug.local-management"
+        )
+    }
+
+    func testReleaseBuildKeepsProductionKeychainNamespace() {
+        XCTAssertEqual(
+            AppIdentity.keychainService(
+                suffix: "local-management",
+                bundleIdentifier: AppIdentity.productionBundleIdentifier,
+                isDevelopmentBuild: false
+            ),
+            "app.bytrong.quotio.local-management"
+        )
+    }
+
     func testLegacyDefaultsMergePreservesCurrentValuesAndNewestLegacyDomain() {
         let merged = AppIdentity.mergingUserDefaults(
             current: ["existing": "current"],

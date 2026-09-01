@@ -188,16 +188,22 @@ final class CLIProxyManager {
         self.configPath = quotioDir.appendingPathComponent("config.yaml").path
         self.authDir = homeDir.appendingPathComponent(".cli-proxy-api").path
         
-        // Always use key from Keychain, generate new if not exists
-        // Never read from config because CLIProxyAPI hashes the key on startup
-        if let savedKey = KeychainHelper.getLocalManagementKey(), !savedKey.hasPrefix("$2a$") {
+        // Always use the key from Keychain and generate one only when the item
+        // is actually absent. A background authorization failure must not show
+        // a password prompt or overwrite an item that still holds the real key.
+        // Never read from config because CLIProxyAPI hashes the key on startup.
+        switch KeychainHelper.getLocalManagementKeyResult() {
+        case let .success(savedKey) where !savedKey.hasPrefix("$2a$"):
             self.managementKey = savedKey
-        } else {
+        case .success, .absent:
             let newKey = UUID().uuidString
             self.managementKey = newKey
             if !KeychainHelper.saveLocalManagementKey(newKey) {
                 Log.keychain("Failed to persist local management key, using in-memory value")
             }
+        case .unavailable:
+            self.managementKey = UUID().uuidString
+            Log.keychain("Local management key is unavailable; using an in-memory value without requesting authorization")
         }
         
         let savedPort = UserDefaults.standard.integer(forKey: "proxyPort")

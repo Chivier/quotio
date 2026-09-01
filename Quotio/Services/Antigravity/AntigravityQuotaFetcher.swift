@@ -280,6 +280,9 @@ nonisolated struct ModelQuota: Codable, Identifiable, Sendable {
         case "zai-weekly": return "quota.metric.weekly".localizedStatic()
         case "zai-monthly": return "quota.metric.monthly".localizedStatic()
         case "zai-web-searches": return "quota.metric.webSearches".localizedStatic()
+        // Kimi Code / MiniMax Coding Plan
+        case "kimi-five-hour", "minimax-five-hour": return "quota.metric.session".localizedStatic()
+        case "kimi-weekly", "minimax-weekly": return "quota.metric.weekly".localizedStatic()
         // Devin
         case "devin-daily": return "quota.metric.daily".localizedStatic()
         case "devin-weekly": return "quota.metric.weekly".localizedStatic()

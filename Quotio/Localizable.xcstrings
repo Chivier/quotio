@@ -4,6 +4,22 @@
     "" : {
 
     },
+    "kimi.apiKey.hint" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Stored securely in Keychain. Create a key in the Kimi Code console." } }, "fr" : { "stringUnit" : { "state" : "translated", "value" : "Stocké en toute sécurité dans le trousseau. Créez une clé dans la console Kimi Code." } }, "vi" : { "stringUnit" : { "state" : "translated", "value" : "Được lưu an toàn trong Keychain. Tạo khóa trong bảng điều khiển Kimi Code." } }, "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "安全存储在钥匙串中。请在 Kimi Code 控制台创建密钥。" } } } },
+    "kimi.apiKey.label" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Kimi Code API Key" } }, "fr" : { "stringUnit" : { "state" : "translated", "value" : "Clé API Kimi Code" } }, "vi" : { "stringUnit" : { "state" : "translated", "value" : "Khóa API Kimi Code" } }, "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "Kimi Code API 密钥" } } } },
+    "kimi.apiKey.placeholder" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Enter your Kimi Code API key" } }, "fr" : { "stringUnit" : { "state" : "translated", "value" : "Saisissez votre clé API Kimi Code" } }, "vi" : { "stringUnit" : { "state" : "translated", "value" : "Nhập khóa API Kimi Code" } }, "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "输入您的 Kimi Code API 密钥" } } } },
+    "kimi.apiKey.rotateHint" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Enter a replacement key. The current key is never revealed." } }, "fr" : { "stringUnit" : { "state" : "translated", "value" : "Saisissez une clé de remplacement. La clé actuelle n’est jamais révélée." } }, "vi" : { "stringUnit" : { "state" : "translated", "value" : "Nhập khóa thay thế. Khóa hiện tại sẽ không bao giờ được hiển thị." } }, "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "输入替换密钥。当前密钥绝不会显示。" } } } },
+    "kimi.connection.edit" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Rotate Kimi Code Key" } }, "fr" : { "stringUnit" : { "state" : "translated", "value" : "Remplacer la clé Kimi Code" } }, "vi" : { "stringUnit" : { "state" : "translated", "value" : "Thay khóa Kimi Code" } }, "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "更换 Kimi Code 密钥" } } } },
+    "kimi.connection.subtitle" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Monitor rolling and weekly Kimi Code subscription limits" } }, "fr" : { "stringUnit" : { "state" : "translated", "value" : "Surveillez les limites glissantes et hebdomadaires de l’abonnement Kimi Code" } }, "vi" : { "stringUnit" : { "state" : "translated", "value" : "Theo dõi hạn mức định kỳ và hàng tuần của gói Kimi Code" } }, "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "监控 Kimi Code 订阅的滚动窗口和周额度" } } } },
+    "kimi.connection.title" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Connect Kimi Code" } }, "fr" : { "stringUnit" : { "state" : "translated", "value" : "Connecter Kimi Code" } }, "vi" : { "stringUnit" : { "state" : "translated", "value" : "Kết nối Kimi Code" } }, "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "连接 Kimi Code" } } } },
+    "kimi.label.placeholder" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Personal, Work, …" } }, "fr" : { "stringUnit" : { "state" : "translated", "value" : "Personnel, Travail, …" } }, "vi" : { "stringUnit" : { "state" : "translated", "value" : "Cá nhân, Công việc, …" } }, "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "个人、工作、…" } } } },
+    "minimax.apiKey.hint" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Stored securely in Keychain. Only Token Plan subscription keys can query usage." } }, "fr" : { "stringUnit" : { "state" : "translated", "value" : "Stocké en toute sécurité dans le trousseau. Seules les clés d’abonnement Token Plan peuvent consulter l’utilisation." } }, "vi" : { "stringUnit" : { "state" : "translated", "value" : "Được lưu an toàn trong Keychain. Chỉ khóa đăng ký Token Plan mới có thể truy vấn mức dùng." } }, "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "安全存储在钥匙串中。只有 Token Plan 订阅密钥可以查询用量。" } } } },
+    "minimax.apiKey.label" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "MiniMax Subscription Key" } }, "fr" : { "stringUnit" : { "state" : "translated", "value" : "Clé d’abonnement MiniMax" } }, "vi" : { "stringUnit" : { "state" : "translated", "value" : "Khóa đăng ký MiniMax" } }, "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "MiniMax 订阅密钥" } } } },
+    "minimax.apiKey.placeholder" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Enter your sk-cp-… subscription key" } }, "fr" : { "stringUnit" : { "state" : "translated", "value" : "Saisissez votre clé d’abonnement sk-cp-…" } }, "vi" : { "stringUnit" : { "state" : "translated", "value" : "Nhập khóa đăng ký sk-cp-…" } }, "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "输入您的 sk-cp-… 订阅密钥" } } } },
+    "minimax.apiKey.rotateHint" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Enter a replacement key. The current key is never revealed." } }, "fr" : { "stringUnit" : { "state" : "translated", "value" : "Saisissez une clé de remplacement. La clé actuelle n’est jamais révélée." } }, "vi" : { "stringUnit" : { "state" : "translated", "value" : "Nhập khóa thay thế. Khóa hiện tại sẽ không bao giờ được hiển thị." } }, "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "输入替换密钥。当前密钥绝不会显示。" } } } },
+    "minimax.connection.edit" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Rotate MiniMax Subscription Key" } }, "fr" : { "stringUnit" : { "state" : "translated", "value" : "Remplacer la clé d’abonnement MiniMax" } }, "vi" : { "stringUnit" : { "state" : "translated", "value" : "Thay khóa đăng ký MiniMax" } }, "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "更换 MiniMax 订阅密钥" } } } },
+    "minimax.connection.subtitle" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Monitor the 5-hour and weekly MiniMax Token Plan limits" } }, "fr" : { "stringUnit" : { "state" : "translated", "value" : "Surveillez les limites de 5 heures et hebdomadaires du MiniMax Token Plan" } }, "vi" : { "stringUnit" : { "state" : "translated", "value" : "Theo dõi hạn mức 5 giờ và hàng tuần của MiniMax Token Plan" } }, "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "监控 MiniMax Token Plan 的 5 小时和周额度" } } } },
+    "minimax.connection.title" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Connect MiniMax Token Plan" } }, "fr" : { "stringUnit" : { "state" : "translated", "value" : "Connecter MiniMax Token Plan" } }, "vi" : { "stringUnit" : { "state" : "translated", "value" : "Kết nối MiniMax Token Plan" } }, "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "连接 MiniMax Token Plan" } } } },
+    "minimax.label.placeholder" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Personal, Work, …" } }, "fr" : { "stringUnit" : { "state" : "translated", "value" : "Personnel, Travail, …" } }, "vi" : { "stringUnit" : { "state" : "translated", "value" : "Cá nhân, Công việc, …" } }, "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "个人、工作、…" } } } },
     "amp.apiKey.hint" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Stored securely in Keychain and never shown again." } }, "fr" : { "stringUnit" : { "state" : "translated", "value" : "Stocké en toute sécurité dans le trousseau et ne sera plus jamais affiché." } }, "vi" : { "stringUnit" : { "state" : "translated", "value" : "Được lưu an toàn trong Keychain và không hiển thị lại." } }, "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "安全存储在钥匙串中，之后不会再次显示。" } } } },
     "amp.apiKey.label" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Amp Access Token" } }, "fr" : { "stringUnit" : { "state" : "translated", "value" : "Jeton d’accès Amp" } }, "vi" : { "stringUnit" : { "state" : "translated", "value" : "Mã truy cập Amp" } }, "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "Amp 访问令牌" } } } },
     "amp.apiKey.placeholder" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Enter your Amp access token" } }, "fr" : { "stringUnit" : { "state" : "translated", "value" : "Saisissez votre jeton d’accès Amp" } }, "vi" : { "stringUnit" : { "state" : "translated", "value" : "Nhập mã truy cập Amp" } }, "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "输入您的 Amp 访问令牌" } } } },
@@ -7228,6 +7244,34 @@
         }
       }
     },
+    "dashboard.partialQuotaCoverage" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Some tracked accounts have no quota data."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Les données de quota manquent pour certains comptes suivis."
+          }
+        },
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Một số tài khoản được theo dõi chưa có dữ liệu hạn mức."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "部分已跟踪账户暂无配额数据。"
+          }
+        }
+      }
+    },
     "dashboard.quotaOverview" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -11032,6 +11076,38 @@
         }
       }
     },
+    "monitor.error.credentialWriteFailed" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Quotio could not save this credential securely." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Quotio n’a pas pu enregistrer cet identifiant de manière sécurisée." } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Quotio không thể lưu thông tin xác thực này một cách an toàn." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "Quotio 无法安全保存此凭据。" } }
+      }
+    },
+    "monitor.error.invalidCredential" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "The credential is invalid." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "L’identifiant n’est pas valide." } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Thông tin xác thực không hợp lệ." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "凭据无效。" } }
+      }
+    },
+    "monitor.error.keychainAuthorizationRequired" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Quotio could not update this credential in Keychain. Retry, then choose Always Allow in the macOS prompt." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Quotio n’a pas pu mettre à jour cet identifiant dans le trousseau. Réessayez, puis choisissez Toujours autoriser dans l’invite macOS." } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Quotio không thể cập nhật thông tin xác thực này trong Keychain. Hãy thử lại, rồi chọn Luôn cho phép trong lời nhắc của macOS." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "Quotio 无法更新钥匙串中的此凭据。请重试，并在 macOS 提示中选择“始终允许”。" } }
+      }
+    },
+    "monitor.error.symbolicLinkRefused" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Quotio will not write credentials through a symbolic link." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Quotio n’écrit pas d’identifiants via un lien symbolique." } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Quotio sẽ không ghi thông tin xác thực qua liên kết tượng trưng." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "Quotio 不会通过符号链接写入凭据。" } }
+      }
+    },
     "monitor.source.apiKey" : {
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "API key" } },
@@ -11086,6 +11162,22 @@
         "fr" : { "stringUnit" : { "state" : "translated", "value" : "Certains comptes n’ont pas pu être actualisés. Leur dernier quota valide reste affiché." } },
         "vi" : { "stringUnit" : { "state" : "translated", "value" : "Không thể làm mới một số tài khoản. Quota thành công gần nhất vẫn được giữ lại." } },
         "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "部分账户无法刷新，仍显示其上次成功的配额。" } }
+      }
+    },
+    "monitor.status.authenticationRequired" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "This login has expired. Sign in again to restore quota access." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Cette connexion a expiré. Reconnectez-vous pour restaurer l’accès aux quotas." } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Phiên đăng nhập này đã hết hạn. Hãy đăng nhập lại để khôi phục quyền truy cập quota." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "此登录已失效，请重新登录以恢复配额访问。" } }
+      }
+    },
+    "monitor.status.credentialUnreadable" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "This Quotio login can no longer be read from the Keychain. Sign in again to restore quota access." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Cette connexion Quotio n’est plus lisible dans le trousseau. Reconnectez-vous pour restaurer l’accès aux quotas." } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Không còn đọc được thông tin đăng nhập Quotio này từ Keychain. Hãy đăng nhập lại để khôi phục quyền truy cập quota." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "无法再从钥匙串读取此 Quotio 登录信息，请重新登录以恢复配额访问。" } }
       }
     },
     "monitor.status.outdated" : {
@@ -13046,6 +13138,78 @@
             "value" : "自动检测"
           }
         }
+      }
+    },
+    "providers.recoveryHelp.message" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "This account is managed by %@ through %@. Sign in again in the source app or command-line tool, then return to Quotio and refresh." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Ce compte %@ est géré via %@. Reconnectez-vous dans l’application source ou l’outil en ligne de commande, puis revenez dans Quotio et actualisez." } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Tài khoản %@ này được quản lý qua %@. Hãy đăng nhập lại trong ứng dụng nguồn hoặc công cụ dòng lệnh, sau đó quay lại Quotio và làm mới." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "此 %@ 账户通过“%@”管理。请在来源应用或命令行工具中重新登录，然后返回 Quotio 刷新。" } }
+      }
+    },
+    "providers.recoveryHelp.refresh" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "I’ve signed in — Refresh" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Je suis reconnecté — Actualiser" } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Đã đăng nhập — Làm mới" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "已重新登录，立即刷新" } }
+      }
+    },
+    "providers.recoveryHelp.title" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Sign in at the source" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Se reconnecter à la source" } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Đăng nhập lại tại nguồn" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "在来源应用中重新登录" } }
+      }
+    },
+    "providers.removeConfirm" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Remove Account from Quotio?" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Retirer le compte de Quotio ?" } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Xóa tài khoản khỏi Quotio?" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "从 Quotio 移除账户？" } }
+      }
+    },
+    "providers.removeFromQuotio" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Remove from Quotio" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Retirer de Quotio" } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Xóa khỏi Quotio" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "从 Quotio 移除" } }
+      }
+    },
+    "providers.removeMessage" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "This removes the account and its saved quota from Quotio. The original login in other apps or command-line tools stays on this Mac. You can restore it later from Add Account." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Le compte et son quota enregistré seront retirés de Quotio. La connexion d’origine dans les autres applications ou outils reste sur ce Mac. Vous pourrez la restaurer via Ajouter un compte." } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Thao tác này xóa tài khoản và quota đã lưu khỏi Quotio. Thông tin đăng nhập gốc trong ứng dụng hoặc công cụ dòng lệnh khác vẫn còn trên máy Mac này. Bạn có thể khôi phục sau từ Thêm tài khoản." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "这只会从 Quotio 移除账户和已保存的配额，不会删除其他应用或命令行工具中的原始登录凭据。之后可从“添加账户”恢复。" } }
+      }
+    },
+    "providers.restoreRemovedAccounts" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Restore removed accounts (%d)" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Restaurer les comptes retirés (%d)" } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Khôi phục tài khoản đã xóa (%d)" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "恢复已移除账户（%d）" } }
+      }
+    },
+    "providers.signInAgain" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Sign In Again" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Se reconnecter" } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Đăng nhập lại" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "重新登录" } }
+      }
+    },
+    "providers.updateCredentials" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Update Credentials" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Mettre à jour les identifiants" } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Cập nhật thông tin xác thực" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "更新凭据" } }
       }
     },
     "providers.deleteConfirm" : {

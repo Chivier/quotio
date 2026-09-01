@@ -6,6 +6,24 @@ import XCTest
 @testable import Quotio
 
 final class MonitorRuntimeTests: XCTestCase {
+    private func assertAuthenticationUIIsDisabled(
+        _ query: [String: Any],
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertTrue(
+            (query[kSecUseAuthenticationContext as String] as? LAContext)?.interactionNotAllowed == true,
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            query[kSecUseAuthenticationUI as String] as? String,
+            KeychainNoUIQuery.uiFailPolicyForTesting(),
+            file: file,
+            line: line
+        )
+    }
+
     func testMonitorCredentialCASUsesActiveVaultBackend() {
         XCTAssertEqual(KeychainHelper.monitorCredentialBackend(vaultEnabled: true), .vault)
         XCTAssertEqual(KeychainHelper.monitorCredentialBackend(vaultEnabled: false), .keychain)
@@ -155,9 +173,7 @@ final class MonitorRuntimeTests: XCTestCase {
         XCTAssertEqual(query[kSecReturnAttributes as String] as? Bool, true)
         XCTAssertEqual(query[kSecReturnRef as String] as? Bool, true)
         XCTAssertNil(query[kSecReturnData as String])
-        XCTAssertTrue(
-            (query[kSecUseAuthenticationContext as String] as? LAContext)?.interactionNotAllowed == true
-        )
+        assertAuthenticationUIIsDisabled(query)
     }
 
     /// The rollback this prevents: with the vault enabled and the key absent or
@@ -176,13 +192,91 @@ final class MonitorRuntimeTests: XCTestCase {
 
         XCTAssertEqual(readQuery[kSecAttrService as String] as? String, "fixture.external")
         XCTAssertEqual(readQuery[kSecAttrAccount as String] as? String, "fixture-account")
-        XCTAssertTrue(
-            (readQuery[kSecUseAuthenticationContext as String] as? LAContext)?.interactionNotAllowed == true
-        )
+        assertAuthenticationUIIsDisabled(readQuery)
         XCTAssertEqual(updateQuery[kSecAttrService as String] as? String, "fixture.external")
         XCTAssertEqual(updateQuery[kSecAttrAccount as String] as? String, "fixture-account")
+        assertAuthenticationUIIsDisabled(updateQuery)
+    }
+
+    func testAppOwnedCredentialReadsDoNotAllowAuthenticationUI() {
+        let query = KeychainHelper.keychainReadQuery(
+            service: "fixture.quotio",
+            account: "fixture-account"
+        )
+
+        XCTAssertEqual(query[kSecReturnData as String] as? Bool, true)
+        assertAuthenticationUIIsDisabled(query)
+
+        let updateQuery = KeychainHelper.keychainUpdateQuery(
+            service: "fixture.quotio",
+            account: "fixture-account"
+        )
+        assertAuthenticationUIIsDisabled(updateQuery)
+    }
+
+    func testUserInitiatedCredentialUpdateAllowsAuthenticationUI() {
+        let query = KeychainHelper.keychainUserInitiatedUpdateQuery(
+            service: "fixture.quotio",
+            account: "fixture-account"
+        )
+
+        XCTAssertEqual(query[kSecAttrService as String] as? String, "fixture.quotio")
+        XCTAssertEqual(query[kSecAttrAccount as String] as? String, "fixture-account")
+        XCTAssertNil(query[kSecUseAuthenticationContext as String])
+        XCTAssertNil(query[kSecUseAuthenticationUI as String])
+    }
+
+    func testUserInitiatedCredentialReadAllowsAuthenticationUI() {
+        let query = KeychainHelper.keychainUserInitiatedReadQuery(
+            service: "fixture.quotio",
+            account: "fixture-account"
+        )
+
+        XCTAssertEqual(query[kSecReturnData as String] as? Bool, true)
+        XCTAssertEqual(query[kSecMatchLimit as String] as? String, kSecMatchLimitOne as String)
+        XCTAssertNil(query[kSecUseAuthenticationContext as String])
+        XCTAssertNil(query[kSecUseAuthenticationUI as String])
+    }
+
+    func testSecretDataQueriesRequireANonSecretACLPreflight() {
+        let query = KeychainAccessPreflight.query(
+            service: "fixture.quotio",
+            account: "fixture-account"
+        )
+
+        XCTAssertNil(query[kSecReturnData as String])
+        XCTAssertEqual(query[kSecReturnAttributes as String] as? Bool, true)
+        XCTAssertEqual(query[kSecReturnRef as String] as? Bool, true)
+        assertAuthenticationUIIsDisabled(query)
+    }
+
+    func testKeychainAccessIsBlockedInsideTestProcesses() {
         XCTAssertTrue(
-            (updateQuery[kSecUseAuthenticationContext as String] as? LAContext)?.interactionNotAllowed == true
+            KeychainTestSafety.shouldBlockRealKeychainAccess(
+                processName: "Quotio",
+                environment: ["XCTestConfigurationFilePath": "/tmp/fixture.xctestconfiguration"]
+            )
+        )
+        XCTAssertFalse(
+            KeychainTestSafety.shouldBlockRealKeychainAccess(
+                processName: "Quotio",
+                environment: [:]
+            )
+        )
+    }
+
+    func testKeychainACLPreflightRejectsPromptingPolicies() {
+        XCTAssertTrue(
+            KeychainAccessPreflight.decryptACLAllowsCurrentExecutable(
+                trustedApplicationValidationResults: [false, true],
+                promptSelector: SecKeychainPromptSelector(rawValue: 0)
+            )
+        )
+        XCTAssertFalse(
+            KeychainAccessPreflight.decryptACLAllowsCurrentExecutable(
+                trustedApplicationValidationResults: [true],
+                promptSelector: SecKeychainPromptSelector(rawValue: 1)
+            )
         )
     }
 
@@ -263,6 +357,92 @@ final class MonitorRuntimeTests: XCTestCase {
             aliases: ["account-1": "same@example.com-pro"]
         )
         XCTAssertEqual(MonitorAccountDiscovery.selectPreferred([legacy, distinctNative]).count, 2)
+    }
+
+    func testCodexCanonicalKeysKeepSameEmailAccountIDsDistinct() {
+        let first = CodexAccountKey.canonical(
+            email: "same@example.com",
+            accountID: "account-1",
+            fallback: "Codex"
+        )
+        let second = CodexAccountKey.canonical(
+            email: "same@example.com",
+            accountID: "account-2",
+            fallback: "Codex"
+        )
+
+        XCTAssertNotEqual(first, second)
+        XCTAssertTrue(first.hasPrefix("same@example.com • "))
+        XCTAssertTrue(second.hasPrefix("same@example.com • "))
+    }
+
+    func testCodexScopedRefreshMatchesLegacyMetadataKeyCaseInsensitively() {
+        XCTAssertTrue(CodexCLIQuotaFetcher.accountKeysMatch(" User@Example.com ", "user@example.com"))
+        XCTAssertFalse(CodexCLIQuotaFetcher.accountKeysMatch("first@example.com", "second@example.com"))
+    }
+
+    func testCodexInteractiveRefreshRecognizesCanonicalizedLegacyKey() {
+        XCTAssertTrue(CodexCLIQuotaFetcher.accountKeyMayIdentifyStoredAccount(
+            "user@example.com • a1b2c3d4",
+            metadataKey: "user@example.com",
+            displayName: "User@example.com"
+        ))
+        XCTAssertFalse(CodexCLIQuotaFetcher.accountKeyMayIdentifyStoredAccount(
+            "user@example.com • not-a-fingerprint",
+            metadataKey: "user@example.com",
+            displayName: "user@example.com"
+        ))
+        XCTAssertFalse(CodexCLIQuotaFetcher.accountKeyMayIdentifyStoredAccount(
+            "other@example.com • a1b2c3d4",
+            metadataKey: "user@example.com",
+            displayName: "user@example.com"
+        ))
+        XCTAssertFalse(CodexCLIQuotaFetcher.accountKeyMayIdentifyStoredAccount(
+            "user@example.com • b1b2c3d4",
+            metadataKey: "user@example.com • a1a2c3d4",
+            displayName: "user@example.com"
+        ))
+        XCTAssertFalse(CodexCLIQuotaFetcher.accountKeyMayIdentifyStoredAccount(
+            "user@example.com",
+            metadataKey: "user@example.com • a1a2c3d4",
+            displayName: "user@example.com"
+        ))
+    }
+
+    func testCodexCanonicalKeyReusesUniqueLegacyAliasForSameAccountID() {
+        let key = CodexAccountKey.canonical(
+            email: "same@example.com",
+            accountID: "account-1",
+            aliases: ["account-1": "same@example.com-plus"],
+            fallback: "Codex"
+        )
+
+        XCTAssertEqual(key, "same@example.com-plus")
+    }
+
+    func testCodexDiscoveryDoesNotCollapseDifferentAccountsWhenLegacyFilenameIsJustEmail() {
+        let legacy = MonitorAccount.make(
+            provider: .codex,
+            accountKey: "same@example.com",
+            source: .legacyCLIProxy
+        )
+        let ownedBeforeMigration = MonitorAccount.make(
+            provider: .codex,
+            accountKey: "same@example.com",
+            source: .quotioKeychain,
+            canDelete: true
+        )
+        let ownedAfterMigration = MonitorAccountDiscovery.canonicalizeCodexAccount(
+            ownedBeforeMigration,
+            accountID: "account-2",
+            aliases: ["account-1": "same@example.com"]
+        )
+
+        let selected = MonitorAccountDiscovery.selectPreferred([legacy, ownedAfterMigration])
+
+        XCTAssertEqual(selected.count, 2)
+        XCTAssertEqual(Set(selected.map(\.source)), [.legacyCLIProxy, .quotioKeychain])
+        XCTAssertEqual(Set(selected.map(\.accountKey)).count, 2)
     }
 
     func testCodexQuotaReconciliationRemovesOnlyLegacyAliases() {
@@ -574,6 +754,60 @@ final class MonitorRuntimeTests: XCTestCase {
 
         XCTAssertEqual(Set(reconciled.keys), ["same@example.com-pro"])
         XCTAssertEqual(reconciled["same@example.com-pro"]?.lastUpdated, freshDate)
+    }
+
+    func testCodexQuotaReconciliationRemovesObsoleteEmailSnapshotKey() {
+        let canonicalKey = CodexAccountKey.canonical(
+            email: "same@example.com",
+            accountID: "account-1",
+            fallback: "Codex"
+        )
+        let reconciled = CodexCLIQuotaFetcher.reconcileLegacyAliases(
+            in: [
+                "same@example.com": ProviderQuotaData(models: [], lastUpdated: Date(timeIntervalSince1970: 1_000)),
+                canonicalKey: ProviderQuotaData(models: [], lastUpdated: Date(timeIntervalSince1970: 2_000)),
+            ],
+            legacy: [],
+            current: [
+                CodexQuotaAccountIdentity(
+                    key: canonicalKey,
+                    email: "same@example.com",
+                    accountID: "account-1"
+                ),
+            ]
+        )
+
+        XCTAssertEqual(Set(reconciled.keys), [canonicalKey])
+    }
+
+    func testCodexQuotaReconciliationPreservesEmailKeyOwnedByDistinctLegacyAccount() {
+        let canonicalKey = CodexAccountKey.canonical(
+            email: "same@example.com",
+            accountID: "account-2",
+            fallback: "Codex"
+        )
+        let reconciled = CodexCLIQuotaFetcher.reconcileLegacyAliases(
+            in: [
+                "same@example.com": ProviderQuotaData(models: [], lastUpdated: Date(timeIntervalSince1970: 1_000)),
+                canonicalKey: ProviderQuotaData(models: [], lastUpdated: Date(timeIntervalSince1970: 2_000)),
+            ],
+            legacy: [
+                CodexQuotaAccountIdentity(
+                    key: "same@example.com",
+                    email: "same@example.com",
+                    accountID: "account-1"
+                ),
+            ],
+            current: [
+                CodexQuotaAccountIdentity(
+                    key: canonicalKey,
+                    email: "same@example.com",
+                    accountID: "account-2"
+                ),
+            ]
+        )
+
+        XCTAssertEqual(Set(reconciled.keys), ["same@example.com", canonicalKey])
     }
 
     func testLegacyCodexAccountsUseDistinctFilenameKeysForSameEmail() {
@@ -1398,6 +1632,10 @@ final class MonitorRuntimeTests: XCTestCase {
     }
 
     func testMonitorCredentialVaultAddsRotatesAndDeletesAPIKeys() async throws {
+        try XCTSkipIf(
+            KeychainTestSafety.shouldBlockRealKeychainAccess(),
+            "Real Keychain access is intentionally blocked inside XCTest hosts."
+        )
         // The test host shares the app's defaults, so whoever has enabled the
         // vault runs this against the vault: every read then needs a physical
         // PIN entry (the slot is `--pin-policy always`), and the run stalls,
@@ -1485,6 +1723,189 @@ final class MonitorRuntimeTests: XCTestCase {
         let disabled = await store.disabledAccountIDs()
         XCTAssertEqual(accounts, [account])
         XCTAssertEqual(disabled, Set([account.id]))
+    }
+
+    func testRemovedMonitorAccountPersistsWithoutDeletingSourceMetadata() async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathComponent("accounts-v1.json")
+        let store = MonitorMetadataStore(url: url)
+        let external = MonitorAccount.make(
+            provider: .claude,
+            accountKey: "external@example.com",
+            source: .nativeCredential,
+            credentialReference: "/tmp/external-credentials.json"
+        )
+
+        try await store.setRemoved(true, accountID: external.id)
+
+        let removed = await store.removedAccountIDs()
+        let accounts = await store.accounts()
+        let restoredCount = try await store.restoreRemovedAccounts()
+        let remainingRemoved = await store.removedAccountIDs()
+        XCTAssertEqual(removed, [external.id])
+        XCTAssertTrue(accounts.isEmpty)
+        XCTAssertEqual(restoredCount, 1)
+        XCTAssertTrue(remainingRemoved.isEmpty)
+    }
+
+    func testSavingAccountClearsMatchingRemovedMarker() async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathComponent("accounts-v1.json")
+        let store = MonitorMetadataStore(url: url)
+        let account = MonitorAccount.make(
+            provider: .codex,
+            accountKey: "same@example.com",
+            source: .quotioKeychain,
+            canDelete: true
+        )
+
+        try await store.setRemoved(true, accountID: account.id)
+        try await store.saveAccount(account)
+
+        let removed = await store.removedAccountIDs()
+        let accounts = await store.accounts()
+        XCTAssertTrue(removed.isEmpty)
+        XCTAssertEqual(accounts, [account])
+    }
+
+    func testRemovedAccountIsFilteredFromBootstrapAndRefresh() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let snapshotsURL = directory.appendingPathComponent("snapshots-v1.json")
+        let metadataURL = directory.appendingPathComponent("accounts-v1.json")
+        let account = MonitorAccount.make(
+            provider: .claude,
+            accountKey: "removed@example.com",
+            source: .nativeCredential
+        )
+        await MonitorSnapshotStore(url: snapshotsURL).store([
+            .claude: [account.accountKey: ideQuota(42)],
+        ])
+        try await MonitorMetadataStore(url: metadataURL).setRemoved(true, accountID: account.id)
+        let coordinator = makeIsolatedCoordinator(snapshots: snapshotsURL, metadata: metadataURL)
+        let refreshedQuota = ideQuota(84)
+
+        let bootstrap = await coordinator.bootstrap()
+        let refreshed = await coordinator.refresh(
+            provider: .claude,
+            force: true,
+            previous: [account.accountKey: ideQuota(42)]
+        ) {
+            [account.accountKey: refreshedQuota]
+        }
+
+        XCTAssertNil(bootstrap.quotas[.claude])
+        XCTAssertFalse(bootstrap.accounts.contains { $0.id == account.id })
+        XCTAssertTrue(refreshed.isEmpty, "A refresh must not resurrect a removed account")
+    }
+
+    @MainActor
+    func testMonitorRowsExposeSafeRemovalAndRecoveryActions() {
+        let external = MonitorAccount.make(
+            provider: .claude,
+            accountKey: "external@example.com",
+            source: .nativeCredential
+        )
+        let externalRow = AccountRowData.from(
+            monitorAccount: external,
+            status: "outdated",
+            statusMessage: "Refresh failed"
+        )
+        XCTAssertTrue(externalRow.canDelete)
+        XCTAssertTrue(externalRow.removesFromQuotioOnly)
+        XCTAssertTrue(externalRow.needsRecovery)
+        XCTAssertTrue(externalRow.requiresSourceRecovery)
+        XCTAssertEqual(externalRow.recoveryActionKey, "providers.signInAgain")
+
+        let owned = MonitorAccount.make(
+            provider: .kimi,
+            accountKey: "work",
+            source: .quotioKeychain,
+            canDelete: true
+        )
+        let ownedRow = AccountRowData.from(
+            monitorAccount: owned,
+            status: "error",
+            statusMessage: "Unauthorized"
+        )
+        XCTAssertTrue(ownedRow.canDelete)
+        XCTAssertFalse(ownedRow.removesFromQuotioOnly)
+        XCTAssertTrue(ownedRow.canEdit)
+        XCTAssertFalse(ownedRow.requiresSourceRecovery)
+        XCTAssertTrue(ownedRow.needsRecovery)
+        XCTAssertEqual(ownedRow.recoveryActionKey, "providers.updateCredentials")
+    }
+
+    @MainActor
+    func testStoredAPIKeyRemainsReadyWhenQuotaRefreshFails() {
+        let viewModel = QuotaViewModel()
+        let account = MonitorAccount.make(
+            provider: .kimi,
+            accountKey: "work",
+            source: .quotioKeychain,
+            canDelete: true
+        )
+        let issue = MonitorRefreshIssue(
+            message: "Quota refresh failed",
+            occurredAt: Date()
+        )
+        viewModel.monitorIssues[.kimi] = issue
+
+        let status = viewModel.monitorStatus(for: account)
+        let row = AccountRowData.from(
+            monitorAccount: account,
+            status: status.status,
+            statusMessage: status.message
+        )
+
+        XCTAssertEqual(status.status, "ready")
+        XCTAssertEqual(status.message, issue.message)
+        XCTAssertFalse(row.needsRecovery)
+    }
+
+    @MainActor
+    func testStoredAPIKeyRequiresRecoveryAfterExplicitRejection() {
+        let viewModel = QuotaViewModel()
+        let account = MonitorAccount.make(
+            provider: .kimi,
+            accountKey: "work",
+            source: .quotioKeychain,
+            canDelete: true
+        )
+        viewModel.providerQuotas[.kimi] = [
+            account.accountKey: ProviderQuotaData(
+                models: [],
+                lastUpdated: Date(),
+                isForbidden: true
+            ),
+        ]
+
+        let status = viewModel.monitorStatus(for: account)
+        XCTAssertEqual(status.status, "error")
+        XCTAssertEqual(status.message, "monitor.status.authenticationRequired".localized())
+    }
+
+    /// A Quotio-owned Keychain item can survive while becoming undecryptable by the
+    /// running build (its ACL names an older code identity). Every fetcher then skips
+    /// the account, so the flag is the only thing that keeps it visible and explains
+    /// why re-authentication is needed.
+    @MainActor
+    func testUnreadableQuotioCredentialReportsSignInAgain() {
+        let viewModel = QuotaViewModel()
+        let account = MonitorAccount.make(
+            provider: .codex,
+            accountKey: "second@example.com",
+            source: .quotioKeychain,
+            canDelete: true
+        )
+        viewModel.monitorUnreadableCredentials = [
+            QuotaAccountID(provider: .codex, accountKey: account.accountKey),
+        ]
+
+        let status = viewModel.monitorStatus(for: account)
+        XCTAssertEqual(status.status, "error")
+        XCTAssertEqual(status.message, "monitor.status.credentialUnreadable".localized())
     }
 
     func testMetadataLoadDropsLegacyGeminiAccountWithoutDroppingOtherProviders() async throws {
@@ -1783,6 +2204,28 @@ final class MonitorRuntimeTests: XCTestCase {
         XCTAssertEqual(result["account"]?.models.first?.percentage, 75)
         let issues = await coordinator.currentIssues()
         XCTAssertNotNil(issues[.codex])
+        XCTAssertEqual(issues[.codex]?.affectedAccountKeys, Set(["account"]))
+    }
+
+    func testCoordinatorScopesPartialRefreshIssueToMissingAccounts() async {
+        let coordinator = MonitorRefreshCoordinator()
+        let previous = [
+            "working@example.com": ideQuota(50),
+            "expired@example.com": ideQuota(25),
+        ]
+        let refreshed = ideQuota(75)
+
+        _ = await coordinator.refresh(
+            provider: .claude,
+            force: true,
+            previous: previous,
+            operation: { ["working@example.com": refreshed] }
+        )
+
+        let issue = await coordinator.currentIssues()[.claude]
+        XCTAssertEqual(issue?.affectedAccountKeys, Set(["expired@example.com"]))
+        XCTAssertFalse(try XCTUnwrap(issue).affects(accountKey: "working@example.com"))
+        XCTAssertTrue(try XCTUnwrap(issue).affects(accountKey: "EXPIRED@example.com"))
     }
 
     func testCoordinatorRemovesStaleQuotaWhenCredentialsAreMissing() async {
@@ -1816,6 +2259,45 @@ final class MonitorRuntimeTests: XCTestCase {
         )
 
         XCTAssertNil(updated)
+    }
+
+    @MainActor
+    func testMonitorStatusKeepsSuccessfulSiblingReadyAfterPartialRefresh() {
+        let viewModel = QuotaViewModel()
+        let successful = MonitorAccount.make(
+            provider: .claude,
+            accountKey: "working@example.com",
+            source: .quotioKeychain
+        )
+        let failed = MonitorAccount.make(
+            provider: .claude,
+            accountKey: "expired@example.com",
+            source: .nativeCredential
+        )
+        viewModel.providerQuotas[.claude] = [
+            successful.accountKey: ProviderQuotaData(
+                models: [ModelQuota(name: "test", percentage: 80, resetTime: "")],
+                lastUpdated: Date(),
+                isForbidden: false
+            ),
+            failed.accountKey: ProviderQuotaData(
+                models: [],
+                lastUpdated: Date(),
+                isForbidden: true
+            ),
+        ]
+        viewModel.monitorIssues[.claude] = MonitorRefreshIssue(
+            message: "Partial refresh",
+            occurredAt: Date().addingTimeInterval(1),
+            affectedAccountKeys: [failed.accountKey]
+        )
+
+        XCTAssertEqual(viewModel.monitorStatus(for: successful).status, "ready")
+        XCTAssertEqual(viewModel.monitorStatus(for: failed).status, "error")
+        XCTAssertEqual(
+            viewModel.monitorStatus(for: failed).message,
+            "monitor.status.authenticationRequired".localized()
+        )
     }
 
     func testKiroFallbackAccountKeysDoNotCollide() {

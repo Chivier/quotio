@@ -29,6 +29,14 @@ struct QuotaScreen: View {
         for provider in viewModel.providerQuotas.keys {
             providers.insert(provider)
         }
+
+        // In monitor mode an account can be discovered before its first quota
+        // refresh succeeds. Keep that provider selectable while data is pending.
+        if modeManager.isMonitorMode {
+            for account in viewModel.monitorAccounts {
+                providers.insert(account.provider)
+            }
+        }
         
         return providers.sorted { $0.displayName < $1.displayName }
     }
@@ -49,7 +57,13 @@ struct QuotaScreen: View {
             }
         }
         
-        return accounts.count
+        let trackedCount = modeManager.isMonitorMode
+            ? viewModel.monitorAccounts.count { $0.provider == provider }
+            : 0
+        return QuotaOverviewSummary.accountCount(
+            tracked: trackedCount,
+            withQuota: accounts.count
+        )
     }
     
     private func lowestQuotaPercent(for provider: AIProvider) -> Double? {
@@ -194,6 +208,9 @@ struct QuotaScreen: View {
                         authFiles: viewModel.authFiles.filter { $0.providerType == provider },
                         quotaData: viewModel.providerQuotas[provider] ?? [:],
                         subscriptionInfos: viewModel.subscriptionInfos[provider] ?? [:],
+                        trackedAccounts: modeManager.isMonitorMode
+                            ? viewModel.monitorAccounts.filter { $0.provider == provider && !$0.isDisabled }
+                            : [],
                         isLoading: viewModel.refreshingProviders.contains(provider)
                     )
                     .padding(.horizontal, 24)
@@ -375,6 +392,7 @@ private struct ProviderQuotaView: View {
     let authFiles: [AuthFile]
     let quotaData: [String: ProviderQuotaData]
     let subscriptionInfos: [String: SubscriptionInfo]
+    let trackedAccounts: [MonitorAccount]
     let isLoading: Bool
     
     /// Get all accounts (from auth files or quota data keys)
@@ -392,6 +410,24 @@ private struct ProviderQuotaView: View {
                 authFile: file,
                 quotaData: quotaData[key],
                 subscriptionInfo: subscriptionInfos[key]
+            ))
+        }
+
+        // In Monitor mode the tracked account list is authoritative. An account whose
+        // quota fetch produced nothing — expired login, unreadable Keychain item,
+        // provider error — must still get a card, otherwise it silently vanishes and
+        // the screen looks like the account was never added.
+        for account in trackedAccounts where !accounts.contains(where: { $0.key == account.accountKey }) {
+            let status = viewModel.monitorStatus(for: account)
+            accounts.append(AccountInfo(
+                key: account.accountKey,
+                email: account.displayName,
+                status: status.status ?? "pending",
+                statusColor: Self.statusColor(for: status.status),
+                authFile: nil,
+                quotaData: quotaData[account.accountKey],
+                subscriptionInfo: subscriptionInfos[account.accountKey],
+                statusMessage: status.message
             ))
         }
         
@@ -462,6 +498,15 @@ private struct ProviderQuotaView: View {
                 .fill(Color.primary.opacity(0.03))
         )
     }
+
+    private static func statusColor(for status: String?) -> Color {
+        switch status {
+        case "error": .red
+        case "outdated": .orange
+        case "ready": .green
+        default: .secondary
+        }
+    }
 }
 
 // MARK: - Account Info
@@ -474,6 +519,9 @@ private struct AccountInfo {
     let authFile: AuthFile?
     let quotaData: ProviderQuotaData?
     let subscriptionInfo: SubscriptionInfo?
+    /// Why this account has no quota, when the reason is known. Auth-file rows keep
+    /// using `authFile.humanReadableStatus` instead.
+    var statusMessage: String?
 }
 
 // MARK: - Account Quota Card V2
@@ -593,8 +641,12 @@ private struct AccountQuotaCardV2: View {
                 QuotaLoadingView()
             } else if hasQuotaData {
                 usageSection
-            } else if let message = account.authFile?.humanReadableStatus {
+            } else if let message = account.statusMessage ?? account.authFile?.humanReadableStatus {
                 Text(message)
+                    .font(.subheadline)
+                    .foregroundStyle(account.status == "error" ? Color.orange : .secondary)
+            } else {
+                Text("quota.noDataYet".localized())
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
@@ -705,7 +757,10 @@ private struct AccountQuotaCardV2: View {
                 
                 Button {
                     Task {
-                        await viewModel.refreshQuota(for: accountID)
+                        await viewModel.refreshQuota(
+                            for: accountID,
+                            allowCredentialAccessPrompt: true
+                        )
                     }
                 } label: {
                     if isRefreshing || isLoading {

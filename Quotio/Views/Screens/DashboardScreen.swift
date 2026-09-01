@@ -69,6 +69,14 @@ struct DashboardScreen: View {
     private var groupedMonitorAccounts: [AIProvider: [MonitorAccount]] {
         Dictionary(grouping: viewModel.monitorAccounts) { $0.provider }
     }
+
+    /// Providers in the overview come from tracked accounts first. Quota-only
+    /// providers remain visible even when every request in the latest refresh failed.
+    private var quotaOverviewProviders: [AIProvider] {
+        Set(viewModel.providerQuotas.keys)
+            .union(viewModel.monitorAccounts.map(\.provider))
+            .sorted { $0.displayName < $1.displayName }
+    }
     
     var body: some View {
         ScrollView {
@@ -220,7 +228,7 @@ struct DashboardScreen: View {
     
     private var quotaStatusSection: some View {
         GroupBox {
-            if viewModel.providerQuotas.isEmpty {
+            if quotaOverviewProviders.isEmpty {
                 VStack(spacing: 12) {
                     Image(systemName: "chart.bar.xaxis")
                         .font(.largeTitle)
@@ -242,11 +250,16 @@ struct DashboardScreen: View {
                 .padding(.vertical, 20)
             } else {
                 VStack(alignment: .leading, spacing: 12) {
-                    // Sort providers for stable iteration order (ForEach performance fix)
-                    ForEach(viewModel.providerQuotas.keys.sorted { $0.displayName < $1.displayName }) { provider in
-                        if let accounts = viewModel.providerQuotas[provider], !accounts.isEmpty {
-                            QuotaProviderRow(provider: provider, accounts: accounts)
-                        }
+                    ForEach(quotaOverviewProviders) { provider in
+                        let quotaAccounts = viewModel.providerQuotas[provider] ?? [:]
+                        QuotaProviderRow(
+                            provider: provider,
+                            accounts: quotaAccounts,
+                            accountCount: QuotaOverviewSummary.accountCount(
+                                tracked: groupedMonitorAccounts[provider]?.count ?? 0,
+                                withQuota: quotaAccounts.count
+                            )
+                        )
                     }
                 }
             }
@@ -810,12 +823,14 @@ struct FlowLayout: Layout {
 struct QuotaProviderRow: View {
     let provider: AIProvider
     let accounts: [String: ProviderQuotaData]
+    let accountCount: Int
     
-    private var lowestQuota: Double {
-        accounts.values.flatMap { $0.models }.map { $0.percentage }.min() ?? 100
+    private var lowestQuota: Double? {
+        QuotaOverviewSummary.lowestAvailablePercentage(in: accounts)
     }
     
     private var quotaColor: Color {
+        guard let lowestQuota else { return .secondary }
         if lowestQuota > 50 { return .green }
         if lowestQuota > 20 { return .orange }
         return .red
@@ -830,9 +845,18 @@ struct QuotaProviderRow: View {
                     .font(.subheadline)
                     .fontWeight(.medium)
                 
-                Text("\(accounts.count) " + "quota.accounts".localized())
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 4) {
+                    Text("\(accountCount) " + "quota.accounts".localized())
+
+                    if accountCount > accounts.count {
+                        Image(systemName: "exclamationmark.circle.fill")
+                            .foregroundStyle(.orange)
+                            .help("dashboard.partialQuotaCoverage".localized())
+                            .accessibilityLabel("dashboard.partialQuotaCoverage".localized())
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
             
             Spacer()
@@ -843,7 +867,7 @@ struct QuotaProviderRow: View {
                     .fill(quotaColor)
                     .frame(width: 8, height: 8)
                 
-                Text(String(format: "%.0f%%", lowestQuota))
+                Text(lowestQuota.map { String(format: "%.0f%%", $0) } ?? "—")
                     .font(.subheadline)
                     .fontWeight(.semibold)
                     .foregroundStyle(quotaColor)
@@ -854,5 +878,21 @@ struct QuotaProviderRow: View {
             .clipShape(Capsule())
         }
         .padding(.vertical, 6)
+    }
+}
+
+nonisolated enum QuotaOverviewSummary {
+    /// Tracked accounts are authoritative. Quota rows are only a fallback for
+    /// providers restored before account discovery has completed.
+    static func accountCount(tracked: Int, withQuota quotaCount: Int) -> Int {
+        tracked > 0 ? tracked : quotaCount
+    }
+
+    static func lowestAvailablePercentage(in accounts: [String: ProviderQuotaData]) -> Double? {
+        accounts.values
+            .flatMap(\.models)
+            .filter { !$0.isStandaloneMetric && (0...100).contains($0.percentage) }
+            .map(\.percentage)
+            .min()
     }
 }

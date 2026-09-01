@@ -26,6 +26,8 @@ final class QuotaViewModel {
     @ObservationIgnored private let grokFetcher = GrokQuotaFetcher()
     @ObservationIgnored private let openRouterFetcher = OpenRouterQuotaFetcher()
     @ObservationIgnored private let ampFetcher = AmpQuotaFetcher()
+    @ObservationIgnored private let kimiFetcher = KimiQuotaFetcher()
+    @ObservationIgnored private let miniMaxFetcher = MiniMaxQuotaFetcher()
     @ObservationIgnored private let directAuthService = DirectAuthFileService()
     @ObservationIgnored private let monitorCoordinator = MonitorRefreshCoordinator()
     @ObservationIgnored private let notificationManager = NotificationManager.shared
@@ -104,23 +106,43 @@ final class QuotaViewModel {
     var monitorAccounts: [MonitorAccount] = []
     var monitorIssues: [AIProvider: MonitorRefreshIssue] = [:]
     var monitorAccountIssues: [QuotaAccountID: MonitorRefreshIssue] = [:]
+    /// Tracked accounts whose Quotio-owned credential is stored but unreadable by
+    /// this build. They fetch no quota at all, so without an explicit flag they
+    /// would only be visible by their absence.
+    var monitorUnreadableCredentials: Set<QuotaAccountID> = []
+    private(set) var removedMonitorAccountCount = 0
 
     func monitorStatus(for account: MonitorAccount) -> (status: String?, message: String?) {
+        let quota = providerQuotas[account.provider]?[account.accountKey]
         let updated = Self.monitorLastUpdated(for: account, providerQuotas: providerQuotas)
         let accountID = QuotaAccountID(provider: account.provider, accountKey: account.accountKey)
+        // A Quotio-owned API key does not expire just because a quota endpoint is
+        // temporarily unavailable. Only an explicit 401/403 (mapped to
+        // `isForbidden`) proves that the stored credential needs attention.
+        let hasStoredAPIKey = account.provider.usesAPIKeyAuth
+            && account.source == .quotioKeychain
+        if quota?.isForbidden == true {
+            return ("error", "monitor.status.authenticationRequired".localized())
+        }
+        if monitorUnreadableCredentials.contains(accountID) {
+            return ("error", "monitor.status.credentialUnreadable".localized())
+        }
         if let issue = monitorAccountIssues[accountID],
            updated == nil || updated! <= issue.occurredAt {
-            return ("outdated", issue.message)
+            return (hasStoredAPIKey ? "ready" : "outdated", issue.message)
         }
         if let issue = monitorIssues[account.provider],
+           issue.affects(accountKey: account.accountKey),
            updated == nil || updated! <= issue.occurredAt {
-            return ("outdated", issue.message)
+            return (hasStoredAPIKey ? "ready" : "outdated", issue.message)
         }
-        guard let updated else { return (nil, nil) }
+        guard let updated else {
+            return hasStoredAPIKey ? ("ready", nil) : (nil, nil)
+        }
         let staleAfter = refreshSettings.refreshCadence.intervalSeconds ?? 600
         if Date().timeIntervalSince(updated) > staleAfter {
             return (
-                "outdated",
+                hasStoredAPIKey ? "ready" : "outdated",
                 String(format: "monitor.status.outdated".localized(), updated.formatted(date: .abbreviated, time: .shortened))
             )
         }
@@ -328,6 +350,8 @@ final class QuotaViewModel {
         await devinFetcher.updateProxyConfiguration()
         await grokFetcher.updateProxyConfiguration()
         await openRouterFetcher.updateProxyConfiguration()
+        await kimiFetcher.updateProxyConfiguration()
+        await miniMaxFetcher.updateProxyConfiguration()
         await ampFetcher.updateProxyConfiguration()
     }
 
@@ -406,6 +430,7 @@ final class QuotaViewModel {
         monitorAccounts = bootstrap.accounts
         monitorIssues = bootstrap.issues
         providerQuotas = bootstrap.quotas
+        removedMonitorAccountCount = await monitorCoordinator.removedAccountCount()
 
         // Keep legacy files available only as a compatibility source.
         await loadDirectAuthFiles()
@@ -438,8 +463,14 @@ final class QuotaViewModel {
     }
 
     func deleteMonitorAccount(accountID: String) async {
-        guard let account = monitorAccounts.first(where: { $0.id == accountID }), account.canDelete else { return }
-        await monitorCoordinator.deleteOwnedAccount(accountID: accountID)
+        guard let account = monitorAccounts.first(where: { $0.id == accountID }) else { return }
+        if account.canDelete {
+            await monitorCoordinator.deleteOwnedAccount(accountID: accountID)
+        } else {
+            // Credentials discovered in another app are user-owned. Removing one from
+            // Quotio hides it persistently without deleting the source file/keychain item.
+            await monitorCoordinator.removeDiscoveredAccount(accountID: accountID)
+        }
         removeQuotaEntry(provider: account.provider, accountKey: account.accountKey)
 
         // Drop the entry from the persisted Monitor snapshot directly. Rewriting the
@@ -453,12 +484,26 @@ final class QuotaViewModel {
         // Re-read the state after the suspension: a concurrent refresh may have written
         // the account back into `providerQuotas` while this task was suspended.
         removeQuotaEntry(provider: account.provider, accountKey: account.accountKey)
+        providerQuotas = await monitorCoordinator.filteringRemovedAccounts(from: providerQuotas)
 
         if modeManager.isMonitorMode {
             await monitorCoordinator.finish(quotas: providerQuotas)
             monitorAccounts = await monitorCoordinator.discoverAccounts(merging: providerQuotas)
         }
+        removedMonitorAccountCount = await monitorCoordinator.removedAccountCount()
         syncMenuBarSelection()
+        notifyQuotaDataChanged()
+    }
+
+    func restoreRemovedMonitorAccounts() async {
+        guard await monitorCoordinator.restoreRemovedAccounts() > 0 else { return }
+        removedMonitorAccountCount = 0
+        monitorAccounts = await monitorCoordinator.discoverAccounts(merging: providerQuotas)
+        if modeManager.isMonitorMode {
+            await refreshQuotasDirectly(force: true)
+        }
+        syncMenuBarSelection()
+        notifyQuotaDataChanged()
     }
 
     /// Delete an account imported from a local IDE (Cursor, Trae) via "Scan for IDEs".
@@ -543,6 +588,24 @@ final class QuotaViewModel {
         )
     }
 
+    func saveKimiAccount(label: String, apiKey: String, existingAccountID: String? = nil) async throws {
+        try await saveMonitorAPIKeyAccount(
+            provider: .kimi,
+            label: label,
+            apiKey: apiKey,
+            existingAccountID: existingAccountID
+        )
+    }
+
+    func saveMiniMaxAccount(label: String, apiKey: String, existingAccountID: String? = nil) async throws {
+        try await saveMonitorAPIKeyAccount(
+            provider: .minimax,
+            label: label,
+            apiKey: apiKey,
+            existingAccountID: existingAccountID
+        )
+    }
+
     private func saveMonitorAPIKeyAccount(
         provider: AIProvider,
         label: String,
@@ -591,7 +654,7 @@ final class QuotaViewModel {
             )
         }
 
-        try await MonitorCredentialVault.shared.save(
+        try await MonitorCredentialVault.shared.saveUserInitiated(
             MonitorOAuthCredential(
                 accessToken: trimmedKey,
                 refreshToken: nil,
@@ -611,7 +674,7 @@ final class QuotaViewModel {
     func refreshQuotasDirectly(force: Bool = false) async {
         let providers: Set<AIProvider> = [
             .codex, .claude, .copilot, .kiro, .glm, .clinePass, .warp,
-            .antigravity, .factoryDroid, .devin, .grok, .openRouter, .amp,
+            .antigravity, .factoryDroid, .devin, .grok, .openRouter, .amp, .kimi, .minimax,
         ]
         guard beginBatchRefresh(providers: providers) else { return }
         defer { endBatchRefresh(providers: providers) }
@@ -625,7 +688,7 @@ final class QuotaViewModel {
         let discoveredAccountKeys = Dictionary(grouping: discoveredAccounts, by: \.provider)
             .mapValues { Set($0.map(\.accountKey)) }
         let credentialProviders: Set<AIProvider> = [
-            .codex, .claude, .copilot, .kiro, .antigravity, .factoryDroid, .devin, .grok, .openRouter, .amp,
+            .codex, .claude, .copilot, .kiro, .antigravity, .factoryDroid, .devin, .grok, .openRouter, .amp, .kimi, .minimax,
         ]
         let credentialAvailability = Dictionary(uniqueKeysWithValues: credentialProviders.map {
             ($0, discoveredProviders.contains($0) ? MonitorCredentialAvailability.present : .missing)
@@ -643,6 +706,8 @@ final class QuotaViewModel {
         let grokQuotaFetcher = grokFetcher
         let openRouterQuotaFetcher = openRouterFetcher
         let ampQuotaFetcher = ampFetcher
+        let kimiQuotaFetcher = kimiFetcher
+        let miniMaxQuotaFetcher = miniMaxFetcher
         let warpTokens = WarpService.shared.tokens.filter { $0.isEnabled }
         let factoryDroidPrevious = previous[.factoryDroid]?.filter {
             discoveredAccountKeys[.factoryDroid]?.contains($0.key) == true
@@ -658,6 +723,12 @@ final class QuotaViewModel {
         } ?? [:]
         let ampPrevious = previous[.amp]?.filter {
             discoveredAccountKeys[.amp]?.contains($0.key) == true
+        } ?? [:]
+        let kimiPrevious = previous[.kimi]?.filter {
+            discoveredAccountKeys[.kimi]?.contains($0.key) == true
+        } ?? [:]
+        let miniMaxPrevious = previous[.minimax]?.filter {
+            discoveredAccountKeys[.minimax]?.contains($0.key) == true
         } ?? [:]
 
         async let codex = coordinator.refresh(
@@ -750,6 +821,22 @@ final class QuotaViewModel {
         ) {
             await ampQuotaFetcher.fetchAllQuotas()
         }
+        async let kimi = coordinator.refresh(
+            provider: .kimi,
+            force: force,
+            previous: kimiPrevious,
+            credentialAvailability: credentialAvailability[.kimi] ?? .unknown
+        ) {
+            await kimiQuotaFetcher.fetchAllQuotas()
+        }
+        async let miniMax = coordinator.refresh(
+            provider: .minimax,
+            force: force,
+            previous: miniMaxPrevious,
+            credentialAvailability: credentialAvailability[.minimax] ?? .unknown
+        ) {
+            await miniMaxQuotaFetcher.fetchAllQuotas()
+        }
 
         let fetchedAntigravityData = await antigravityData
         let antigravity = await coordinator.refresh(
@@ -777,6 +864,8 @@ final class QuotaViewModel {
         providerQuotas[.grok] = await grok
         providerQuotas[.openRouter] = await openRouter
         providerQuotas[.amp] = await amp
+        providerQuotas[.kimi] = await kimi
+        providerQuotas[.minimax] = await miniMax
         providerQuotas = providerQuotas.filter { !$0.value.isEmpty }
 
         // Refresh (not re-import) already-imported Cursor/Trae accounts before the
@@ -785,7 +874,9 @@ final class QuotaViewModel {
 
         monitorAccounts = await coordinator.discoverAccounts(merging: providerQuotas)
         removeDisabledMonitorQuotas()
+        await refreshUnreadableCredentialFlags()
         monitorIssues = await coordinator.currentIssues()
+        removedMonitorAccountCount = await coordinator.removedAccountCount()
         await coordinator.finish(quotas: providerQuotas)
         
         checkQuotaNotifications()
@@ -837,6 +928,26 @@ final class QuotaViewModel {
             providerQuotas[account.provider]?.removeValue(forKey: account.accountKey)
         }
         removeHiddenPlaceholderQuotas()
+    }
+
+    /// Mark Quotio-owned accounts whose Keychain item exists but cannot be decrypted
+    /// by the running executable.
+    ///
+    /// Every fetcher treats an unreadable credential exactly like a missing one and
+    /// skips the account, so it contributes no quota row and used to disappear from
+    /// the Quota screen and the menu bar entirely — including right after the user
+    /// re-authenticated. Only accounts that produced no quota are probed, so the
+    /// healthy path costs no extra Keychain work.
+    private func refreshUnreadableCredentialFlags() async {
+        var unreadable: Set<QuotaAccountID> = []
+        for account in monitorAccounts
+        where account.source == .quotioKeychain && !account.isDisabled {
+            guard providerQuotas[account.provider]?[account.accountKey] == nil,
+                  await MonitorCredentialVault.shared.credentialState(for: account.id) == .unreadable
+            else { continue }
+            unreadable.insert(QuotaAccountID(provider: account.provider, accountKey: account.accountKey))
+        }
+        monitorUnreadableCredentials = unreadable
     }
 
     /// `MonitorRefreshCoordinator.discoverAccounts` hides generic placeholder
@@ -909,6 +1020,24 @@ final class QuotaViewModel {
             providerQuotas[.glm] = quotas
         } else {
             providerQuotas.removeValue(forKey: .glm)
+        }
+    }
+
+    private func refreshKimiQuotasInternal() async {
+        let quotas = await kimiFetcher.fetchAllQuotas()
+        if quotas.isEmpty {
+            providerQuotas.removeValue(forKey: .kimi)
+        } else {
+            providerQuotas[.kimi] = quotas
+        }
+    }
+
+    private func refreshMiniMaxQuotasInternal() async {
+        let quotas = await miniMaxFetcher.fetchAllQuotas()
+        if quotas.isEmpty {
+            providerQuotas.removeValue(forKey: .minimax)
+        } else {
+            providerQuotas[.minimax] = quotas
         }
     }
 
@@ -1605,7 +1734,7 @@ final class QuotaViewModel {
             await refreshQuotasDirectly()
             return
         }
-        let providers: Set<AIProvider> = [.antigravity, .codex, .copilot, .claude, .glm, .warp, .kiro, .clinePass]
+        let providers: Set<AIProvider> = [.antigravity, .codex, .copilot, .claude, .glm, .kimi, .warp, .kiro, .clinePass]
         guard beginBatchRefresh(providers: providers) else { return }
         defer { endBatchRefresh(providers: providers) }
 
@@ -1622,8 +1751,9 @@ final class QuotaViewModel {
         async let warp: () = refreshWarpQuotasInternal()
         async let kiro: () = refreshKiroQuotasInternal()
         async let clinePass: () = refreshClinePassQuotasInternal()
+        async let kimi: () = refreshKimiQuotasInternal()
 
-        _ = await (antigravity, openai, copilot, claudeCode, glm, warp, kiro, clinePass)
+        _ = await (antigravity, openai, copilot, claudeCode, glm, warp, kiro, clinePass, kimi)
 
         // Refresh (not re-import) already-imported Cursor/Trae accounts (#163).
         await refreshImportedIDEQuotas()
@@ -1645,7 +1775,7 @@ final class QuotaViewModel {
             return
         }
         let providers: Set<AIProvider> = [
-            .antigravity, .codex, .copilot, .claude, .glm, .warp, .kiro, .clinePass,
+            .antigravity, .codex, .copilot, .claude, .glm, .kimi, .warp, .kiro, .clinePass,
         ]
         guard beginBatchRefresh(providers: providers) else { return }
         defer { endBatchRefresh(providers: providers) }
@@ -1663,8 +1793,9 @@ final class QuotaViewModel {
         async let warp: () = refreshWarpQuotasInternal()
         async let kiro: () = refreshKiroQuotasInternal()
         async let clinePass: () = refreshClinePassQuotasInternal()
+        async let kimi: () = refreshKimiQuotasInternal()
 
-        _ = await (antigravity, codex, copilot, claudeCode, glm, warp, kiro, clinePass)
+        _ = await (antigravity, codex, copilot, claudeCode, glm, warp, kiro, clinePass, kimi)
 
         // Refresh (not re-import) already-imported Cursor/Trae accounts (#163).
         await refreshImportedIDEQuotas()
@@ -1791,6 +1922,10 @@ final class QuotaViewModel {
             await refreshTraeQuotasInternal()
         case .glm:
             await refreshGlmQuotasInternal()
+        case .kimi:
+            await refreshKimiQuotasInternal()
+        case .minimax:
+            await refreshMiniMaxQuotasInternal()
         case .warp:
             await refreshWarpQuotasInternal()
         case .kiro:
@@ -1814,11 +1949,15 @@ final class QuotaViewModel {
         await finishScopedRefresh(provider: provider)
     }
 
-    func refreshQuota(for account: QuotaAccountID) async {
+    func refreshQuota(
+        for account: QuotaAccountID,
+        allowCredentialAccessPrompt: Bool = false
+    ) async {
         guard beginScopedRefresh(provider: account.provider, account: account) else { return }
         defer { endScopedRefresh(provider: account.provider, account: account) }
 
         let quota: ProviderQuotaData?
+        var resolvedAccountKey = account.accountKey
         var subscription: SubscriptionInfo?
 
         switch account.provider {
@@ -1827,7 +1966,12 @@ final class QuotaViewModel {
             quota = result.quota
             subscription = result.subscription
         case .codex:
-            quota = await codexCLIFetcher.fetchQuota(forAccountKey: account.accountKey)
+            let result = await codexCLIFetcher.fetchQuotaResult(
+                forAccountKey: account.accountKey,
+                allowUserInteraction: modeManager.isMonitorMode && allowCredentialAccessPrompt
+            )
+            quota = result?.quota
+            resolvedAccountKey = result?.accountKey ?? account.accountKey
         case .copilot:
             quota = await copilotFetcher.fetchQuota(accountKey: account.accountKey)
         case .claude:
@@ -1863,6 +2007,13 @@ final class QuotaViewModel {
             quota = await openRouterFetcher.fetchQuota(accountKey: account.accountKey)
         case .amp:
             quota = await ampFetcher.fetchQuota(accountKey: account.accountKey)
+        case .kimi:
+            quota = await kimiFetcher.fetchQuota(
+                accountKey: account.accountKey,
+                allowUserInteraction: modeManager.isMonitorMode && allowCredentialAccessPrompt
+            )
+        case .minimax:
+            quota = await miniMaxFetcher.fetchQuota(accountKey: account.accountKey)
         case .qwen, .iflow, .vertex:
             return
         }
@@ -1877,10 +2028,9 @@ final class QuotaViewModel {
             return
         }
         if account.provider == .codex {
-            let fresh = await codexCLIFetcher.promoteFreshLegacyAliases(in: [account.accountKey: quota])
             var quotas = providerQuotas[.codex, default: [:]]
             quotas.removeValue(forKey: account.accountKey)
-            quotas.merge(fresh) { _, fresh in fresh }
+            quotas[resolvedAccountKey] = quota
             providerQuotas[.codex] = await codexCLIFetcher.reconcileLegacyAliases(in: quotas)
         } else {
             providerQuotas[account.provider, default: [:]][account.accountKey] = quota
@@ -1889,6 +2039,9 @@ final class QuotaViewModel {
             subscriptionInfos[account.provider, default: [:]][account.accountKey] = subscription
         }
         monitorAccountIssues.removeValue(forKey: account)
+        monitorAccountIssues.removeValue(
+            forKey: QuotaAccountID(provider: account.provider, accountKey: resolvedAccountKey)
+        )
         await finishScopedRefresh(provider: account.provider)
     }
 
@@ -1926,7 +2079,7 @@ final class QuotaViewModel {
         let previous = providerQuotas[provider] ?? [:]
         let credentialProviders: Set<AIProvider> = [
             .codex, .claude, .copilot, .kiro, .antigravity,
-            .factoryDroid, .devin, .grok, .openRouter, .amp,
+            .factoryDroid, .devin, .grok, .openRouter, .amp, .kimi, .minimax,
         ]
         let discoveredProviders = Set(await coordinator.discoverAccounts().map(\.provider))
         let credentialAvailability: MonitorCredentialAvailability = credentialProviders.contains(provider)
@@ -2028,6 +2181,16 @@ final class QuotaViewModel {
             fresh = await coordinatedRefresh {
                 await fetcher.fetchAllQuotas()
             }
+        case .kimi:
+            let fetcher = kimiFetcher
+            fresh = await coordinatedRefresh {
+                await fetcher.fetchAllQuotas()
+            }
+        case .minimax:
+            let fetcher = miniMaxFetcher
+            fresh = await coordinatedRefresh {
+                await fetcher.fetchAllQuotas()
+            }
         case .cursor:
             let fetcher = cursorFetcher
             fresh = await coordinatedRefresh {
@@ -2058,7 +2221,9 @@ final class QuotaViewModel {
         if modeManager.isMonitorMode {
             monitorAccounts = await monitorCoordinator.discoverAccounts(merging: providerQuotas)
             removeDisabledMonitorQuotas()
+            await refreshUnreadableCredentialFlags()
             monitorIssues = await monitorCoordinator.currentIssues()
+            removedMonitorAccountCount = await monitorCoordinator.removedAccountCount()
             await monitorCoordinator.finish(quotas: providerQuotas)
         }
 
@@ -2897,57 +3062,9 @@ final class QuotaViewModel {
     }
     
     // MARK: - Menu Bar Quota Items
-    
+
     var menuBarSettings: MenuBarSettingsManager {
         MenuBarSettingsManager.shared
-    }
-    
-    var menuBarQuotaItems: [MenuBarQuotaDisplayItem] {
-        let settings = menuBarSettings
-        guard settings.showQuotaInMenuBar else { return [] }
-        
-        var items: [MenuBarQuotaDisplayItem] = []
-        
-        for selectedItem in settings.selectedItems {
-            guard let provider = selectedItem.aiProvider else { continue }
-            
-            let shortAccount = shortenAccountKey(selectedItem.accountKey)
-            
-            if let accountQuotas = providerQuotas[provider],
-               let quotaData = accountQuotas[selectedItem.accountKey],
-               !quotaData.models.isEmpty {
-                // Filter out -1 (unknown) percentages when calculating lowest
-                let validPercentages = quotaData.models.map(\.percentage).filter { $0 >= 0 }
-                let lowestPercent = validPercentages.min() ?? (quotaData.models.first?.percentage ?? -1)
-                items.append(MenuBarQuotaDisplayItem(
-                    id: selectedItem.id,
-                    providerSymbol: provider.menuBarSymbol,
-                    accountShort: shortAccount,
-                    percentage: lowestPercent,
-                    provider: provider
-                ))
-            } else {
-                items.append(MenuBarQuotaDisplayItem(
-                    id: selectedItem.id,
-                    providerSymbol: provider.menuBarSymbol,
-                    accountShort: shortAccount,
-                    percentage: -1,
-                    provider: provider
-                ))
-            }
-        }
-        
-        return items
-    }
-    
-    private func shortenAccountKey(_ key: String) -> String {
-        if let atIndex = key.firstIndex(of: "@") {
-            let user = String(key[..<atIndex].prefix(4))
-            let domainStart = key.index(after: atIndex)
-            let domain = String(key[domainStart...].prefix(1))
-            return "\(user)@\(domain)"
-        }
-        return String(key.prefix(6))
     }
 }
 

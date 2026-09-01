@@ -13,6 +13,17 @@
 import AppKit
 import SwiftUI
 
+/// One row of the menu bar dropdown's account list.
+///
+/// `data` is nil for a tracked account whose quota could not be fetched; such an
+/// account is still listed, with `statusMessage` explaining the gap.
+nonisolated struct MenuBarAccountRow {
+    let accountKey: String
+    let email: String
+    let data: ProviderQuotaData?
+    let statusMessage: String?
+}
+
 // MARK: - Status Bar Menu Builder
 
 @MainActor
@@ -51,7 +62,7 @@ final class StatusBarMenuBuilder {
         }
 
         // 3. Provider picker and account groups
-        let providers = providersWithData
+        let providers = providersWithData.filter { hasDisplayableMenuContent(for: $0) }
         if !providers.isEmpty {
             let pickerView = MenuProviderPickerView(
                 providers: providers,
@@ -64,7 +75,7 @@ final class StatusBarMenuBuilder {
 
             let visibleProviders = visibleProviders(from: providers)
             let showsProviderHeaders = selectedProvider(from: providers) == nil
-            for (index, provider) in visibleProviders.enumerated() {
+            for provider in visibleProviders {
                 let accounts = accountsForProvider(provider)
 
                 if showsProviderHeaders {
@@ -80,16 +91,13 @@ final class StatusBarMenuBuilder {
                             accountKey: account.accountKey,
                             email: account.email,
                             data: account.data,
+                            statusMessage: account.statusMessage,
                             provider: provider
                         )
                         menu.addItem(cardItem)
                     }
                 }
 
-                // Separator between provider groups (not after the last one)
-                if index < visibleProviders.count - 1 {
-                    menu.addItem(NSMenuItem.separator())
-                }
             }
 
             menu.addItem(NSMenuItem.separator())
@@ -220,13 +228,62 @@ final class StatusBarMenuBuilder {
         return [provider]
     }
 
-    private func accountsForProvider(
-        _ provider: AIProvider
-    ) -> [(accountKey: String, email: String, data: ProviderQuotaData)] {
-        guard let quotas = viewModel.providerQuotas[provider] else { return [] }
-        return Self.orderedAccounts(quotas, provider: provider) {
+    private func accountsForProvider(_ provider: AIProvider) -> [MenuBarAccountRow] {
+        let quotas = viewModel.providerQuotas[provider] ?? [:]
+        let ordered = Self.orderedAccounts(quotas, provider: provider) {
             viewModel.isAntigravityAccountActive(email: $0)
         }
+        guard modeManager.isMonitorMode else {
+            return ordered.map {
+                MenuBarAccountRow(accountKey: $0.accountKey, email: $0.email, data: $0.data, statusMessage: nil)
+            }
+        }
+        return Self.accountRows(
+            quotaRows: ordered,
+            trackedAccounts: viewModel.monitorAccounts.filter { $0.provider == provider }
+        ) {
+            viewModel.monitorStatus(for: $0).message
+        }
+    }
+
+    /// Hide providers that would only render a generic empty block. A specific
+    /// account error remains visible because it gives the user something actionable.
+    private func hasDisplayableMenuContent(for provider: AIProvider) -> Bool {
+        accountsForProvider(provider).contains { row in
+            if let data = row.data {
+                return !data.models.isEmpty || data.isForbidden
+            }
+            return row.statusMessage?.isEmpty == false
+        }
+    }
+
+    /// Builds the dropdown's rows for one provider: quota rows first, in the order
+    /// `orderedAccounts` established, then tracked accounts that produced no quota.
+    ///
+    /// Those trailing rows are the point. Deriving the list from quota data alone hid
+    /// every account whose fetch failed, so a user with two logins saw a single row
+    /// and no explanation for the missing one.
+    nonisolated static func accountRows(
+        quotaRows: [(accountKey: String, email: String, data: ProviderQuotaData)],
+        trackedAccounts: [MonitorAccount],
+        statusMessage: (MonitorAccount) -> String?
+    ) -> [MenuBarAccountRow] {
+        var rows = quotaRows.map {
+            MenuBarAccountRow(accountKey: $0.accountKey, email: $0.email, data: $0.data, statusMessage: nil)
+        }
+        let listed = Set(rows.map(\.accountKey))
+        let pending = trackedAccounts
+            .filter { !$0.isDisabled && !listed.contains($0.accountKey) }
+            .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+        rows.append(contentsOf: pending.map {
+            MenuBarAccountRow(
+                accountKey: $0.accountKey,
+                email: $0.displayName,
+                data: nil,
+                statusMessage: statusMessage($0)
+            )
+        })
+        return rows
     }
 
     /// Orders the menu-bar account rows for `provider`: alphabetical by email, with the
@@ -287,7 +344,8 @@ final class StatusBarMenuBuilder {
     private func buildAccountCardItem(
         accountKey: String,
         email: String,
-        data: ProviderQuotaData,
+        data: ProviderQuotaData?,
+        statusMessage: String?,
         provider: AIProvider
     ) -> NSMenuItem {
         let subscriptionInfo = viewModel.subscriptionInfos[provider]?[accountKey]
@@ -297,6 +355,7 @@ final class StatusBarMenuBuilder {
             accountKey: accountKey,
             email: email,
             data: data,
+            statusMessage: statusMessage,
             provider: provider,
             subscriptionInfo: subscriptionInfo,
             isActiveInIDE: isActiveInIDE,
@@ -306,15 +365,14 @@ final class StatusBarMenuBuilder {
         )
 
         let item = viewItem(for: cardView)
+        guard let data else { return item }
 
         let isAntigravitySummary = provider == .antigravity && data.models.contains { $0.name.hasPrefix("antigravity-") }
 
         if provider == .codex, let analytics = data.analytics, !analytics.isEmpty {
-            let submenu = buildCodexAnalyticsSubmenu(analytics: analytics)
-            item.submenu = submenu
+            item.submenu = buildCodexAnalyticsSubmenu(analytics: analytics)
         } else if provider == .antigravity && !data.models.isEmpty && !isAntigravitySummary {
-            let submenu = buildAntigravitySubmenu(data: data)
-            item.submenu = submenu
+            item.submenu = buildAntigravitySubmenu(data: data)
         }
 
         return item
@@ -518,8 +576,8 @@ private struct MenuProviderSectionHeader: View {
             )
             .help("action.refreshQuota".localized())
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 4)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 3)
     }
 }
 
@@ -542,7 +600,7 @@ private struct MenuProviderPickerView: View {
     
     var body: some View {
         // Wrap providers in a flexible layout
-        FlowLayout(spacing: 6) {
+        FlowLayout(spacing: 4) {
             AllProviderFilterButton(isSelected: selectedProvider == nil) {
                 selectedProviderRaw = ""
                 onProviderChanged()
@@ -558,8 +616,8 @@ private struct MenuProviderPickerView: View {
                 }
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
     }
 }
 
@@ -571,18 +629,18 @@ private struct AllProviderFilterButton: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 6) {
+            HStack(spacing: 5) {
                 Image(systemName: "square.grid.2x2")
                     .font(.system(size: 12, weight: .semibold))
-                    .frame(width: 14, height: 14)
+                    .frame(width: 13, height: 13)
                     .opacity(isSelected ? 1.0 : 0.7)
 
                 Text("menubar.providers.all".localized())
                     .font(.system(size: 11, weight: isSelected ? .semibold : .medium, design: .rounded))
             }
             .foregroundStyle(isSelected ? .primary : .secondary)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
             .background(
                 Capsule()
                     .fill(isSelected ? Color.accentColor.opacity(0.1) : Color.secondary.opacity(0.05))
@@ -605,16 +663,16 @@ private struct ProviderFilterButton: View {
     
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 6) {
-                ProviderIconMono(provider: provider, size: 14)
+            HStack(spacing: 5) {
+                ProviderIconMono(provider: provider, size: 13)
                     .opacity(isSelected ? 1.0 : 0.7)
                 
                 Text(provider.shortName)
                     .font(.system(size: 11, weight: isSelected ? .semibold : .medium, design: .rounded))
             }
             .foregroundStyle(isSelected ? .primary : .secondary)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
             .background(
                 Capsule()
                     .fill(isSelected ? Color.accentColor.opacity(0.1) : Color.secondary.opacity(0.05))
@@ -805,7 +863,8 @@ private struct MenuAccountCardView: View {
     @Environment(QuotaViewModel.self) private var viewModel
     let accountKey: String
     let email: String
-    let data: ProviderQuotaData
+    let data: ProviderQuotaData?
+    let statusMessage: String?
     let provider: AIProvider
     let subscriptionInfo: SubscriptionInfo?
     let isActiveInIDE: Bool
@@ -823,6 +882,8 @@ private struct MenuAccountCardView: View {
     private var displayEmail: String {
         email.masked(if: settings.hideSensitiveInfo)
     }
+
+    private var quotaModels: [ModelQuota] { data?.models ?? [] }
     
     // Modern Tier Badge Config
     private var tierConfig: (name: String, bgColor: Color, textColor: Color)? {
@@ -843,12 +904,12 @@ private struct MenuAccountCardView: View {
             return (info.tierDisplayName, .secondary.opacity(0.1), .secondary)
         }
         
-        if provider == .codex, let planName = codexPlanDisplayName(data.planType) {
+        if provider == .codex, let planName = codexPlanDisplayName(data?.planType) {
             let config = planConfig(for: planName)
             return (planName, config.bgColor, config.textColor)
         }
 
-        guard let planName = data.planDisplayName else { return nil }
+        guard let planName = data?.planDisplayName else { return nil }
         return planConfig(for: planName)
     }
 
@@ -916,12 +977,12 @@ private struct MenuAccountCardView: View {
     }
     
     private var isAntigravity: Bool {
-        provider == .antigravity && !data.models.isEmpty
+        provider == .antigravity && !quotaModels.isEmpty
     }
     
     private var antigravityGroups: [AntigravityDisplayGroup] {
         guard isAntigravity else { return [] }
-        let summaryModels = data.models.filter { $0.name.hasPrefix("antigravity-") }
+        let summaryModels = quotaModels.filter { $0.name.hasPrefix("antigravity-") }
         if !summaryModels.isEmpty {
             return summaryModels
                 .map { AntigravityDisplayGroup(name: $0.displayName, percentage: $0.percentage, resetTime: $0.resetTime) }
@@ -931,7 +992,7 @@ private struct MenuAccountCardView: View {
 
         let settings = MenuBarSettingsManager.shared
         
-        let gemini3ProModels = data.models.filter {
+        let gemini3ProModels = quotaModels.filter {
             $0.name.contains("gemini-3-pro") && !$0.name.contains("image")
         }
         if !gemini3ProModels.isEmpty {
@@ -940,21 +1001,21 @@ private struct MenuAccountCardView: View {
             groups.append(AntigravityDisplayGroup(name: "Gemini 3 Pro", percentage: aggregatedPercent, resetTime: minModel?.resetTime))
         }
 
-        let gemini3FlashModels = data.models.filter { $0.name.contains("gemini-3-flash") }
+        let gemini3FlashModels = quotaModels.filter { $0.name.contains("gemini-3-flash") }
         if !gemini3FlashModels.isEmpty {
             let aggregatedPercent = settings.aggregateModelPercentages(gemini3FlashModels.map(\.percentage))
             let minModel = gemini3FlashModels.min(by: { $0.percentage < $1.percentage })
             groups.append(AntigravityDisplayGroup(name: "Gemini 3 Flash", percentage: aggregatedPercent, resetTime: minModel?.resetTime))
         }
 
-        let geminiImageModels = data.models.filter { $0.name.contains("image") }
+        let geminiImageModels = quotaModels.filter { $0.name.contains("image") }
         if !geminiImageModels.isEmpty {
             let aggregatedPercent = settings.aggregateModelPercentages(geminiImageModels.map(\.percentage))
             let minModel = geminiImageModels.min(by: { $0.percentage < $1.percentage })
             groups.append(AntigravityDisplayGroup(name: "Gemini 3 Image", percentage: aggregatedPercent, resetTime: minModel?.resetTime))
         }
 
-        let claudeModels = data.models.filter { $0.name.contains("claude") }
+        let claudeModels = quotaModels.filter { $0.name.contains("claude") }
         if !claudeModels.isEmpty {
             let aggregatedPercent = settings.aggregateModelPercentages(claudeModels.map(\.percentage))
             let minModel = claudeModels.min(by: { $0.percentage < $1.percentage })
@@ -965,42 +1026,63 @@ private struct MenuAccountCardView: View {
     }
     
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 8) {
             headerSection
             
             quotaContentSection
-            
-            footerSection
         }
-        .padding(12)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
         .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(isHovered ? Color.secondary.opacity(0.08) : Color.secondary.opacity(0.04))
         )
         .padding(.horizontal, 8)
-        .padding(.vertical, 4)
+        .padding(.vertical, 2)
         .onHover { isHovered = $0 }
     }
     
     // MARK: - Header
     
     private var headerSection: some View {
-        HStack(alignment: .center, spacing: 8) {
+        HStack(alignment: .center, spacing: 7) {
             // Provider Icon
             ProviderIconMono(provider: provider, size: 16)
                 .foregroundStyle(.secondary)
                 .opacity(0.8)
             
-            // Email
-            Text(displayEmail)
-                .font(.system(size: 13, weight: .medium, design: .rounded))
-                .foregroundStyle(.primary)
-                .lineLimit(1)
+            // Keep freshness attached to the account identity instead of spending a
+            // separate footer row on the same timestamp in every card.
+            VStack(alignment: .leading, spacing: 1) {
+                Text(displayEmail)
+                    .font(.system(size: 13, weight: .medium, design: .rounded))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+
+                if let data {
+                    HStack(spacing: 3) {
+                        Image(systemName: "clock")
+                            .font(.system(size: 8, weight: .medium))
+                        Text(data.lastUpdated.formatted(
+                            .relative(presentation: .numeric, unitsStyle: .abbreviated)
+                        ))
+                            .lineLimit(1)
+                    }
+                    .font(.system(size: 9, design: .rounded))
+                    .foregroundStyle(.tertiary)
+                }
+            }
+            .layoutPriority(1)
             
             Spacer()
 
             Button {
-                Task { await viewModel.refreshQuota(for: accountID) }
+                Task {
+                    await viewModel.refreshQuota(
+                        for: accountID,
+                        allowCredentialAccessPrompt: true
+                    )
+                }
             } label: {
                 if viewModel.isRefreshing(account: accountID) {
                     ProgressView()
@@ -1019,6 +1101,7 @@ private struct MenuAccountCardView: View {
                     || !viewModel.supportsScopedRefresh(for: provider)
             )
             .help("action.refreshQuota".localized())
+            .accessibilityLabel("action.refreshQuota".localized())
             
             // Tier Badge
             if let config = tierConfig {
@@ -1086,28 +1169,33 @@ private struct MenuAccountCardView: View {
             if isAntigravity {
                 return antigravityGroups.map { ModelBadgeData(name: $0.name, percentage: $0.percentage, resetTime: $0.resetTime) }
             } else {
-                let meterModels = data.models.filter { !$0.isStandaloneMetric }.map {
+                let meterModels = quotaModels.filter { !$0.isStandaloneMetric }.map {
                     ModelBadgeData(name: $0.displayName, percentage: $0.percentage, resetTime: $0.resetTime)
                 }
                 guard isCardStyle else { return meterModels }
-                let standaloneModels = data.models.filter(\.isStandaloneMetric).map {
+                let standaloneModels = quotaModels.filter(\.isStandaloneMetric).map {
                     ModelBadgeData(name: $0.displayName, percentage: $0.percentage, resetTime: $0.resetTime, usage: $0.formattedUsage)
                 }
                 return meterModels + standaloneModels
             }
         }()
-        let standaloneModels = isAntigravity || isCardStyle ? [] : data.models.filter(\.isStandaloneMetric)
+        let standaloneModels = isAntigravity || isCardStyle ? [] : quotaModels.filter(\.isStandaloneMetric)
         let factorySections = provider == .factoryDroid
-            ? FactoryDroidQuotaSection.sections(from: data.models.filter { !$0.isStandaloneMetric })
+            ? FactoryDroidQuotaSection.sections(from: quotaModels.filter { !$0.isStandaloneMetric })
             : []
         
-        return VStack(spacing: 8) {
+        return VStack(spacing: 6) {
             if models.isEmpty && standaloneModels.isEmpty {
-                Text("dashboard.noQuotaData".localized())
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                    .frame(maxWidth: .infinity, alignment: .center)
-                    .padding(.vertical, 8)
+                HStack(spacing: 6) {
+                    Image(systemName: statusMessage == nil ? "info.circle" : "exclamationmark.circle")
+                        .font(.system(size: 10, weight: .medium))
+                    Text(statusMessage ?? "dashboard.noQuotaData".localized())
+                        .font(.system(size: 10, design: .rounded))
+                        .lineLimit(2)
+                }
+                .foregroundStyle(Color.secondary.opacity(statusMessage == nil ? 0.65 : 1))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 2)
             } else if !factorySections.isEmpty {
                 ForEach(factorySections) { section in
                     VStack(alignment: .leading, spacing: 6) {
@@ -1131,8 +1219,7 @@ private struct MenuAccountCardView: View {
                         .font(.system(size: 10, weight: .semibold, design: .monospaced))
                         .foregroundStyle(.primary)
                 }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 5)
+                .padding(.vertical, 2)
                 .menuNativeTooltip(model.tooltip ?? "")
             }
         }
@@ -1150,27 +1237,13 @@ private struct MenuAccountCardView: View {
         }
     }
     
-    // MARK: - Footer
-
-    private var footerSection: some View {
-        HStack(spacing: 12) {
-            // Reset info is now shown inside each metric, so only show last update here
-            Spacer()
-
-            // Last Update
-            Text(data.lastUpdated.formatted(.relative(presentation: .named)))
-                .font(.system(size: 10, design: .rounded))
-                .foregroundStyle(.secondary)
-        }
-    }
-    
     private var displayStyle: QuotaDisplayStyle { settings.quotaDisplayStyle }
     
     private var primaryResetModel: ModelQuota? {
         let formatter = ISO8601DateFormatter()
         let now = Date()
         
-        let validModels = data.models.filter { model in
+        let validModels = quotaModels.filter { model in
             guard let date = formatter.date(from: model.resetTime) else { return false }
             return date > now
         }
@@ -2192,17 +2265,24 @@ private func menuPercentText(remainingPercent: Double, displayMode: QuotaDisplay
     return "\(Int(menuDisplayPercent(remainingPercent: remainingPercent, displayMode: displayMode)))%"
 }
 
+private let menuHealthyGreen = Color(nsColor: NSColor(name: nil) { appearance in
+    let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+    return isDark
+        ? NSColor(srgbRed: 0.29, green: 0.82, blue: 0.43, alpha: 1)
+        : NSColor(srgbRed: 0.03, green: 0.32, blue: 0.15, alpha: 1)
+})
+
 private func menuStatusColor(remainingPercent: Double, displayMode: QuotaDisplayMode) -> Color {
     guard remainingPercent >= 0 else { return .secondary }
     let usedPercent = 100 - remainingPercent
     let checkValue = displayMode == .used ? usedPercent : remainingPercent
 
     if displayMode == .used {
-        if checkValue < 70 { return .green }
+        if checkValue < 70 { return menuHealthyGreen }
         if checkValue < 90 { return .yellow }
         return .red
     } else {
-        if checkValue > 50 { return .green }
+        if checkValue > 50 { return menuHealthyGreen }
         if checkValue > 20 { return .orange }
         return .red
     }
@@ -2230,10 +2310,10 @@ private struct LowestBarLayout: View {
     var body: some View {
         let displayMode = settings.quotaDisplayMode
         
-        VStack(spacing: 8) {
+        VStack(spacing: 6) {
             if let lowest = lowest {
                 // Hero Row for Lowest with reset time
-                VStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: 4) {
                     HStack {
                         Text(lowest.name)
                             .font(.system(size: 12, weight: .semibold, design: .rounded))
@@ -2242,7 +2322,7 @@ private struct LowestBarLayout: View {
                         PercentageBadge(percentage: lowest.percentage, style: .textOnly)
                     }
 
-                    ModernProgressBar(percentage: lowest.percentage, height: 8)
+                    ModernProgressBar(percentage: lowest.percentage, height: 5)
 
                     if let resetTime = lowest.formattedResetTime {
                         HStack(spacing: 4) {
@@ -2254,18 +2334,11 @@ private struct LowestBarLayout: View {
                         .foregroundStyle(.tertiary)
                     }
                 }
-                .padding(8)
-                .background(menuStatusColor(remainingPercent: lowest.percentage, displayMode: displayMode).opacity(0.08))
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                        .stroke(menuStatusColor(remainingPercent: lowest.percentage, displayMode: displayMode).opacity(0.2), lineWidth: 1)
-                )
             }
 
             // Others as text rows (one per line)
             if !others.isEmpty {
-                VStack(spacing: 4) {
+                VStack(spacing: 3) {
                     ForEach(others, id: \.name) { (model: ModelBadgeData) in
                         HStack(spacing: 6) {
                             Text(model.name)
@@ -2282,7 +2355,7 @@ private struct LowestBarLayout: View {
                                 .font(.system(size: 10, weight: .bold, design: .monospaced))
                                 .foregroundStyle(menuStatusColor(remainingPercent: model.percentage, displayMode: displayMode))
                         }
-                        .padding(.vertical, 2)
+                        .padding(.vertical, 1)
                     }
                 }
             }
@@ -2304,16 +2377,16 @@ private struct RingGridLayout: View {
     }
 
     private var ringSize: CGFloat {
-        columnCount >= 4 ? 36 : 40
+        columnCount >= 4 ? 32 : 36
     }
 
     var body: some View {
         let displayMode = settings.quotaDisplayMode
         
         // Auto-distribute 1-4 columns, cap at 4
-        LazyVGrid(columns: columns, spacing: 10) {
+        LazyVGrid(columns: columns, spacing: 6) {
             ForEach(models, id: \.name) { (model: ModelBadgeData) in
-                VStack(spacing: 4) {
+                VStack(spacing: 3) {
                     RingProgressView(percent: menuDisplayPercent(remainingPercent: model.percentage, displayMode: displayMode), size: ringSize, lineWidth: 4, tint: menuStatusColor(remainingPercent: model.percentage, displayMode: displayMode), showLabel: true)
 
                     Text(model.name)
@@ -2340,31 +2413,25 @@ private struct CardGridLayout: View {
     private var settings: MenuBarSettingsManager { MenuBarSettingsManager.shared }
 
     private var columns: [GridItem] {
-        // Single metric: full width. Multiple: 2 columns
-        if models.count == 1 {
-            return [GridItem(.flexible())]
-        } else {
-            return [GridItem(.flexible()), GridItem(.flexible())]
-        }
+        // At the fixed menu width this yields one, two, or three columns. Three
+        // common quota windows now fit on one row instead of leaving a sparse
+        // second row, while long labels remain discoverable through the tooltip.
+        [GridItem(.adaptive(minimum: 92), spacing: 10, alignment: .topLeading)]
     }
     
     var body: some View {
         let displayMode = settings.quotaDisplayMode
         
-        LazyVGrid(columns: columns, spacing: 8) {
+        LazyVGrid(columns: columns, alignment: .leading, spacing: 7) {
             ForEach(models, id: \.name) { (model: ModelBadgeData) in
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(alignment: .firstTextBaseline, spacing: 4) {
                         Text(model.name)
-                            .font(.system(size: 10, weight: .medium, design: .rounded))
+                            .font(.system(size: 9, weight: .medium, design: .rounded))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
-                        Spacer()
-                        if let resetTime = model.formattedResetTime {
-                            Text(resetTime)
-                                .font(.system(size: 9, design: .rounded))
-                                .foregroundStyle(.tertiary)
-                        }
+                            .truncationMode(.tail)
+                        Spacer(minLength: 2)
                         if let usage = model.usage {
                             Text(usage)
                                 .font(.system(size: 10, weight: .bold, design: .monospaced))
@@ -2377,12 +2444,22 @@ private struct CardGridLayout: View {
                     }
 
                     if model.usage == nil {
-                        ModernProgressBar(percentage: model.percentage, height: 4)
+                        ModernProgressBar(percentage: model.percentage, height: 3)
+                    }
+
+                    if let resetTime = model.formattedResetTime {
+                        HStack(spacing: 3) {
+                            Image(systemName: "clock.arrow.circlepath")
+                                .font(.system(size: 7, weight: .medium))
+                            Text(resetTime)
+                                .font(.system(size: 8, design: .rounded))
+                                .lineLimit(1)
+                        }
+                        .foregroundStyle(.tertiary)
                     }
                 }
-                .padding(8)
-                .background(Color.secondary.opacity(0.05))
-                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .menuNativeTooltip(model.name)
             }
         }
     }
@@ -2608,6 +2685,8 @@ private extension AIProvider {
         case .openRouter: return "OpenRouter"
         case .amp: return "Amp"
         case .glm: return "Z.ai"
+        case .kimi: return "Kimi"
+        case .minimax: return "MiniMax"
         case .warp: return "Warp"
         case .clinePass: return "ClinePass"
         }

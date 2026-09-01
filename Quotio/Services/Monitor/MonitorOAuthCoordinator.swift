@@ -94,7 +94,7 @@ actor MonitorOAuthCoordinator {
             expiresAt: (tokens["expires_in"] as? NSNumber).map { Date().addingTimeInterval($0.doubleValue) },
             extra: [:]
         )
-        try await MonitorCredentialVault.shared.save(credential, metadata: account)
+        try await MonitorCredentialVault.shared.saveUserInitiated(credential, metadata: account)
         return account
     }
 
@@ -207,25 +207,31 @@ actor MonitorOAuthCoordinator {
         var email = MonitorIdentity.jwtString(idToken, claim: "email")
         var accountID: String?
         if provider == .codex {
-            accountID = MonitorIdentity.jwtNestedString(
-                idToken,
-                namespace: "https://api.openai.com/auth",
-                claim: "chatgpt_account_id"
-            )
+            accountID = (tokens["account_id"] as? String)
+                ?? MonitorIdentity.jwtNestedString(
+                    idToken,
+                    namespace: "https://api.openai.com/auth",
+                    claim: "chatgpt_account_id"
+                )
         } else {
             let user = try? await googleUserInfo(accessToken: accessToken)
             email = email ?? user?.email
             accountID = user?.id
         }
-        let key = email ?? accountID ?? "\(provider.displayName) \(UUID().uuidString.prefix(8))"
-        let account = MonitorAccount.make(
-            provider: provider,
-            accountKey: key,
-            displayName: email ?? key,
-            source: .quotioKeychain,
-            credentialReference: "keychain",
-            canDelete: true
-        )
+        let account: MonitorAccount
+        if provider == .codex {
+            account = await codexOwnedAccount(email: email, accountID: accountID)
+        } else {
+            let key = email ?? accountID ?? "\(provider.displayName) \(UUID().uuidString.prefix(8))"
+            account = MonitorAccount.make(
+                provider: provider,
+                accountKey: key,
+                displayName: email ?? key,
+                source: .quotioKeychain,
+                credentialReference: "keychain",
+                canDelete: true
+            )
+        }
         let credential = MonitorOAuthCredential(
             accessToken: accessToken,
             refreshToken: refreshToken,
@@ -234,8 +240,59 @@ actor MonitorOAuthCoordinator {
             expiresAt: expiresIn.map { Date().addingTimeInterval($0) },
             extra: [:]
         )
-        try await MonitorCredentialVault.shared.save(credential, metadata: account)
+        try await MonitorCredentialVault.shared.saveUserInitiated(credential, metadata: account)
         return account
+    }
+
+    /// Re-authentication must update the matching ChatGPT account, while another
+    /// workspace on the same email must create a second Keychain item.
+    private func codexOwnedAccount(email: String?, accountID: String?) async -> MonitorAccount {
+        let key = CodexAccountKey.canonical(
+            email: email,
+            accountID: accountID,
+            fallback: "Codex " + String(UUID().uuidString.prefix(8))
+        )
+        let trimmedEmail = email?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedEmail = trimmedEmail?.isEmpty == false ? trimmedEmail : nil
+        let trimmedAccountID = accountID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedAccountID = trimmedAccountID?.isEmpty == false ? trimmedAccountID : nil
+
+        if let normalizedAccountID {
+            for existing in await MonitorCredentialVault.shared.accounts() where existing.provider == .codex {
+                guard let credential = await MonitorCredentialVault.shared.credential(for: existing.id) else {
+                    continue
+                }
+                let existingAccountID = credential.accountID
+                    ?? MonitorIdentity.jwtNestedString(
+                        credential.idToken,
+                        namespace: "https://api.openai.com/auth",
+                        claim: "chatgpt_account_id"
+                    )
+                guard existingAccountID?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) == normalizedAccountID else {
+                    continue
+                }
+                return MonitorAccount(
+                    id: existing.id,
+                    provider: .codex,
+                    accountKey: key,
+                    displayName: normalizedEmail ?? existing.displayName,
+                    source: .quotioKeychain,
+                    credentialReference: "keychain",
+                    canDelete: true,
+                    isDisabled: existing.isDisabled
+                )
+            }
+        }
+
+        return MonitorAccount.make(
+            provider: .codex,
+            accountKey: key,
+            displayName: normalizedEmail ?? key,
+            source: .quotioKeychain,
+            credentialReference: "keychain",
+            canDelete: true
+        )
     }
 
     private func googleUserInfo(accessToken: String) async throws -> (email: String?, id: String?) {
@@ -326,7 +383,7 @@ actor MonitorOAuthCoordinator {
             expiresAt: nil,
             extra: [:]
         )
-        try await MonitorCredentialVault.shared.save(credential, metadata: account)
+        try await MonitorCredentialVault.shared.saveUserInitiated(credential, metadata: account)
         return account
     }
 
@@ -423,7 +480,7 @@ actor MonitorOAuthCoordinator {
                     "region": region,
                 ]
             )
-            try await MonitorCredentialVault.shared.save(credential, metadata: account)
+            try await MonitorCredentialVault.shared.saveUserInitiated(credential, metadata: account)
             return account
         }
         throw MonitorOAuthError.expired

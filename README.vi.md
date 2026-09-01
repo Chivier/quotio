@@ -59,14 +59,19 @@ Quotio là ứng dụng macOS để quản lý **CLIProxyAPI** - máy chủ prox
 | Antigravity | OAuth |
 | Kiro | OAuth |
 | GitHub Copilot | OAuth |
+| Kimi Code | OAuth |
+| Z.ai | API key |
 
-### Theo dõi Quota IDE (Chỉ giám sát)
-| IDE | Mô tả |
-|-----|-------|
+### Theo dõi quota dịch vụ lập trình
+| Dịch vụ | Mô tả |
+|---------|-------|
 | Cursor | Tự động phát hiện khi cài đặt và đăng nhập |
 | Trae | Tự động phát hiện khi cài đặt và đăng nhập |
+| Z.ai | Hạn mức phiên, ngày, tuần, tháng và tìm kiếm web |
+| Kimi Code | Tự động đọc thông tin CLI hoặc dùng API key; hạn mức định kỳ và hàng tuần |
+| MiniMax | Khóa đăng ký Token Plan; hạn mức 5 giờ và hàng tuần |
 
-> **Lưu ý**: Các IDE này chỉ dùng để theo dõi quota. Không thể sử dụng làm provider cho proxy.
+> **Lưu ý**: Cursor, Trae và MiniMax chỉ dùng để giám sát. Kimi Code cũng có thể kết nối với CLIProxyAPI qua OAuth.
 
 ### Agent tương thích
 Quotio có thể tự động cấu hình các công cụ sau:

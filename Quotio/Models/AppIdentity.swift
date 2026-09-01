@@ -22,8 +22,31 @@ nonisolated enum AppIdentity {
         bundleIdentifier == productionBundleIdentifier
     }
 
+    static var isDevelopmentBuild: Bool {
+#if DEBUG
+        true
+#else
+        false
+#endif
+    }
+
     static func keychainService(suffix: String) -> String {
-        "\(bundleIdentifier).\(suffix)"
+        keychainService(
+            suffix: suffix,
+            bundleIdentifier: bundleIdentifier,
+            isDevelopmentBuild: isDevelopmentBuild
+        )
+    }
+
+    static func keychainService(
+        suffix: String,
+        bundleIdentifier: String,
+        isDevelopmentBuild: Bool
+    ) -> String {
+        let namespace = isDevelopmentBuild && bundleIdentifier == productionBundleIdentifier
+            ? "\(bundleIdentifier).debug"
+            : bundleIdentifier
+        return "\(namespace).\(suffix)"
     }
 
     static func legacyKeychainServices(suffix: String) -> [String] {

@@ -43,8 +43,9 @@ struct AccountRowData: Identifiable, Hashable {
     let status: String?           // "ready", "cooling", "error", etc.
     let statusMessage: String?
     let isDisabled: Bool
-    let canDelete: Bool           // Only proxy accounts can be deleted
-    let canEdit: Bool             // Whether this account can be edited (GLM only)
+    let canDelete: Bool
+    let removesFromQuotioOnly: Bool
+    let canEdit: Bool
     let canSwitch: Bool           // Whether this account can be switched (Antigravity only)
 
     // Custom initializer to handle canEdit parameter
@@ -59,6 +60,7 @@ struct AccountRowData: Identifiable, Hashable {
         statusMessage: String?,
         isDisabled: Bool,
         canDelete: Bool,
+        removesFromQuotioOnly: Bool = false,
         canEdit: Bool = false,
         canSwitch: Bool = false
     ) {
@@ -72,6 +74,7 @@ struct AccountRowData: Identifiable, Hashable {
         self.statusMessage = statusMessage
         self.isDisabled = isDisabled
         self.canDelete = canDelete
+        self.removesFromQuotioOnly = removesFromQuotioOnly
         self.canEdit = canEdit
         self.canSwitch = canSwitch
     }
@@ -83,6 +86,29 @@ struct AccountRowData: Identifiable, Hashable {
 
     var canDownloadAuthFile: Bool {
         authFileName != nil
+    }
+
+    var needsRecovery: Bool {
+        status == "outdated" || status == "error"
+    }
+
+    var recoveryActionKey: String {
+        provider.usesAPIKeyAuth ? "providers.updateCredentials" : "providers.signInAgain"
+    }
+
+    /// Accounts discovered from another app or CLI must be repaired at that source.
+    /// Starting Quotio's own OAuth flow for one of these rows can authenticate a
+    /// different browser account and add an unrelated duplicate instead of repairing
+    /// the selected credential.
+    var requiresSourceRecovery: Bool {
+        switch source {
+        case .monitor(let monitorSource):
+            return monitorSource != .quotioKeychain
+        case .direct, .autoDetected:
+            return true
+        case .proxy:
+            return false
+        }
     }
 
     // MARK: - Factory Methods
@@ -152,9 +178,12 @@ struct AccountRowData: Identifiable, Hashable {
             status: status,
             statusMessage: statusMessage,
             isDisabled: monitorAccount.isDisabled,
-            canDelete: monitorAccount.canDelete,
+            // Every Monitor row can be removed. For externally managed credentials,
+            // removal means hiding the account in Quotio, never deleting the source.
+            canDelete: true,
+            removesFromQuotioOnly: !monitorAccount.canDelete,
             canEdit: monitorAccount.source == .quotioKeychain
-                && [.factoryDroid, .openRouter, .amp].contains(monitorAccount.provider)
+                && [.factoryDroid, .openRouter, .amp, .kimi, .minimax].contains(monitorAccount.provider)
         )
     }
 
@@ -163,13 +192,21 @@ struct AccountRowData: Identifiable, Hashable {
         hasher.combine(authFileName)
         hasher.combine(isDisabled)
         hasher.combine(status)
+        hasher.combine(canDelete)
+        hasher.combine(removesFromQuotioOnly)
+        hasher.combine(canEdit)
     }
 
     static func == (lhs: AccountRowData, rhs: AccountRowData) -> Bool {
         lhs.id == rhs.id &&
         lhs.authFileName == rhs.authFileName &&
+        lhs.source == rhs.source &&
         lhs.isDisabled == rhs.isDisabled &&
-        lhs.status == rhs.status
+        lhs.status == rhs.status &&
+        lhs.statusMessage == rhs.statusMessage &&
+        lhs.canDelete == rhs.canDelete &&
+        lhs.removesFromQuotioOnly == rhs.removesFromQuotioOnly &&
+        lhs.canEdit == rhs.canEdit
     }
 }
 
@@ -179,9 +216,13 @@ struct AccountRow: View {
     let account: AccountRowData
     var onDelete: (() -> Void)?
     var onEdit: (() -> Void)?
+    var onRefresh: (() -> Void)?
+    var onReconnect: (() -> Void)?
     var onSwitch: (() -> Void)?
     var onToggleDisabled: (() -> Void)?
     var onDownload: (() -> Void)?
+    var isRefreshing = false
+    var isRefreshBlocked = false
     var isActiveInIDE: Bool = false
     
     @State private var settings = MenuBarSettingsManager.shared
@@ -275,6 +316,19 @@ struct AccountRow: View {
                     .background(Color(red: 0.85, green: 0.95, blue: 0.85))
                     .clipShape(Capsule())
             }
+
+            if account.needsRecovery, let onReconnect {
+                Button {
+                    onReconnect()
+                } label: {
+                    Label(account.recoveryActionKey.localized(), systemImage: "person.crop.circle.badge.exclamationmark")
+                        .font(.caption)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(.orange)
+                .help(account.recoveryActionKey.localized())
+            }
             
             // Switch button (Antigravity only, for proxy/direct accounts that are not active)
             if account.provider == .antigravity && !isActiveInIDE && account.source != .autoDetected {
@@ -295,6 +349,27 @@ struct AccountRow: View {
                 }
                 .buttonStyle(.plain)
                 .help("antigravity.switch.title".localized())
+            }
+
+            if let onRefresh {
+                Button {
+                    onRefresh()
+                } label: {
+                    Group {
+                        if isRefreshing {
+                            SmallProgressView(size: 12)
+                        } else {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.system(size: 14))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .frame(width: 28, height: 28)
+                }
+                .buttonStyle(.rowAction)
+                .disabled(account.isDisabled || isRefreshing || isRefreshBlocked)
+                .help((isRefreshing ? "status.refreshing" : "action.refreshQuota").localized())
+                .accessibilityLabel((isRefreshing ? "status.refreshing" : "action.refreshQuota").localized())
             }
             
             // Menu bar toggle
@@ -344,7 +419,7 @@ struct AccountRow: View {
                         .foregroundStyle(.red.opacity(0.8))
                 }
                 .buttonStyle(.rowActionDestructive)
-                .help("action.delete".localized())
+                .help((account.removesFromQuotioOnly ? "providers.removeFromQuotio" : "action.delete").localized())
             }
         }
         .contentShape(Rectangle())
@@ -366,6 +441,26 @@ struct AccountRow: View {
                 } label: {
                     Label("action.download".localized(), systemImage: "arrow.down.circle")
                 }
+            }
+
+            if let onReconnect {
+                Button {
+                    onReconnect()
+                } label: {
+                    Label(account.recoveryActionKey.localized(), systemImage: "person.crop.circle.badge.exclamationmark")
+                }
+            }
+
+            if let onRefresh {
+                Button {
+                    onRefresh()
+                } label: {
+                    Label(
+                        (isRefreshing ? "status.refreshing" : "action.refreshQuota").localized(),
+                        systemImage: "arrow.clockwise"
+                    )
+                }
+                .disabled(account.isDisabled || isRefreshing || isRefreshBlocked)
             }
 
             // Menu bar toggle
@@ -392,24 +487,33 @@ struct AccountRow: View {
                 }
             }
 
-            // Delete option (only for proxy accounts)
+            // Destructive account action
             if account.canDelete, onDelete != nil {
                 Divider()
                 
                 Button(role: .destructive) {
                     showDeleteConfirmation = true
                 } label: {
-                    Label("action.delete".localized(), systemImage: "trash")
+                    Label(
+                        (account.removesFromQuotioOnly ? "providers.removeFromQuotio" : "action.delete").localized(),
+                        systemImage: "trash"
+                    )
                 }
             }
         }
-        .confirmationDialog("providers.deleteConfirm".localized(), isPresented: $showDeleteConfirmation) {
-            Button("action.delete".localized(), role: .destructive) {
+        .confirmationDialog(
+            (account.removesFromQuotioOnly ? "providers.removeConfirm" : "providers.deleteConfirm").localized(),
+            isPresented: $showDeleteConfirmation
+        ) {
+            Button(
+                (account.removesFromQuotioOnly ? "providers.removeFromQuotio" : "action.delete").localized(),
+                role: .destructive
+            ) {
                 onDelete?()
             }
             Button("action.cancel".localized(), role: .cancel) {}
         } message: {
-            Text("providers.deleteMessage".localized())
+            Text((account.removesFromQuotioOnly ? "providers.removeMessage" : "providers.deleteMessage").localized())
         }
         .alert("menubar.warning.title".localized(), isPresented: $showWarning) {
             Button("menubar.warning.confirm".localized()) {

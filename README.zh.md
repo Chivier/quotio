@@ -59,14 +59,19 @@ Quotio 是一款原生 macOS 应用，用于管理 **CLIProxyAPI** ——为你�
 | Antigravity | OAuth |
 | Kiro | OAuth |
 | GitHub Copilot | OAuth |
+| Kimi Code | OAuth |
+| Z.ai | API 密钥 |
 
-### IDE 配额追踪（仅监控）
-| IDE | 说明 |
+### Coding 服务配额追踪
+| 服务 | 说明 |
 |-----|-------------|
 | Cursor | 安装并登录后自动检测 |
 | Trae | 安装并登录后自动检测 |
+| Z.ai | 会话、每日、每周、每月和联网搜索额度 |
+| Kimi Code | 自动读取 CLI 凭据或使用 API 密钥，显示滚动窗口和周额度 |
+| MiniMax | 使用 Token Plan 订阅密钥，显示 5 小时和周额度 |
 
-> **注意**：这些 IDE 仅用于配额使用监控，不能作为代理的提供商。
+> **注意**：Cursor、Trae 和 MiniMax 仅用于监控。Kimi Code 也可通过 OAuth 连接到 CLIProxyAPI。
 
 ### 兼容的 CLI Agent
 Quotio 可以自动配置以下工具使用你的集中式代理：
