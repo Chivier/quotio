@@ -71,7 +71,7 @@ nonisolated struct MonitorAccount: Identifiable, Codable, Hashable, Sendable {
 
     static func makeLegacy(_ file: DirectAuthFile) -> MonitorAccount {
         let accountKey: String
-        if file.provider == .codex || file.provider == .copilot {
+        if file.provider == .codex || file.provider == .copilot || file.provider == .kiro {
             accountKey = file.menuBarAccountKey
         } else if let email = file.email, !email.isEmpty {
             accountKey = email
@@ -144,7 +144,7 @@ nonisolated protocol MonitorCredentialStore: Sendable {
     func credentialForUserInitiatedAccess(for accountID: String) async -> MonitorOAuthCredential?
     func reloadLatest(accountID: String) async -> MonitorOAuthCredential?
     func save(_ credential: MonitorOAuthCredential, metadata: MonitorAccount) async throws
-    func delete(accountID: String) async
+    func delete(accountID: String) async throws
     func credentialState(for accountID: String) async -> MonitorStoredCredentialState
 }
 
@@ -193,11 +193,32 @@ nonisolated enum CodexAccountKey {
     }
 }
 
+/// One identity contract for native Kiro, legacy files, and their old snapshot keys.
+nonisolated enum KiroAccountIdentity {
+    static func canonicalKey(email: String?, profileARN: String?, filename: String) -> String {
+        profileARN?.nilIfBlank ?? email?.nilIfBlank
+            ?? filename.replacingOccurrences(of: ".json", with: "")
+    }
+
+    static func aliases(for file: DirectAuthFile) -> Set<String> {
+        var keys = Set(file.legacyIdentityKeys)
+        if let email = file.email?.nilIfBlank { keys.insert(email) }
+        if let profile = file.kiroProfileARN?.nilIfBlank { keys.insert(profile) }
+        keys.insert(file.menuBarAccountKey)
+        if file.source == .nativeCredential, file.email?.nilIfBlank == nil,
+           file.kiroProfileARN?.nilIfBlank == nil {
+            keys.insert("Kiro")
+        }
+        return Set(keys.map { MonitorAccount.make(provider: .kiro, accountKey: $0, source: .nativeCredential).id })
+    }
+}
+
 actor MonitorCredentialVault: MonitorCredentialStore {
     static let shared = MonitorCredentialVault()
 
     private let metadata: MonitorMetadataStore
     private var loadedGenerations: [String: String] = [:]
+    private var removalGeneration: [String: Int] = [:]
     /// A foreground Keychain authorization may grant this process access without
     /// rewriting the item. Keep that decoded credential only in memory so later
     /// background refreshes in the same run remain prompt-free.
@@ -261,6 +282,13 @@ actor MonitorCredentialVault: MonitorCredentialStore {
         metadata account: MonitorAccount,
         userInitiated: Bool
     ) async throws {
+        let generation = removalGeneration[account.id, default: 0]
+        if !userInitiated, await self.metadata.isRemoved(account.id) {
+            throw MonitorRuntimeError.invalidCredential
+        }
+        guard userInitiated || generation == removalGeneration[account.id, default: 0] else {
+            throw MonitorRuntimeError.invalidCredential
+        }
         let data = try JSONEncoder().encode(credential)
         let saved: Bool
         if userInitiated {
@@ -286,14 +314,17 @@ actor MonitorCredentialVault: MonitorCredentialStore {
         }
         loadedGenerations[account.id] = MonitorIdentity.fingerprint(data.base64EncodedString())
         sessionCredentials[account.id] = credential
-        try await self.metadata.saveAccount(account)
+        try await self.metadata.saveAccount(account, restoringRemoved: userInitiated)
     }
 
-    func delete(accountID: String) async {
+    func delete(accountID: String) async throws {
+        removalGeneration[accountID, default: 0] += 1
+        // Persist the marker before touching credentials; a disk failure must not
+        // look like a successful permanent removal to the caller.
+        try await metadata.deleteAccount(accountID)
         KeychainHelper.deleteMonitorCredential(account: accountID)
         loadedGenerations.removeValue(forKey: accountID)
         sessionCredentials.removeValue(forKey: accountID)
-        try? await metadata.deleteAccount(accountID)
     }
 }
 
@@ -305,6 +336,8 @@ actor MonitorMetadataStore {
         var disabledAccountIDs: Set<String> = []
         // Optional so existing accounts-v1.json files decode without a migration.
         var removedAccountIDs: Set<String>?
+        // Only equivalent identities observed in the same source are linked.
+        var accountAliases: [String: String]?
     }
 
     private let url: URL
@@ -314,15 +347,22 @@ actor MonitorMetadataStore {
             .appendingPathComponent("Quotio/Monitor/accounts-v1.json")
     }
 
-    func accounts() -> [MonitorAccount] { load().accounts }
+    func accounts() -> [MonitorAccount] { filteringAccounts(load().accounts) }
     func disabledAccountIDs() -> Set<String> { load().disabledAccountIDs }
     func removedAccountIDs() -> Set<String> { load().removedAccountIDs ?? [] }
 
-    func saveAccount(_ account: MonitorAccount) throws {
+    func saveAccount(_ account: MonitorAccount, restoringRemoved: Bool = false) throws {
         var payload = load()
+        let identity = canonicalID(account.id, in: payload)
+        if restoringRemoved {
+            payload.removedAccountIDs = payload.removedAccountIDs?.filter {
+                canonicalID($0, in: payload) != identity
+            }
+        } else if payload.removedAccountIDs?.contains(where: { canonicalID($0, in: payload) == identity }) == true {
+            throw MonitorRuntimeError.invalidCredential
+        }
         payload.accounts.removeAll { $0.id == account.id }
         payload.accounts.append(account)
-        payload.removedAccountIDs?.remove(account.id)
         try save(payload)
     }
 
@@ -330,25 +370,27 @@ actor MonitorMetadataStore {
         var payload = load()
         payload.accounts.removeAll { $0.id == accountID }
         payload.disabledAccountIDs.remove(accountID)
-        payload.removedAccountIDs?.remove(accountID)
+        payload.removedAccountIDs = (payload.removedAccountIDs ?? []).union([canonicalID(accountID, in: payload)])
         try save(payload)
     }
 
     func setDisabled(_ disabled: Bool, accountID: String) throws {
         var payload = load()
-        if disabled { payload.disabledAccountIDs.insert(accountID) }
-        else { payload.disabledAccountIDs.remove(accountID) }
+        let identity = canonicalID(accountID, in: payload)
+        if disabled { payload.disabledAccountIDs.insert(identity) }
+        else { payload.disabledAccountIDs = payload.disabledAccountIDs.filter { canonicalID($0, in: payload) != identity } }
         try save(payload)
     }
 
     func setRemoved(_ removed: Bool, accountID: String) throws {
         var payload = load()
+        let identity = canonicalID(accountID, in: payload)
         var removedIDs = payload.removedAccountIDs ?? []
         if removed {
-            removedIDs.insert(accountID)
-            payload.disabledAccountIDs.remove(accountID)
+            removedIDs.insert(identity)
+            payload.disabledAccountIDs = payload.disabledAccountIDs.filter { canonicalID($0, in: payload) != identity }
         } else {
-            removedIDs.remove(accountID)
+            removedIDs = removedIDs.filter { canonicalID($0, in: payload) != identity }
         }
         payload.removedAccountIDs = removedIDs.isEmpty ? nil : removedIDs
         try save(payload)
@@ -362,6 +404,108 @@ actor MonitorMetadataStore {
         payload.removedAccountIDs = nil
         try save(payload)
         return count
+    }
+
+    private func canonicalID(_ id: String, in payload: Payload) -> String {
+        payload.accountAliases?[id] ?? id
+    }
+
+    func isRemoved(_ accountID: String) -> Bool {
+        let payload = load()
+        let identity = canonicalID(accountID, in: payload)
+        return payload.removedAccountIDs?.contains { canonicalID($0, in: payload) == identity } == true
+    }
+
+    func isExcluded(_ accountID: String) -> Bool {
+        excludedQuotaAccountIDs().contains(accountID)
+    }
+
+    func reconcileAliases(_ aliasesByIdentity: [String: Set<String>]) throws {
+        var payload = load()
+        // Freeze existing markers onto the previously proven identity before a
+        // reused filename is associated with a different login.
+        payload.removedAccountIDs = payload.removedAccountIDs.map { Set($0.map { canonicalID($0, in: payload) }) }
+        payload.disabledAccountIDs = Set(payload.disabledAccountIDs.map { canonicalID($0, in: payload) })
+        var targets: [String: Set<String>] = [:]
+        for (identity, aliases) in aliasesByIdentity {
+            for alias in aliases { targets[alias, default: []].insert(identity) }
+        }
+        var aliases = payload.accountAliases ?? [:]
+        for (alias, identities) in targets {
+            // An email or old generic label shared by different profiles proves
+            // nothing; never let that label suppress all of those accounts.
+            if identities.count == 1, let identity = identities.first, alias != identity {
+                aliases[alias] = identity
+            } else {
+                aliases.removeValue(forKey: alias)
+            }
+        }
+        guard aliases != (payload.accountAliases ?? [:]) else { return }
+        payload.accountAliases = aliases.isEmpty ? nil : aliases
+        payload.removedAccountIDs = payload.removedAccountIDs.map { Set($0.map { canonicalID($0, in: payload) }) }
+        payload.disabledAccountIDs = Set(payload.disabledAccountIDs.map { canonicalID($0, in: payload) })
+        try save(payload)
+    }
+
+    func filteringAccounts(_ accounts: [MonitorAccount]) -> [MonitorAccount] {
+        let payload = load()
+        let removed = Set((payload.removedAccountIDs ?? []).map { canonicalID($0, in: payload) })
+        let disabled = Set(payload.disabledAccountIDs.map { canonicalID($0, in: payload) })
+        var selected: [String: MonitorAccount] = [:]
+        for var account in accounts {
+            let identity = canonicalID(account.id, in: payload)
+            guard !removed.contains(identity) else { continue }
+            account.isDisabled = disabled.contains(identity)
+            if let existing = selected[identity],
+               existing.source.priority > account.source.priority
+                || (existing.source.priority == account.source.priority && existing.id == identity) { continue }
+            selected[identity] = account
+        }
+        return selected.values.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+    }
+
+    func filteringQuotas(_ quotas: [AIProvider: [String: ProviderQuotaData]]) -> [AIProvider: [String: ProviderQuotaData]] {
+        let payload = load()
+        let excluded = Set(payload.disabledAccountIDs.union(payload.removedAccountIDs ?? []).map { canonicalID($0, in: payload) })
+        return quotas.reduce(into: [:]) { result, entry in
+            var visible: [String: ProviderQuotaData] = [:]
+            let currentIDs = Set(entry.value.keys.map {
+                MonitorAccount.make(provider: entry.key, accountKey: $0, source: .nativeCredential).id
+            })
+            for (key, value) in entry.value {
+                let id = MonitorAccount.make(provider: entry.key, accountKey: key, source: .nativeCredential).id
+                guard !excluded.contains(canonicalID(id, in: payload)) else { continue }
+                let identity = canonicalID(id, in: payload)
+                if id != identity, currentIDs.contains(identity) { continue }
+                if entry.key == .kiro {
+                    guard let quota = KiroQuotaFetcher.sanitizedCachedQuota(value) else { continue }
+                    visible[key] = quota
+                } else {
+                    visible[key] = value
+                }
+            }
+            if !visible.isEmpty { result[entry.key] = visible }
+        }
+    }
+
+    func persistSnapshot(_ quotas: [AIProvider: [String: ProviderQuotaData]], at url: URL) {
+        // Filtering and writing share metadata's executor, so a delayed finish
+        // cannot race a tombstone commit and write the removed account back.
+        let visible = filteringQuotas(quotas)
+        let encoded = visible.reduce(into: [String: [String: ProviderQuotaData]]()) {
+            $0[$1.key.rawValue] = $1.value
+        }
+        do {
+            try SecureAtomicFileWriter.write(try JSONEncoder().encode(["quotas": encoded]), to: url)
+        } catch {
+            Log.quota("Failed to persist Monitor snapshot: \(error.localizedDescription)")
+        }
+    }
+
+    func excludedQuotaAccountIDs() -> Set<String> {
+        let payload = load()
+        let excluded = Set(payload.disabledAccountIDs.union(payload.removedAccountIDs ?? []).map { canonicalID($0, in: payload) })
+        return excluded.union((payload.accountAliases ?? [:]).compactMap { excluded.contains($0.value) ? $0.key : nil })
     }
 
     private func load() -> Payload {
@@ -398,7 +542,7 @@ actor MonitorSnapshotStore {
         var quotas: [String: [String: ProviderQuotaData]]
     }
 
-    private let url: URL
+    nonisolated let url: URL
 
     init(url: URL? = nil) {
         if let url {
@@ -475,32 +619,50 @@ actor MonitorSnapshotStore {
 actor MonitorAccountDiscovery {
     private let vault: MonitorCredentialStore
     private let directAuthService: DirectAuthFileService
-    private let metadata: MonitorMetadataStore
+    let metadata: MonitorMetadataStore
+    private let includesNativeSources: Bool
 
     init(
         vault: MonitorCredentialStore = MonitorCredentialVault.shared,
         directAuthService: DirectAuthFileService = DirectAuthFileService(),
-        metadata: MonitorMetadataStore = .shared
+        metadata: MonitorMetadataStore = .shared,
+        includesNativeSources: Bool = true
     ) {
         self.vault = vault
         self.directAuthService = directAuthService
         self.metadata = metadata
+        self.includesNativeSources = includesNativeSources
     }
 
     func discover() async -> [MonitorAccount] {
         let legacyFiles = await directAuthService.scanAllAuthFiles()
         let codexAliases = Self.codexAliases(from: legacyFiles)
         var candidates = await canonicalizeCodexAccounts(await vault.accounts(), aliases: codexAliases)
-        candidates.append(contentsOf: await discoverNativeFiles(codexAliases: codexAliases))
-        candidates.append(contentsOf: discoverNativeKeychains(codexAliases: codexAliases))
+        if includesNativeSources {
+            candidates.append(contentsOf: await discoverNativeFiles(codexAliases: codexAliases))
+            candidates.append(contentsOf: discoverNativeKeychains(codexAliases: codexAliases))
+        }
         let legacy = legacyFiles.map(MonitorAccount.makeLegacy)
         candidates.append(contentsOf: legacy)
 
-        let disabled = await metadata.disabledAccountIDs()
-        let removed = await metadata.removedAccountIDs()
-        return Self.selectPreferred(candidates, disabledIDs: disabled).filter {
-            !removed.contains($0.id)
+        var aliases: [String: Set<String>] = [:]
+        var kiroFiles = legacyFiles.filter { $0.provider == .kiro }
+        if includesNativeSources, let native = Self.kiroAuthFile(at: MonitorIdentity.expand("~/.aws/sso/cache/kiro-auth-token.json")) {
+            kiroFiles.append(native)
         }
+        for file in kiroFiles {
+            let id = MonitorAccount.makeLegacy(file).id
+            aliases[id, default: []].formUnion(KiroAccountIdentity.aliases(for: file))
+        }
+        for account in candidates where account.provider == .kiro && account.source == .quotioKeychain {
+            guard let credential = await vault.credential(for: account.id),
+                  let profile = credential.extra["profileArn"]?.nilIfBlank else { continue }
+            let id = MonitorAccount.make(provider: .kiro, accountKey: profile, source: .nativeCredential).id
+            aliases[id, default: []].formUnion([id, account.id])
+        }
+        do { try await metadata.reconcileAliases(aliases) }
+        catch { Log.quota("Failed to persist Monitor account identities: \(error.localizedDescription)") }
+        return await metadata.filteringAccounts(Self.selectPreferred(candidates))
     }
 
     nonisolated static func selectPreferred(
@@ -604,8 +766,12 @@ actor MonitorAccountDiscovery {
         await metadata.removedAccountIDs()
     }
 
-    func setRemoved(_ removed: Bool, accountID: String) async {
-        try? await metadata.setRemoved(removed, accountID: accountID)
+    func setRemoved(_ removed: Bool, accountID: String) async throws {
+        try await metadata.setRemoved(removed, accountID: accountID)
+    }
+
+    func deleteOwnedAccount(accountID: String) async throws {
+        try await vault.delete(accountID: accountID)
     }
 
     func restoreRemovedAccounts() async -> Int {
@@ -615,22 +781,7 @@ actor MonitorAccountDiscovery {
     func filteringRemovedAccounts(
         from quotas: [AIProvider: [String: ProviderQuotaData]]
     ) async -> [AIProvider: [String: ProviderQuotaData]] {
-        let removed = await metadata.removedAccountIDs()
-        guard !removed.isEmpty else { return quotas }
-
-        return quotas.reduce(into: [:]) { result, entry in
-            let visible = entry.value.filter { accountKey, _ in
-                let account = MonitorAccount.make(
-                    provider: entry.key,
-                    accountKey: accountKey,
-                    source: .nativeCredential
-                )
-                return !removed.contains(account.id)
-            }
-            if !visible.isEmpty {
-                result[entry.key] = visible
-            }
-        }
+        await metadata.filteringQuotas(quotas)
     }
 
     private func discoverNativeFiles(codexAliases: [String: String]) async -> [MonitorAccount] {
@@ -762,11 +913,21 @@ actor MonitorAccountDiscovery {
     }
 
     private func discoverKiroFile() -> [MonitorAccount] {
-        let path = MonitorIdentity.expand("~/.aws/sso/cache/kiro-auth-token.json")
+        guard let file = Self.kiroAuthFile(at: MonitorIdentity.expand("~/.aws/sso/cache/kiro-auth-token.json")) else { return [] }
+        return [.make(provider: .kiro, accountKey: file.menuBarAccountKey, source: .nativeCredential, credentialReference: file.filePath)]
+    }
+
+    nonisolated static func kiroAuthFile(at path: String) -> DirectAuthFile? {
         guard let json = MonitorIdentity.json(at: path),
-              (json["accessToken"] as? String ?? json["access_token"] as? String)?.isEmpty == false else { return [] }
-        let key = (json["email"] as? String) ?? (json["profileArn"] as? String) ?? "Kiro"
-        return [.make(provider: .kiro, accountKey: key, source: .nativeCredential, credentialReference: path)]
+              (json["accessToken"] as? String ?? json["access_token"] as? String)?.isEmpty == false else { return nil }
+        let filename = URL(fileURLWithPath: path).lastPathComponent
+        return DirectAuthFile(
+            id: path, provider: .kiro, email: json["email"] as? String,
+            login: nil, expired: nil, accountType: nil, filePath: path,
+            source: .nativeCredential, filename: filename,
+            legacyIdentityKeys: [filename.replacingOccurrences(of: ".json", with: "")],
+            kiroProfileARN: json["profile_arn"] as? String ?? json["profileArn"] as? String
+        )
     }
 
     private func discoverNativeKeychains(codexAliases: [String: String]) -> [MonitorAccount] {
@@ -833,16 +994,17 @@ actor MonitorRefreshCoordinator {
     }
 
     func bootstrap() async -> MonitorRefreshBatch {
-        let quotas = await discovery.filteringRemovedAccounts(from: await snapshots.load())
-        return MonitorRefreshBatch(
-            accounts: await discoverAccounts(merging: quotas),
-            quotas: quotas,
-            issues: issues
-        )
+        // Discover aliases before filtering older snapshots and tombstones.
+        let snapshot = await snapshots.load()
+        let accounts = await discoverAccounts(merging: snapshot)
+        let quotas = await discovery.filteringRemovedAccounts(from: snapshot)
+        await finish(quotas: quotas)
+        return MonitorRefreshBatch(accounts: accounts, quotas: quotas, issues: issues)
     }
 
     func discoverAccounts(merging quotas: [AIProvider: [String: ProviderQuotaData]] = [:]) async -> [MonitorAccount] {
         var accounts = await discovery.discover()
+        let quotas = await discovery.filteringRemovedAccounts(from: quotas)
         accounts = Self.applyingQuotaDisplayNames(accounts, quotas: quotas)
         let disabledIDs = await discovery.disabledAccountIDs()
         let removedIDs = await discovery.removedAccountIDs()
@@ -879,7 +1041,7 @@ actor MonitorRefreshCoordinator {
                     && $0.source.priority >= account.source.priority
             }
         }
-        return accounts.sorted {
+        return await discovery.metadata.filteringAccounts(accounts).sorted {
             if $0.provider.displayName == $1.provider.displayName {
                 return $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
             }
@@ -936,14 +1098,11 @@ actor MonitorRefreshCoordinator {
         credentialAvailability: MonitorCredentialAvailability = .unknown,
         operation: @escaping @Sendable () async -> [String: ProviderQuotaData]
     ) async -> [String: ProviderQuotaData] {
-        let visiblePrevious = await discovery.filteringRemovedAccounts(
-            from: [provider: previous]
-        )[provider] ?? [:]
         if !force, let retry = retryAfter[provider], retry > Date() {
-            return visiblePrevious
+            return await discovery.filteringRemovedAccounts(from: [provider: previous])[provider] ?? [:]
         }
         if let task = inFlight[provider] {
-            return await task.value
+            return await discovery.filteringRemovedAccounts(from: [provider: await task.value])[provider] ?? [:]
         }
 
         let task = Task {
@@ -953,6 +1112,7 @@ actor MonitorRefreshCoordinator {
         }
         inFlight[provider] = task
         let fresh = await task.value
+        let visiblePrevious = await discovery.filteringRemovedAccounts(from: [provider: previous])[provider] ?? [:]
         inFlight[provider] = nil
 
         if fresh.isEmpty, credentialAvailability == .missing {
@@ -968,7 +1128,7 @@ actor MonitorRefreshCoordinator {
                 affectedAccountKeys: Set(visiblePrevious.keys)
             )
             retryAfter[provider] = Date().addingTimeInterval(60)
-            return visiblePrevious
+            return await discovery.filteringRemovedAccounts(from: [provider: visiblePrevious])[provider] ?? [:]
         }
 
         if !fresh.isEmpty {
@@ -991,22 +1151,26 @@ actor MonitorRefreshCoordinator {
                 issues.removeValue(forKey: provider)
                 retryAfter.removeValue(forKey: provider)
             }
-            return merged
+            return await discovery.filteringRemovedAccounts(from: [provider: merged])[provider] ?? [:]
         }
 
         issues.removeValue(forKey: provider)
         retryAfter.removeValue(forKey: provider)
-        return fresh
+        return await discovery.filteringRemovedAccounts(from: [provider: fresh])[provider] ?? [:]
     }
 
     func finish(quotas: [AIProvider: [String: ProviderQuotaData]]) async {
-        await snapshots.store(await discovery.filteringRemovedAccounts(from: quotas))
+        await discovery.metadata.persistSnapshot(quotas, at: snapshots.url)
     }
 
     func filteringRemovedAccounts(
         from quotas: [AIProvider: [String: ProviderQuotaData]]
     ) async -> [AIProvider: [String: ProviderQuotaData]] {
         await discovery.filteringRemovedAccounts(from: quotas)
+    }
+
+    func excludedQuotaAccountIDs() async -> Set<String> {
+        await discovery.metadata.excludedQuotaAccountIDs()
     }
 
     /// Forget every Monitor-owned trace of a single account: its persisted snapshot
@@ -1040,8 +1204,9 @@ actor MonitorRefreshCoordinator {
         await discovery.setDisabled(disabled, accountID: accountID)
     }
 
-    func removeDiscoveredAccount(accountID: String) async {
-        await discovery.setRemoved(true, accountID: accountID)
+    func removeDiscoveredAccount(accountID: String) async throws {
+        try await discovery.setRemoved(true, accountID: accountID)
+        await finish(quotas: await snapshots.load())
     }
 
     func removedAccountCount() async -> Int {
@@ -1053,8 +1218,9 @@ actor MonitorRefreshCoordinator {
         await discovery.restoreRemovedAccounts()
     }
 
-    func deleteOwnedAccount(accountID: String) async {
-        await MonitorCredentialVault.shared.delete(accountID: accountID)
+    func deleteOwnedAccount(accountID: String) async throws {
+        try await discovery.deleteOwnedAccount(accountID: accountID)
+        await finish(quotas: await snapshots.load())
     }
 }
 

@@ -89,6 +89,8 @@ final class QuotaViewModel {
     }
     var errorMessage: String?
     var oauthState: OAuthState?
+    @ObservationIgnored private var monitorOAuthRequestID: UUID?
+    @ObservationIgnored private var monitorOAuthCancellation: Task<Void, Never>?
 
     /// OAuth launch mode for controlling browser behavior
     enum OAuthLaunchMode {
@@ -111,6 +113,8 @@ final class QuotaViewModel {
     /// would only be visible by their absence.
     var monitorUnreadableCredentials: Set<QuotaAccountID> = []
     private(set) var removedMonitorAccountCount = 0
+    @ObservationIgnored private var excludedMonitorQuotaIDs: Set<String> = []
+    @ObservationIgnored private var monitorVisibilityRevision = 0
 
     func monitorStatus(for account: MonitorAccount) -> (status: String?, message: String?) {
         let quota = providerQuotas[account.provider]?[account.accountKey]
@@ -178,7 +182,28 @@ final class QuotaViewModel {
     }
     
     /// Quota data per provider per account (email -> QuotaData)
-    var providerQuotas: [AIProvider: [String: ProviderQuotaData]] = [:]
+    var providerQuotas: [AIProvider: [String: ProviderQuotaData]] = [:] {
+        didSet {
+            // Every writer passes this boundary, including refreshes started in a
+            // different mode and tasks that completed before deletion but publish later.
+            for (provider, quotas) in providerQuotas {
+                guard !excludedMonitorQuotaIDs.isEmpty || provider == .kiro else { continue }
+                for (key, quota) in quotas {
+                    if !excludedMonitorQuotaIDs.isEmpty,
+                       excludedMonitorQuotaIDs.contains(MonitorAccount.make(provider: provider, accountKey: key, source: .nativeCredential).id) {
+                        providerQuotas[provider]?.removeValue(forKey: key)
+                    } else if provider == .kiro,
+                              (quota.isForbidden && !quota.models.isEmpty) || quota.models.contains(where: {
+                                  $0.name == "Error" || $0.name.hasPrefix("Debug: Keys:")
+                                      || ($0.name == "kiro-standard" && $0.resetTime == "Unknown")
+                              }) {
+                        providerQuotas[provider]?[key] = KiroQuotaFetcher.sanitizedCachedQuota(quota)
+                    }
+                }
+                if providerQuotas[provider]?.isEmpty == true { providerQuotas.removeValue(forKey: provider) }
+            }
+        }
+    }
     
     /// Subscription info per provider per account (provider -> email -> SubscriptionInfo)
     var subscriptionInfos: [AIProvider: [String: SubscriptionInfo]] = [:]
@@ -427,6 +452,7 @@ final class QuotaViewModel {
             _apiClient = nil
         }
         let bootstrap = await monitorCoordinator.bootstrap()
+        await syncMonitorQuotaVisibility()
         monitorAccounts = bootstrap.accounts
         monitorIssues = bootstrap.issues
         providerQuotas = bootstrap.quotas
@@ -454,6 +480,8 @@ final class QuotaViewModel {
 
     func setMonitorAccountDisabled(_ disabled: Bool, accountID: String) async {
         await monitorCoordinator.setDisabled(disabled, accountID: accountID)
+        monitorVisibilityRevision += 1
+        await syncMonitorQuotaVisibility()
         if disabled, let account = monitorAccounts.first(where: { $0.id == accountID }) {
             providerQuotas[account.provider]?.removeValue(forKey: account.accountKey)
             await monitorCoordinator.finish(quotas: providerQuotas)
@@ -464,13 +492,20 @@ final class QuotaViewModel {
 
     func deleteMonitorAccount(accountID: String) async {
         guard let account = monitorAccounts.first(where: { $0.id == accountID }) else { return }
-        if account.canDelete {
-            await monitorCoordinator.deleteOwnedAccount(accountID: accountID)
-        } else {
-            // Credentials discovered in another app are user-owned. Removing one from
-            // Quotio hides it persistently without deleting the source file/keychain item.
-            await monitorCoordinator.removeDiscoveredAccount(accountID: accountID)
+        do {
+            if account.source == .quotioKeychain {
+                try await monitorCoordinator.deleteOwnedAccount(accountID: accountID)
+            } else if !account.provider.isImportedFromLocalIDE {
+                // Imported IDE quotas have no credential to rediscover; external
+                // logins do, and must keep a tombstone without deleting their source.
+                try await monitorCoordinator.removeDiscoveredAccount(accountID: accountID)
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+            return
         }
+        monitorVisibilityRevision += 1
+        await syncMonitorQuotaVisibility()
         removeQuotaEntry(provider: account.provider, accountKey: account.accountKey)
 
         // Drop the entry from the persisted Monitor snapshot directly. Rewriting the
@@ -498,6 +533,8 @@ final class QuotaViewModel {
     func restoreRemovedMonitorAccounts() async {
         guard await monitorCoordinator.restoreRemovedAccounts() > 0 else { return }
         removedMonitorAccountCount = 0
+        monitorVisibilityRevision += 1
+        await syncMonitorQuotaVisibility()
         monitorAccounts = await monitorCoordinator.discoverAccounts(merging: providerQuotas)
         if modeManager.isMonitorMode {
             await refreshQuotasDirectly(force: true)
@@ -559,6 +596,15 @@ final class QuotaViewModel {
             savePersistedIDEQuotas()
         }
         return true
+    }
+
+    private func syncMonitorQuotaVisibility() async {
+        let revision = monitorVisibilityRevision
+        let excluded = await monitorCoordinator.excludedQuotaAccountIDs()
+        guard revision == monitorVisibilityRevision else { return }
+        excludedMonitorQuotaIDs = excluded
+        let quotas = providerQuotas
+        providerQuotas = quotas
     }
 
     func saveOpenRouterAccount(label: String, apiKey: String, existingAccountID: String? = nil) async throws {
@@ -684,6 +730,7 @@ final class QuotaViewModel {
         let previous = providerQuotas
         let coordinator = monitorCoordinator
         let discoveredAccounts = await coordinator.discoverAccounts()
+        await syncMonitorQuotaVisibility()
         let discoveredProviders = Set(discoveredAccounts.map(\.provider))
         let discoveredAccountKeys = Dictionary(grouping: discoveredAccounts, by: \.provider)
             .mapValues { Set($0.map(\.accountKey)) }
@@ -873,6 +920,7 @@ final class QuotaViewModel {
         await refreshImportedIDEQuotas()
 
         monitorAccounts = await coordinator.discoverAccounts(merging: providerQuotas)
+        await syncMonitorQuotaVisibility()
         removeDisabledMonitorQuotas()
         await refreshUnreadableCredentialFlags()
         monitorIssues = await coordinator.currentIssues()
@@ -1150,7 +1198,8 @@ final class QuotaViewModel {
         
         refreshTask = Task {
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: intervalNs)
+                do { try await Task.sleep(nanoseconds: intervalNs) }
+                catch { return }
                 _ = await kiroFetcher.refreshAllTokensIfNeeded()
                 await refreshQuotasDirectly()
             }
@@ -1167,7 +1216,8 @@ final class QuotaViewModel {
         
         refreshTask = Task {
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: intervalNs)
+                do { try await Task.sleep(nanoseconds: intervalNs) }
+                catch { return }
                 if !proxyManager.proxyStatus.running {
                     _ = await kiroFetcher.refreshAllTokensIfNeeded()
                     await refreshQuotasUnified()
@@ -1975,7 +2025,11 @@ final class QuotaViewModel {
         case .copilot:
             quota = await copilotFetcher.fetchQuota(accountKey: account.accountKey)
         case .claude:
-            quota = await claudeCodeFetcher.fetchQuota(accountKey: account.accountKey, forceRefresh: true)
+            quota = await claudeCodeFetcher.fetchQuota(
+                accountKey: account.accountKey,
+                forceRefresh: true,
+                allowUserInteraction: modeManager.isMonitorMode && allowCredentialAccessPrompt
+            )
         case .cursor:
             quota = await cursorFetcher.fetchAsProviderQuota()[account.accountKey]
         case .trae:
@@ -2025,6 +2079,7 @@ final class QuotaViewModel {
                     occurredAt: Date()
                 )
             }
+            await finishScopedRefresh(provider: account.provider)
             return
         }
         if account.provider == .codex {
@@ -2217,6 +2272,7 @@ final class QuotaViewModel {
 
     private func finishScopedRefresh(provider: AIProvider) async {
         lastQuotaRefreshTime = Date()
+        await syncMonitorQuotaVisibility()
 
         if modeManager.isMonitorMode {
             monitorAccounts = await monitorCoordinator.discoverAccounts(merging: providerQuotas)
@@ -2353,9 +2409,14 @@ final class QuotaViewModel {
         }
     }
 
-    func startOAuth(for provider: AIProvider, authMethod: AuthCommand? = nil, launchMode: OAuthLaunchMode = .manual) async {
+    func startOAuth(
+        for provider: AIProvider,
+        authMethod: AuthCommand? = nil,
+        launchMode: OAuthLaunchMode = .manual,
+        expectedAccountKey: String? = nil
+    ) async {
         if modeManager.isMonitorMode {
-            await startMonitorOAuth(for: provider)
+            await startMonitorOAuth(for: provider, launchMode: launchMode, expectedAccountKey: expectedAccountKey)
             return
         }
 
@@ -2364,7 +2425,7 @@ final class QuotaViewModel {
             await startCopilotAuth()
             return
         }
-        
+
         // Kiro uses CLI-based auth with multiple options
         if provider == .kiro {
             await startKiroAuth(method: authMethod ?? .kiroGoogleLogin)
@@ -2377,42 +2438,56 @@ final class QuotaViewModel {
         }
 
         oauthState = OAuthState(provider: provider, status: .waiting)
-        
+
         do {
             let response = try await client.getOAuthURL(for: provider)
-            
+
             guard response.status == "ok", let urlString = response.url, let state = response.state else {
                 oauthState = OAuthState(provider: provider, status: .error, error: response.error)
                 return
             }
-            
+
             // Store URL for copy/open buttons
             oauthState = OAuthState(provider: provider, status: .polling, state: state, authURL: urlString)
-            
+
             // Auto-open browser if launchMode is .autoOpen
             if launchMode == .autoOpen, let url = URL(string: urlString) {
                 NSWorkspace.shared.open(url)
             }
-            
+
             await pollOAuthStatus(state: state, provider: provider)
-            
+
         } catch {
             oauthState = OAuthState(provider: provider, status: .error, error: error.localizedDescription)
         }
     }
 
-    private func startMonitorOAuth(for provider: AIProvider) async {
+    private func startMonitorOAuth(
+        for provider: AIProvider,
+        launchMode: OAuthLaunchMode,
+        expectedAccountKey: String?
+    ) async {
+        let requestID = UUID()
+        monitorOAuthRequestID = requestID
+        await monitorOAuthCancellation?.value
+        guard monitorOAuthRequestID == requestID else { return }
+        await MonitorOAuthCoordinator.shared.cancel()
+        guard monitorOAuthRequestID == requestID else { return }
         oauthState = OAuthState(provider: provider, status: .waiting)
         if provider == .claude {
             do {
                 let pending = try await MonitorOAuthCoordinator.shared.beginClaudeLogin()
+                guard monitorOAuthRequestID == requestID else { return }
                 oauthState = OAuthState(
                     provider: provider,
-                    status: .polling,
+                    status: .awaitingCode,
                     state: pending.state,
-                    authURL: pending.url.absoluteString
+                    authURL: pending.url.absoluteString,
+                    expectedAccountKey: expectedAccountKey
                 )
+                if launchMode == .autoOpen { NSWorkspace.shared.open(pending.url) }
             } catch {
+                guard monitorOAuthRequestID == requestID else { return }
                 oauthState = OAuthState(provider: provider, status: .error, error: error.localizedDescription)
             }
             return
@@ -2425,6 +2500,7 @@ final class QuotaViewModel {
             let code = notification.userInfo?["code"] as? String
             let url = notification.userInfo?["url"] as? String
             Task { @MainActor [weak self] in
+                guard self?.monitorOAuthRequestID == requestID else { return }
                 self?.oauthState = OAuthState(
                     provider: provider,
                     status: .polling,
@@ -2438,27 +2514,96 @@ final class QuotaViewModel {
 
         do {
             _ = try await MonitorOAuthCoordinator.shared.login(provider: provider)
+            guard monitorOAuthRequestID == requestID else { return }
             oauthState = OAuthState(provider: provider, status: .success)
             await refreshQuotasDirectly(force: true)
         } catch is CancellationError {
+            guard monitorOAuthRequestID == requestID else { return }
             oauthState = nil
         } catch {
+            guard monitorOAuthRequestID == requestID else { return }
             oauthState = OAuthState(provider: provider, status: .error, error: error.localizedDescription)
         }
     }
 
     func completeMonitorOAuthCode(_ code: String, provider: AIProvider) async {
-        guard modeManager.isMonitorMode, provider == .claude else { return }
-        oauthState = OAuthState(provider: provider, status: .waiting)
+        guard modeManager.isMonitorMode, provider == .claude,
+            let requestID = monitorOAuthRequestID,
+            let previous = oauthState, previous.provider == provider,
+            previous.status == .awaitingCode || previous.status == .error
+        else { return }
+        oauthState = OAuthState(
+            provider: provider, status: previous.credentialsReady ? .savingCredentials : .exchanging,
+            state: previous.state, authURL: previous.authURL, expectedAccountKey: previous.expectedAccountKey
+        )
         do {
-            _ = try await MonitorOAuthCoordinator.shared.completeClaudeLogin(code: code)
-            oauthState = OAuthState(provider: provider, status: .success)
-            await refreshQuotasDirectly(force: true)
+            let account = try await MonitorOAuthCoordinator.shared.completeClaudeLogin(
+                code: code, expectedAccountKey: previous.expectedAccountKey
+            )
+            guard monitorOAuthRequestID == requestID else { return }
+            await verifyClaudeLogin(accountKey: account.accountKey, requestID: requestID)
+        } catch is CancellationError {
+            guard monitorOAuthRequestID == requestID else { return }
+            oauthState = nil
         } catch {
-            oauthState = OAuthState(provider: provider, status: .error, error: error.localizedDescription)
+            guard monitorOAuthRequestID == requestID else { return }
+            let pending = await MonitorOAuthCoordinator.shared.pendingClaudeLogin()
+            guard monitorOAuthRequestID == requestID else { return }
+            oauthState = OAuthState(
+                provider: provider, status: .error,
+                state: pending?.state, error: error.localizedDescription, authURL: pending?.url.absoluteString,
+                expectedAccountKey: previous.expectedAccountKey, credentialsReady: pending?.credentialsReady ?? false
+            )
         }
     }
-    
+
+    func retryClaudeLoginVerification() async {
+        guard let requestID = monitorOAuthRequestID,
+            oauthState?.status == .verificationFailed,
+            let accountKey = oauthState?.expectedAccountKey
+        else { return }
+        await verifyClaudeLogin(accountKey: accountKey, requestID: requestID)
+    }
+
+    private func verifyClaudeLogin(accountKey: String, requestID: UUID) async {
+        oauthState = OAuthState(provider: .claude, status: .verifying, expectedAccountKey: accountKey)
+        // A pre-login batch may still publish old results. Let it finish before
+        // installing the explicitly refreshed result for this account.
+        let deadline = Date().addingTimeInterval(60)
+        while activeRefreshProviders.contains(.claude) {
+            do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
+            guard monitorOAuthRequestID == requestID else { return }
+            if Date() >= deadline {
+                oauthState = OAuthState(
+                    provider: .claude, status: .verificationFailed,
+                    error: "oauth.claude.usageUnavailable".localized(), expectedAccountKey: accountKey
+                )
+                return
+            }
+        }
+        guard monitorOAuthRequestID == requestID,
+            beginScopedRefresh(provider: .claude)
+        else { return }
+        defer { endScopedRefresh(provider: .claude) }
+        await claudeCodeFetcher.clearCache(for: accountKey)
+        let quota = await claudeCodeFetcher.fetchQuota(accountKey: accountKey, forceRefresh: true)
+        guard monitorOAuthRequestID == requestID else { return }
+        await syncMonitorQuotaVisibility()
+        guard monitorOAuthRequestID == requestID else { return }
+        if let quota { providerQuotas[.claude, default: [:]][accountKey] = quota }
+        if let quota, !quota.isForbidden, !quota.models.isEmpty {
+            monitorAccountIssues.removeValue(forKey: QuotaAccountID(provider: .claude, accountKey: accountKey))
+        }
+        await finishScopedRefresh(provider: .claude)
+        guard monitorOAuthRequestID == requestID else { return }
+        oauthState = OAuthState(
+            provider: .claude,
+            status: quota.map { !$0.isForbidden && !$0.models.isEmpty } == true ? .success : .verificationFailed,
+            error: quota?.isForbidden == true ? "oauth.claude.usageRejected".localized() : "oauth.claude.usageUnavailable".localized(),
+            expectedAccountKey: accountKey
+        )
+    }
+
     /// Start GitHub Copilot authentication using Device Code Flow
     private func startCopilotAuth() async {
         oauthState = OAuthState(provider: .copilot, status: .waiting)
@@ -2587,7 +2732,8 @@ final class QuotaViewModel {
     }
     
     func cancelOAuth() {
-        Task { await MonitorOAuthCoordinator.shared.cancel() }
+        monitorOAuthRequestID = nil
+        monitorOAuthCancellation = Task { await MonitorOAuthCoordinator.shared.cancel() }
         oauthState = nil
     }
     
@@ -3006,6 +3152,7 @@ final class QuotaViewModel {
 
         if modeManager.isMonitorMode {
             monitorAccounts = await monitorCoordinator.discoverAccounts(merging: providerQuotas)
+            await syncMonitorQuotaVisibility()
             removeDisabledMonitorQuotas()
         }
 
@@ -3074,8 +3221,15 @@ struct OAuthState {
     var state: String?
     var error: String?
     var authURL: String?
-    
+    var expectedAccountKey: String?
+    var credentialsReady: Bool = false
+
+    var acceptsClaudeCode: Bool {
+        provider == .claude && !credentialsReady && state != nil
+            && (status == .awaitingCode || status == .error)
+    }
+
     enum OAuthStatus {
-        case waiting, polling, success, error
+        case waiting, polling, awaitingCode, exchanging, savingCredentials, verifying, verificationFailed, success, error
     }
 }

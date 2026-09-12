@@ -19,7 +19,7 @@ struct QuotaScreen: View {
         var providers = Set<AIProvider>()
         
         // From proxy auth files
-        for file in viewModel.authFiles {
+        for file in viewModel.authFiles where modeManager.isLocalProxyMode {
             if let provider = file.providerType {
                 providers.insert(provider)
             }
@@ -46,7 +46,7 @@ struct QuotaScreen: View {
         var accounts = Set<String>()
         
         // From auth files
-        for file in viewModel.authFiles where file.providerType == provider {
+        for file in viewModel.authFiles where modeManager.isLocalProxyMode && file.providerType == provider {
             accounts.insert(file.quotaLookupKey)
         }
         
@@ -66,19 +66,9 @@ struct QuotaScreen: View {
         )
     }
     
-    private func lowestQuotaPercent(for provider: AIProvider) -> Double? {
+    private func quotaPercent(for provider: AIProvider) -> Double? {
         guard let accounts = viewModel.providerQuotas[provider] else { return nil }
-        
-        var allTotals: [Double] = []
-        for (_, quotaData) in accounts {
-            let models = quotaData.models.map { (name: $0.name, percentage: $0.percentage) }
-            let total = settings.totalUsagePercent(models: models)
-            if total >= 0 {
-                allTotals.append(total)
-            }
-        }
-        
-        return allTotals.min()
+        return settings.summaryUsagePercent(for: accounts.values)
     }
     
     /// Check if we have any data to show
@@ -205,7 +195,7 @@ struct QuotaScreen: View {
                 if let provider = selectedProvider ?? availableProviders.first {
                     ProviderQuotaView(
                         provider: provider,
-                        authFiles: viewModel.authFiles.filter { $0.providerType == provider },
+                        authFiles: modeManager.isLocalProxyMode ? viewModel.authFiles.filter { $0.providerType == provider } : [],
                         quotaData: viewModel.providerQuotas[provider] ?? [:],
                         subscriptionInfos: viewModel.subscriptionInfos[provider] ?? [:],
                         trackedAccounts: modeManager.isMonitorMode
@@ -236,7 +226,7 @@ struct QuotaScreen: View {
                 ForEach(availableProviders) { provider in
                     ProviderSegmentButton(
                         provider: provider,
-                        quotaPercent: lowestQuotaPercent(for: provider),
+                        quotaPercent: quotaPercent(for: provider),
                         accountCount: accountCount(for: provider),
                         isSelected: selectedProvider == provider
                     ) {
@@ -253,10 +243,11 @@ struct QuotaScreen: View {
     }
 }
 
-fileprivate struct QuotaDisplayHelper {
+struct QuotaDisplayHelper {
     let displayMode: QuotaDisplayMode
     
     func statusColor(remainingPercent: Double) -> Color {
+        guard displayPercent(remainingPercent: remainingPercent) >= 0 else { return .secondary }
         let clamped = max(0, min(100, remainingPercent))
         let usedPercent = 100 - clamped
         let checkValue = displayMode == .used ? usedPercent : clamped
@@ -273,17 +264,13 @@ fileprivate struct QuotaDisplayHelper {
     }
     
     func displayPercent(remainingPercent: Double) -> Double {
-        let clamped = max(0, min(100, remainingPercent))
-        return displayMode == .used ? (100 - clamped) : clamped
+        guard remainingPercent.isFinite, (0...100).contains(remainingPercent) else { return -1 }
+        return displayMode.displayValue(from: remainingPercent)
     }
 
-    /// Percentage for ring rendering. Unlike `displayPercent(remainingPercent:)`
-    /// this keeps the "no data" sentinel instead of clamping it into a real
-    /// value, so `RingProgressView` can render its unknown state.
-    func ringPercent(remainingPercent: Double) -> Double {
-        remainingPercent < 0
-            ? RingProgressView.unknownPercent
-            : displayPercent(remainingPercent: remainingPercent)
+    func formattedPercent(remainingPercent: Double) -> String {
+        let percentage = displayPercent(remainingPercent: remainingPercent)
+        return percentage >= 0 ? String(format: "%.0f%%", percentage) : "—"
     }
 }
 
@@ -528,14 +515,21 @@ private struct AccountInfo {
 
 private struct AccountQuotaCardV2: View {
     @Environment(QuotaViewModel.self) private var viewModel
-    
+
     private var settings: MenuBarSettingsManager { MenuBarSettingsManager.shared }
     let provider: AIProvider
     let account: AccountInfo
     let isLoading: Bool
-    
+
     @State private var showSwitchSheet = false
     @State private var showModelsDetailSheet = false
+    @State private var showOAuthSheet = false
+    @State private var showSourceRecovery = false
+    @State private var modeManager = OperatingModeManager.shared
+
+    private var trackedAccount: MonitorAccount? {
+        viewModel.monitorAccounts.first { $0.provider == provider && $0.accountKey == account.key }
+    }
 
     private var accountID: QuotaAccountID {
         QuotaAccountID(provider: provider, accountKey: account.key)
@@ -545,40 +539,26 @@ private struct AccountQuotaCardV2: View {
         viewModel.isRefreshing(account: accountID)
     }
 
-    /// Check if OAuth is in progress for this provider
-    private var isReauthenticating: Bool {
-        guard let oauthState = viewModel.oauthState else { return false }
-        return oauthState.provider == provider &&
-               (oauthState.status == .waiting || oauthState.status == .polling)
-    }
-    
-    /// Get auth URL if available during reauthentication
-    private var reauthURL: URL? {
-        guard let oauthState = viewModel.oauthState,
-              oauthState.provider == provider,
-              let urlString = oauthState.authURL else { return nil }
-        return URL(string: urlString)
-    }
     @State private var showWarmupSheet = false
-    
+
     private var hasQuotaData: Bool {
         guard let data = account.quotaData else { return false }
         return !data.models.isEmpty
     }
-    
+
     private var displayEmail: String {
         account.email.masked(if: settings.hideSensitiveInfo)
     }
-    
+
     private var isWarmupEnabled: Bool {
         viewModel.isWarmupEnabled(for: provider, accountKey: account.key)
     }
-    
+
     /// Check if this Antigravity account is active in IDE
     private var isActiveInIDE: Bool {
         provider == .antigravity && viewModel.isAntigravityAccountActive(email: account.email)
     }
-    
+
     /// Build 4-group display for Antigravity: Gemini 3 Pro, Gemini 3 Flash, Gemini 3 Image, Claude 4.5
     private var antigravityDisplayGroups: [AntigravityDisplayGroup] {
         guard let data = account.quotaData, provider == .antigravity else { return [] }
@@ -593,11 +573,11 @@ private struct AccountQuotaCardV2: View {
                 )
             }
         }
-        
+
         var groups: [AntigravityDisplayGroup] = []
-        
-        let gemini3ProModels = data.models.filter { 
-            $0.name.contains("gemini-3-pro") && !$0.name.contains("image") 
+
+        let gemini3ProModels = data.models.filter {
+            $0.name.contains("gemini-3-pro") && !$0.name.contains("image")
         }
         if !gemini3ProModels.isEmpty {
             let aggregatedQuota = settings.aggregateModelPercentages(gemini3ProModels.map(\.percentage))
@@ -605,7 +585,7 @@ private struct AccountQuotaCardV2: View {
                 groups.append(AntigravityDisplayGroup(name: "Gemini 3 Pro", percentage: aggregatedQuota, models: gemini3ProModels))
             }
         }
-        
+
         let gemini3FlashModels = data.models.filter { $0.name.contains("gemini-3-flash") }
         if !gemini3FlashModels.isEmpty {
             let aggregatedQuota = settings.aggregateModelPercentages(gemini3FlashModels.map(\.percentage))
@@ -613,7 +593,7 @@ private struct AccountQuotaCardV2: View {
                 groups.append(AntigravityDisplayGroup(name: "Gemini 3 Flash", percentage: aggregatedQuota, models: gemini3FlashModels))
             }
         }
-        
+
         let geminiImageModels = data.models.filter { $0.name.contains("image") }
         if !geminiImageModels.isEmpty {
             let aggregatedQuota = settings.aggregateModelPercentages(geminiImageModels.map(\.percentage))
@@ -621,7 +601,7 @@ private struct AccountQuotaCardV2: View {
                 groups.append(AntigravityDisplayGroup(name: "Gemini 3 Image", percentage: aggregatedQuota, models: geminiImageModels))
             }
         }
-        
+
         let claudeModels = data.models.filter { $0.name.contains("claude") }
         if !claudeModels.isEmpty {
             let aggregatedQuota = settings.aggregateModelPercentages(claudeModels.map(\.percentage))
@@ -629,14 +609,14 @@ private struct AccountQuotaCardV2: View {
                 groups.append(AntigravityDisplayGroup(name: "Claude", percentage: aggregatedQuota, models: claudeModels))
             }
         }
-        
+
         return groups.sorted { $0.percentage < $1.percentage }
     }
-    
+
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             accountHeader
-            
+
             if isLoading {
                 QuotaLoadingView()
             } else if hasQuotaData {
@@ -662,7 +642,7 @@ private struct AccountQuotaCardV2: View {
                 .stroke(Color.primary.opacity(0.06), lineWidth: 0.5)
         )
     }
-    
+
     // MARK: - Account Header
 
     private var accountHeader: some View {
@@ -698,9 +678,9 @@ private struct AccountQuotaCardV2: View {
                         .foregroundStyle(account.statusColor)
                 }
             }
-            
+
             Spacer()
-            
+
             HStack(spacing: 6) {
                 if provider == .antigravity {
                     Button {
@@ -713,16 +693,16 @@ private struct AccountQuotaCardV2: View {
                                 .font(.caption)
                                 .fontWeight(.medium)
                         }
-                            .foregroundStyle(isWarmupEnabled ? provider.color : .secondary)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 6)
-                            .background(isWarmupEnabled ? provider.color.opacity(0.12) : Color.primary.opacity(0.05))
-                            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        .foregroundStyle(isWarmupEnabled ? provider.color : .secondary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(isWarmupEnabled ? provider.color.opacity(0.12) : Color.primary.opacity(0.05))
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                     }
                     .buttonStyle(.plain)
                     .help("action.warmup".localized())
                 }
-                
+
                 if isActiveInIDE {
                     Text("antigravity.active".localized())
                         .font(.caption2)
@@ -733,7 +713,7 @@ private struct AccountQuotaCardV2: View {
                         .background(Color.green.opacity(0.1))
                         .clipShape(Capsule())
                 }
-                
+
                 if provider == .antigravity && !isActiveInIDE {
                     Button {
                         showSwitchSheet = true
@@ -745,16 +725,16 @@ private struct AccountQuotaCardV2: View {
                                 .font(.caption)
                                 .fontWeight(.medium)
                         }
-                            .foregroundStyle(.blue)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 6)
-                            .background(Color.blue.opacity(0.1))
-                            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        .foregroundStyle(.blue)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(Color.blue.opacity(0.1))
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                     }
                     .buttonStyle(.plain)
                     .help("antigravity.useInIDE".localized())
                 }
-                
+
                 Button {
                     Task {
                         await viewModel.refreshQuota(
@@ -776,11 +756,11 @@ private struct AccountQuotaCardV2: View {
                                 .font(.caption)
                                 .fontWeight(.medium)
                         }
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 6)
-                            .background(Color.primary.opacity(0.05))
-                            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(Color.primary.opacity(0.05))
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                     }
                 }
                 .buttonStyle(.plain)
@@ -789,50 +769,28 @@ private struct AccountQuotaCardV2: View {
                         || !viewModel.supportsScopedRefresh(for: provider)
                 )
                 .help("action.refreshQuota".localized())
-                
+
                 if let data = account.quotaData, data.isForbidden {
                     if provider == .claude {
-                        // When reauthenticating with authURL available, show "Open Link" button
-                        if isReauthenticating, let url = reauthURL {
-                            Button {
-                                NSWorkspace.shared.open(url)
-                            } label: {
-                                HStack(spacing: 4) {
-                                    ProgressView()
-                                        .controlSize(.mini)
-                                    Image(systemName: "safari")
-                                        .font(.caption)
-                                }
+                        Button {
+                            if modeManager.isMonitorMode, let trackedAccount,
+                                trackedAccount.source != .quotioKeychain
+                            {
+                                showSourceRecovery = true
+                            } else {
+                                showOAuthSheet = true
+                            }
+                        } label: {
+                            Label("providers.signInAgain".localized(), systemImage: "arrow.clockwise.circle.fill")
+                                .font(.caption)
                                 .foregroundStyle(.orange)
-                                .frame(width: 56, height: 28)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 6)
                                 .background(Color.orange.opacity(0.1))
                                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                            }
-                            .buttonStyle(.plain)
-                            .help("oauth.openLink".localized())
-                        } else {
-                            Button {
-                                Task {
-                                    await viewModel.startOAuth(for: .claude, launchMode: .autoOpen)
-                                }
-                            } label: {
-                                if isReauthenticating {
-                                    ProgressView()
-                                        .controlSize(.mini)
-                                        .frame(width: 28, height: 28)
-                                } else {
-                                    Image(systemName: "arrow.clockwise.circle.fill")
-                                        .font(.caption)
-                                        .foregroundStyle(.orange)
-                                        .frame(width: 28, height: 28)
-                                        .background(Color.orange.opacity(0.1))
-                                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                                }
-                            }
-                            .buttonStyle(.plain)
-                            .disabled(isReauthenticating)
-                            .help("quota.reauthenticate".localized())
                         }
+                        .buttonStyle(.plain)
+                        .help("quota.reauthenticate".localized())
                     } else {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .font(.caption)
@@ -854,6 +812,26 @@ private struct AccountQuotaCardV2: View {
             )
             .environment(viewModel)
         }
+        .sheet(isPresented: $showOAuthSheet) {
+            OAuthSheet(provider: provider, expectedAccountKey: account.key, autoStart: true) {
+                showOAuthSheet = false
+            }
+            .environment(viewModel)
+        }
+        .sheet(isPresented: $showSourceRecovery) {
+            if let trackedAccount {
+                AccountRecoveryHelpSheet(
+                    account: AccountRowData.from(
+                        monitorAccount: trackedAccount, status: account.status, statusMessage: account.statusMessage
+                    )
+                ) {
+                    showSourceRecovery = false
+                    Task { await viewModel.refreshQuota(for: accountID, allowCredentialAccessPrompt: true) }
+                } onDismiss: {
+                    showSourceRecovery = false
+                }
+            }
+        }
         .sheet(isPresented: $showWarmupSheet) {
             WarmupSheet(
                 provider: provider,
@@ -866,7 +844,7 @@ private struct AccountQuotaCardV2: View {
             .environment(viewModel)
         }
     }
-    
+
     // MARK: - Usage Section
 
     private var isQuotaUnavailable: Bool {
@@ -1211,7 +1189,7 @@ private struct AntigravityGroupRow: View {
     }
     
     private var remainingPercent: Double {
-        max(0, min(100, group.percentage))
+        group.percentage
     }
     
     private var groupIcon: String {
@@ -1248,7 +1226,7 @@ private struct AntigravityGroupRow: View {
                 
                 Spacer()
                 
-                Text(String(format: "%.0f%%", displayPercent))
+                Text(displayHelper.formattedPercent(remainingPercent: remainingPercent))
                     .font(.subheadline)
                     .fontWeight(.semibold)
                     .foregroundStyle(statusColor)
@@ -1268,7 +1246,7 @@ private struct AntigravityGroupRow: View {
                         .fill(Color.primary.opacity(0.06))
                     Capsule()
                         .fill(statusColor.gradient)
-                        .frame(width: proxy.size.width * (displayPercent / 100))
+                        .frame(width: proxy.size.width * (max(0, displayPercent) / 100))
                 }
             }
             .frame(height: 6)
@@ -1312,7 +1290,7 @@ private struct AntigravityLowestBarLayout: View {
                             .font(.subheadline)
                             .fontWeight(.semibold)
                         Spacer()
-                        Text(String(format: "%.0f%%", displayPercent(for: lowest.percentage)))
+                        Text(displayHelper.formattedPercent(remainingPercent: lowest.percentage))
                             .font(.subheadline)
                             .fontWeight(.bold)
                             .foregroundStyle(displayHelper.statusColor(remainingPercent: lowest.percentage))
@@ -1325,7 +1303,7 @@ private struct AntigravityLowestBarLayout: View {
                                 .fill(Color.primary.opacity(0.06))
                             Capsule()
                                 .fill(displayHelper.statusColor(remainingPercent: lowest.percentage).gradient)
-                                .frame(width: proxy.size.width * (displayPercent(for: lowest.percentage) / 100))
+                                .frame(width: proxy.size.width * (max(0, displayPercent(for: lowest.percentage)) / 100))
                         }
                     }
                     .frame(height: 8)
@@ -1344,7 +1322,7 @@ private struct AntigravityLowestBarLayout: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                             Spacer()
-                            Text(String(format: "%.0f%%", displayPercent(for: group.percentage)))
+                            Text(displayHelper.formattedPercent(remainingPercent: group.percentage))
                                 .font(.caption)
                                 .fontWeight(.medium)
                                 .foregroundStyle(displayHelper.statusColor(remainingPercent: group.percentage))
@@ -1373,7 +1351,7 @@ private struct AntigravityRingLayout: View {
     }
     
     private func ringPercent(for remainingPercent: Double) -> Double {
-        displayHelper.ringPercent(remainingPercent: remainingPercent)
+        displayHelper.displayPercent(remainingPercent: remainingPercent)
     }
 
     var body: some View {
@@ -1434,7 +1412,7 @@ private struct StandardLowestBarLayout: View {
                             .font(.subheadline)
                             .fontWeight(.semibold)
                         Spacer()
-                        Text(String(format: "%.0f%%", displayPercent(for: lowest.percentage)))
+                        Text(displayHelper.formattedPercent(remainingPercent: lowest.percentage))
                             .font(.subheadline)
                             .fontWeight(.bold)
                             .foregroundStyle(displayHelper.statusColor(remainingPercent: lowest.percentage))
@@ -1447,7 +1425,7 @@ private struct StandardLowestBarLayout: View {
                                 .fill(Color.primary.opacity(0.06))
                             Capsule()
                                 .fill(displayHelper.statusColor(remainingPercent: lowest.percentage).gradient)
-                                .frame(width: proxy.size.width * (displayPercent(for: lowest.percentage) / 100))
+                                .frame(width: proxy.size.width * (max(0, displayPercent(for: lowest.percentage)) / 100))
                         }
                     }
                     .frame(height: 8)
@@ -1477,7 +1455,7 @@ private struct StandardLowestBarLayout: View {
                                     .font(.caption2)
                                     .foregroundStyle(.tertiary)
                             }
-                            Text(String(format: "%.0f%%", displayPercent(for: model.percentage)))
+                            Text(displayHelper.formattedPercent(remainingPercent: model.percentage))
                                 .font(.caption)
                                 .fontWeight(.medium)
                                 .foregroundStyle(displayHelper.statusColor(remainingPercent: model.percentage))
@@ -1506,7 +1484,7 @@ private struct StandardRingLayout: View {
     }
     
     private func ringPercent(for remainingPercent: Double) -> Double {
-        displayHelper.ringPercent(remainingPercent: remainingPercent)
+        displayHelper.displayPercent(remainingPercent: remainingPercent)
     }
 
     var body: some View {
@@ -1617,7 +1595,7 @@ private struct ModelDetailCard: View {
     }
     
     private var remainingPercent: Double {
-        max(0, min(100, model.percentage))
+        model.percentage
     }
     
     var body: some View {
@@ -1639,14 +1617,14 @@ private struct ModelDetailCard: View {
                         .fill(Color.primary.opacity(0.06))
                     Capsule()
                         .fill(statusColor.gradient)
-                        .frame(width: proxy.size.width * (displayPercent / 100))
+                        .frame(width: proxy.size.width * (max(0, displayPercent) / 100))
                 }
             }
             .frame(height: 6)
             
             // Footer: Percentage + Reset time
             HStack {
-                Text(String(format: "%.0f%%", displayPercent))
+                Text(displayHelper.formattedPercent(remainingPercent: remainingPercent))
                     .font(.caption)
                     .fontWeight(.medium)
                     .foregroundStyle(statusColor)
@@ -1691,11 +1669,11 @@ private struct UsageRowV2: View {
     }
     
     private var isUnknown: Bool {
-        usedPercent < 0 || usedPercent > 100
+        !usedPercent.isFinite || !(0...100).contains(usedPercent)
     }
     
     private var remainingPercent: Double {
-        max(0, min(100, 100 - usedPercent))
+        isUnknown ? -1 : 100 - usedPercent
     }
     
     var body: some View {

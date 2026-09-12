@@ -8,7 +8,33 @@ actor MonitorOAuthCoordinator {
     private let githubClientID = "Iv1.b507a08c87ecfe98"
     private var activeTask: Task<MonitorAccount, Error>?
     private var callbackServer: MonitorOAuthCallbackServer?
-    private var claudePending: (state: String, verifier: String)?
+    private struct ClaudeAuthorization: Sendable {
+        let account: MonitorAccount
+        let credential: MonitorOAuthCredential
+    }
+
+    private struct PendingClaudeLogin: Sendable {
+        let state: String
+        let verifier: String
+        let url: URL
+        let expiresAt: Date
+        var authorization: ClaudeAuthorization?
+    }
+
+    private var claudePending: PendingClaudeLogin?
+    private var claudeCompletion: (state: String, task: Task<MonitorAccount, Error>)?
+    private let claudeSession: URLSession?
+    private let saveClaudeCredential: @Sendable (MonitorOAuthCredential, MonitorAccount) async throws -> Void
+
+    init(
+        claudeSession: URLSession? = nil,
+        saveClaudeCredential: @escaping @Sendable (MonitorOAuthCredential, MonitorAccount) async throws -> Void = {
+            try await MonitorCredentialVault.shared.saveUserInitiated($0, metadata: $1)
+        }
+    ) {
+        self.claudeSession = claudeSession
+        self.saveClaudeCredential = saveClaudeCredential
+    }
 
     func login(provider: AIProvider) async throws -> MonitorAccount {
         let task: Task<MonitorAccount, Error>
@@ -32,10 +58,14 @@ actor MonitorOAuthCoordinator {
         activeTask = nil
         callbackServer?.stop()
         callbackServer = nil
+        claudeCompletion?.task.cancel()
+        claudeCompletion = nil
         claudePending = nil
     }
 
-    func beginClaudeLogin() async throws -> (url: URL, state: String) {
+    func beginClaudeLogin() throws -> (url: URL, state: String) {
+        claudeCompletion?.task.cancel()
+        claudeCompletion = nil
         let state = UUID().uuidString
         let verifier = Self.randomURLSafeString(byteCount: 48)
         let challenge = Self.base64URL(Data(SHA256.hash(data: Data(verifier.utf8))))
@@ -44,58 +74,137 @@ actor MonitorOAuthCoordinator {
             URLQueryItem(name: "client_id", value: "9d1c250a-e61b-44d9-88ed-5944d1962f5e"),
             URLQueryItem(name: "redirect_uri", value: "https://platform.claude.com/oauth/code/callback"),
             URLQueryItem(name: "response_type", value: "code"),
-            URLQueryItem(name: "scope", value: "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"),
+            URLQueryItem(
+                name: "scope",
+                value: "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"),
             URLQueryItem(name: "state", value: state),
             URLQueryItem(name: "code", value: "true"),
             URLQueryItem(name: "code_challenge", value: challenge),
             URLQueryItem(name: "code_challenge_method", value: "S256"),
         ]
-        guard let url = components.url,
-              await MainActor.run(body: { NSWorkspace.shared.open(url) }) else {
-            throw MonitorOAuthError.browserOpenFailed
-        }
-        claudePending = (state, verifier)
+        guard let url = components.url else { throw MonitorOAuthError.invalidResponse }
+        claudePending = PendingClaudeLogin(
+            state: state, verifier: verifier, url: url,
+            expiresAt: Date().addingTimeInterval(600)
+        )
         return (url, state)
     }
 
-    func completeClaudeLogin(code rawCode: String) async throws -> MonitorAccount {
-        guard let pending = claudePending else { throw MonitorOAuthError.expired }
-        defer { claudePending = nil }
-        let pieces = rawCode.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: "#", maxSplits: 1).map(String.init)
-        guard let code = pieces.first, !code.isEmpty else { throw MonitorOAuthError.invalidResponse }
-        if pieces.count == 2, pieces[1] != pending.state { throw MonitorOAuthError.stateMismatch }
-        let tokens = try await postJSON(
-            url: "https://platform.claude.com/v1/oauth/token",
-            body: [
-                "grant_type": "authorization_code",
-                "code": code,
-                "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-                "redirect_uri": "https://platform.claude.com/oauth/code/callback",
-                "code_verifier": pending.verifier,
-                "state": pending.state,
-            ]
-        )
-        guard let accessToken = tokens["access_token"] as? String else { throw MonitorOAuthError.invalidResponse }
-        let accountJSON = tokens["account"] as? [String: Any]
-        let email = accountJSON?["email_address"] as? String ?? "Claude"
-        let accountID = accountJSON?["uuid"] as? String
-        let account = MonitorAccount.make(
-            provider: .claude,
-            accountKey: email,
-            source: .quotioKeychain,
-            credentialReference: "keychain",
-            canDelete: true
-        )
-        let credential = MonitorOAuthCredential(
-            accessToken: accessToken,
-            refreshToken: tokens["refresh_token"] as? String,
-            idToken: nil,
-            accountID: accountID,
-            expiresAt: (tokens["expires_in"] as? NSNumber).map { Date().addingTimeInterval($0.doubleValue) },
-            extra: [:]
-        )
-        try await MonitorCredentialVault.shared.saveUserInitiated(credential, metadata: account)
-        return account
+    func pendingClaudeLogin() -> (state: String, url: URL, credentialsReady: Bool)? {
+        guard let pending = claudePending else { return nil }
+        guard pending.authorization != nil || pending.expiresAt > Date() else {
+            claudePending = nil
+            return nil
+        }
+        return (pending.state, pending.url, pending.authorization != nil)
+    }
+
+    func completeClaudeLogin(code rawCode: String, expectedAccountKey: String? = nil) async throws -> MonitorAccount {
+        guard let pending = claudePending, pendingClaudeLogin() != nil else { throw MonitorOAuthError.expired }
+        if let completion = claudeCompletion, completion.state == pending.state {
+            return try await completion.task.value
+        }
+        // Validate without consuming the pending PKCE request. A mistyped code
+        // must remain correctable without opening a new authorization page.
+        let code =
+            pending.authorization == nil
+            ? try Self.claudeAuthorizationCode(from: rawCode, expectedState: pending.state)
+            : nil
+        let task = Task {
+            try await self.finishClaudeLogin(pending: pending, code: code, expectedAccountKey: expectedAccountKey)
+        }
+        claudeCompletion = (pending.state, task)
+        defer {
+            if claudeCompletion?.state == pending.state { claudeCompletion = nil }
+        }
+        return try await task.value
+    }
+
+    private func finishClaudeLogin(
+        pending: PendingClaudeLogin,
+        code: String?,
+        expectedAccountKey: String?
+    ) async throws -> MonitorAccount {
+        let authorization: ClaudeAuthorization
+        if let saved = pending.authorization {
+            authorization = saved
+        } else {
+            guard let code else { throw MonitorOAuthError.invalidResponse }
+            let session =
+                claudeSession
+                ?? URLSession(
+                    configuration: ProxyConfigurationService.createProxiedConfigurationStatic(timeout: 30)
+                )
+            let tokens = try await postJSON(
+                url: "https://platform.claude.com/v1/oauth/token",
+                body: [
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+                    "redirect_uri": "https://platform.claude.com/oauth/code/callback",
+                    "code_verifier": pending.verifier,
+                    "state": pending.state,
+                ],
+                session: session
+            )
+            try Task.checkCancellation()
+            guard claudePending?.state == pending.state else { throw CancellationError() }
+            guard let accessToken = tokens["access_token"] as? String, !accessToken.isEmpty,
+                let refreshToken = tokens["refresh_token"] as? String, !refreshToken.isEmpty,
+                let accountJSON = tokens["account"] as? [String: Any],
+                let email = (accountJSON["email_address"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                !email.isEmpty
+            else { throw MonitorOAuthError.invalidResponse }
+            let account = MonitorAccount.make(
+                provider: .claude, accountKey: email, source: .quotioKeychain,
+                credentialReference: "keychain", canDelete: true
+            )
+            authorization = ClaudeAuthorization(
+                account: account,
+                credential: MonitorOAuthCredential(
+                    accessToken: accessToken,
+                    refreshToken: refreshToken,
+                    accountID: accountJSON["uuid"] as? String,
+                    expiresAt: (tokens["expires_in"] as? NSNumber).map { Date().addingTimeInterval($0.doubleValue) },
+                    extra: [:]
+                )
+            )
+            // Authorization codes are single-use. Retain the exchanged credential
+            // in memory so a denied/failed Keychain write can be retried safely.
+            claudePending?.authorization = authorization
+        }
+        if let expectedAccountKey,
+            authorization.account.accountKey.caseInsensitiveCompare(
+                expectedAccountKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            ) != .orderedSame
+        {
+            claudePending = nil
+            throw MonitorOAuthError.accountMismatch
+        }
+        try Task.checkCancellation()
+        guard claudePending?.state == pending.state else { throw CancellationError() }
+        try await saveClaudeCredential(authorization.credential, authorization.account)
+        try Task.checkCancellation()
+        guard claudePending?.state == pending.state else { throw CancellationError() }
+        claudePending = nil
+        return authorization.account
+    }
+
+    nonisolated static func claudeAuthorizationCode(from rawCode: String, expectedState: String) throws -> String {
+        let value = rawCode.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.hasPrefix("https://") {
+            guard let callback = URL(string: value), callback.host == "platform.claude.com",
+                callback.path == "/oauth/code/callback"
+            else { throw MonitorOAuthError.invalidResponse }
+            return try authorizationCode(from: callback, expectedState: expectedState)
+        }
+        let pieces = value.split(separator: "#", omittingEmptySubsequences: false)
+        guard let code = pieces.first, !code.isEmpty,
+            String(code).rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
+            pieces.count <= 2
+        else { throw MonitorOAuthError.invalidResponse }
+        if pieces.count == 2, pieces[1] != expectedState { throw MonitorOAuthError.stateMismatch }
+        return String(code)
     }
 
     private struct BrowserConfiguration: Sendable {
@@ -493,21 +602,26 @@ actor MonitorOAuthCoordinator {
         return "AWS Builder ID • " + String(MonitorIdentity.fingerprint(clientID).prefix(8))
     }
 
-    private func postJSON(url: String, body: [String: Any]) async throws -> [String: Any] {
+    private func postJSON(url: String, body: [String: Any], session: URLSession = .shared) async throws -> [String: Any] {
         guard let endpoint = URL(string: url) else { throw MonitorOAuthError.invalidResponse }
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.addValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse,
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw MonitorOAuthError.invalidResponse
         }
         guard 200...299 ~= http.statusCode else {
-            throw MonitorOAuthError.provider(
-                (json["error"] as? String) ?? (json["errorCode"] as? String) ?? "http_\(http.statusCode)"
-            )
+            let nestedError = json["error"] as? [String: Any]
+            let rawCode = (json["error"] as? String) ?? (nestedError?["type"] as? String) ?? (json["errorCode"] as? String)
+            let safeCode = rawCode.flatMap { code -> String? in
+                guard code.count <= 80,
+                      code.range(of: "^[A-Za-z0-9_-]+$", options: .regularExpression) != nil else { return nil }
+                return code
+            }
+            throw MonitorOAuthError.provider(safeCode ?? "http_\(http.statusCode)")
         }
         return json
     }
@@ -565,6 +679,7 @@ nonisolated enum MonitorOAuthError: LocalizedError {
     case expired
     case stateMismatch
     case browserOpenFailed
+    case accountMismatch
     case provider(String)
 
     var errorDescription: String? {
@@ -574,6 +689,7 @@ nonisolated enum MonitorOAuthError: LocalizedError {
         case .expired: "The device authorization expired. Please try again."
         case .stateMismatch: "The OAuth callback state did not match the login request."
         case .browserOpenFailed: "Quotio could not open the OAuth page in your browser."
+        case .accountMismatch: "oauth.claude.accountMismatch".localizedStatic()
         case .provider(let code): "The OAuth provider returned \(code)."
         }
     }

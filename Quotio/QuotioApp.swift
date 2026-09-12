@@ -121,11 +121,14 @@ final class AppBootstrap {
                    accountQuotas: accountQuotas
                ) {
                 isForbidden = quotaData.isForbidden
-                if !quotaData.models.isEmpty {
-                    let models = quotaData.models.map { (name: $0.name, percentage: $0.percentage) }
-                    displayPercent = menuBarSettings.totalUsagePercent(models: models)
+                if !isForbidden {
+                    displayPercent = menuBarSettings.totalUsagePercent(for: quotaData)
                     if menuBarSettings.stackPairedQuotaMetrics {
-                        quotaPair = MenuBarQuotaPair.resolve(for: provider, from: quotaData.models)
+                        quotaPair = MenuBarQuotaPair.resolve(
+                            for: provider,
+                            from: quotaData.models,
+                            aggregationMode: menuBarSettings.modelAggregationMode
+                        )
                     }
                 }
             }
@@ -316,7 +319,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         UserDefaults.standard.register(defaults: [
             "showInDock": true,
             "totalUsageMode": TotalUsageMode.sessionOnly.rawValue,
-            "modelAggregationMode": ModelAggregationMode.lowest.rawValue
+            "modelAggregationMode": ModelAggregationMode.average.rawValue
         ])
 
         TelemetryService.shared.configureIfAllowed()

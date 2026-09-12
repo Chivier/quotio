@@ -832,37 +832,43 @@ struct RefreshCadenceSettingsSection: View {
 
 struct UpdateSettingsSection: View {
     @AppStorage("autoCheckUpdates") private var autoCheckUpdates = true
-    
+
     #if canImport(Sparkle)
-    private let updaterService = UpdaterService.shared
+        private let updaterService = UpdaterService.shared
     #endif
-    
+
     var body: some View {
         Section {
             #if canImport(Sparkle)
-            Toggle("settings.autoCheckUpdates".localized(), isOn: $autoCheckUpdates)
-                .onChange(of: autoCheckUpdates) { _, newValue in
-                    updaterService.automaticallyChecksForUpdates = newValue
-                }
-            
-            HStack {
-                Text("settings.lastChecked".localized())
-                Spacer()
-                if let date = updaterService.lastUpdateCheckDate {
-                    Text(date, style: .relative)
+                if AppIdentity.isDevelopmentBuild {
+                    Text("settings.updates.localBuild".localized())
                         .foregroundStyle(.secondary)
                 } else {
-                    Text("settings.never".localized())
-                        .foregroundStyle(.secondary)
+                    Toggle("settings.autoCheckUpdates".localized(), isOn: $autoCheckUpdates)
+                        .onChange(of: autoCheckUpdates) { _, newValue in
+                            updaterService.automaticallyChecksForUpdates = newValue
+                        }
+
+                    HStack {
+                        Text("settings.lastChecked".localized())
+                        Spacer()
+                        if let date = updaterService.lastUpdateCheckDate {
+                            Text(date, style: .relative)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Text("settings.never".localized())
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    Button("settings.checkNow".localized()) {
+                        updaterService.checkForUpdates()
+                    }
+                    .disabled(!updaterService.canCheckForUpdates)
                 }
-            }
-            
-            Button("settings.checkNow".localized()) {
-                updaterService.checkForUpdates()
-            }
-            .disabled(!updaterService.canCheckForUpdates)
             #else
-            Text("settings.version".localized() + ": " + (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"))
+                Text(
+                    "settings.version".localized() + ": " + (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"))
             #endif
         } header: {
             Label("settings.updates".localized(), systemImage: "arrow.down.circle")
@@ -2229,11 +2235,11 @@ struct VersionBadge: View {
 struct AboutUpdateCard: View {
     @AppStorage("autoCheckUpdates") private var autoCheckUpdates = true
     @State private var isHovered = false
-    
+
     #if canImport(Sparkle)
-    private let updaterService = UpdaterService.shared
+        private let updaterService = UpdaterService.shared
     #endif
-    
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             cardHeader(
@@ -2241,61 +2247,72 @@ struct AboutUpdateCard: View {
                 systemImage: "arrow.down.circle",
                 color: .blue
             )
-            
-            #if canImport(Sparkle)
-            HStack {
-                Text("settings.autoCheckUpdates".localized())
-                    .font(.subheadline)
-                Spacer()
-                Toggle("", isOn: $autoCheckUpdates)
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-                    .onChange(of: autoCheckUpdates) { _, newValue in
-                        updaterService.automaticallyChecksForUpdates = newValue
-                    }
-            }
-            
-            HStack {
-                Text("settings.updateChannel.receiveBeta".localized())
-                    .font(.subheadline)
-                Spacer()
-                Toggle("", isOn: Binding(
-                    get: { updaterService.updateChannel == .beta },
-                    set: { newValue in
-                        updaterService.updateChannel = newValue ? .beta : .stable
-                    }
-                ))
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-            }
-            
-            Divider()
 
-            HStack {
-                Text("settings.lastChecked".localized())
-                Spacer()
-                if let date = updaterService.lastUpdateCheckDate {
-                    Text(date, style: .relative)
+            #if canImport(Sparkle)
+                if AppIdentity.isDevelopmentBuild {
+                    Text("settings.updates.localBuild".localized())
+                        .font(.subheadline)
                         .foregroundStyle(.secondary)
                 } else {
-                    Text("settings.never".localized())
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .font(.caption)
-            .foregroundStyle(.secondary)
+                    HStack {
+                        Text("settings.autoCheckUpdates".localized())
+                            .font(.subheadline)
+                        Spacer()
+                        Toggle("", isOn: $autoCheckUpdates)
+                            .toggleStyle(.switch)
+                            .controlSize(.small)
+                            .onChange(of: autoCheckUpdates) { _, newValue in
+                                updaterService.automaticallyChecksForUpdates = newValue
+                            }
+                    }
 
-            HStack {
-                Spacer()
+                    HStack {
+                        Text("settings.updateChannel.receiveBeta".localized())
+                            .font(.subheadline)
+                        Spacer()
+                        Toggle(
+                            "",
+                            isOn: Binding(
+                                get: { updaterService.updateChannel == .beta },
+                                set: { newValue in
+                                    updaterService.updateChannel = newValue ? .beta : .stable
+                                }
+                            )
+                        )
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                    }
 
-                Button("settings.checkNow".localized()) {
-                    updaterService.checkForUpdates()
+                    Divider()
+
+                    HStack {
+                        Text("settings.lastChecked".localized())
+                        Spacer()
+                        if let date = updaterService.lastUpdateCheckDate {
+                            Text(date, style: .relative)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Text("settings.never".localized())
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                    HStack {
+                        Spacer()
+
+                        Button("settings.checkNow".localized()) {
+                            updaterService.checkForUpdates()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    }
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-            }
             #else
-            Text("settings.version".localized() + ": " + (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"))
+                Text(
+                    "settings.version".localized() + ": " + (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0")
+                )
                 .font(.caption)
             #endif
         }

@@ -48,7 +48,7 @@ final class UpdaterService: NSObject {
     
     /// Whether automatic update checks are enabled
     var automaticallyChecksForUpdates: Bool {
-        get { updater?.automaticallyChecksForUpdates ?? true }
+        get { updater?.automaticallyChecksForUpdates ?? !AppIdentity.isDevelopmentBuild }
         set { updater?.automaticallyChecksForUpdates = newValue }
     }
     
@@ -94,7 +94,9 @@ final class UpdaterService: NSObject {
     
     /// Initialize Sparkle updater on-demand (memory optimization)
     func initializeIfNeeded() {
-        guard !isInitialized else { return }
+        // A published release would replace local fixes and may use an older
+        // credential/storage contract. Only distribution builds may self-update.
+        guard !AppIdentity.isDevelopmentBuild, !isInitialized else { return }
         
         updaterController = SPUStandardUpdaterController(
             startingUpdater: true,

@@ -36,6 +36,17 @@ final class QuotaDisplayModeTests: XCTestCase {
         XCTAssertEqual(QuotaDisplayMode.remaining.displayValue(from: 0), 0)
     }
 
+    func testSummaryDisplayKeepsUnavailableDataDistinctFromExhaustedQuota() {
+        let helper = QuotaDisplayHelper(displayMode: .used)
+
+        XCTAssertEqual(helper.formattedPercent(remainingPercent: -1), "—")
+        XCTAssertEqual(helper.formattedPercent(remainingPercent: .nan), "—")
+        XCTAssertEqual(helper.formattedPercent(remainingPercent: .infinity), "—")
+        XCTAssertEqual(helper.formattedPercent(remainingPercent: 101), "—")
+        XCTAssertEqual(helper.formattedPercent(remainingPercent: 0), "100%")
+        XCTAssertEqual(helper.formattedPercent(remainingPercent: 100), "0%")
+    }
+
     // MARK: - Out-of-range values are clamped at the display boundary
 
     func testOverOneHundredRemainingIsClamped() {

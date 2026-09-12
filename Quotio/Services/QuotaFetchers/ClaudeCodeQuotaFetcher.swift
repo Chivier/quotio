@@ -12,14 +12,12 @@ import Foundation
 nonisolated enum ClaudeAPIResult: Sendable {
     case success(ClaudeCodeQuotaInfo)
     case authenticationError  // Token expired or invalid - needs re-authentication
+    case permissionError  // A 403 does not imply that the access token expired
     case otherError
 }
 
 /// Quota data from Claude Code OAuth API
 nonisolated struct ClaudeCodeQuotaInfo: Sendable {
-    let accessToken: String?
-    let email: String?
-
     /// Usage quotas from OAuth API
     let fiveHour: QuotaUsage?
     let sevenDay: QuotaUsage?
@@ -29,7 +27,7 @@ nonisolated struct ClaudeCodeQuotaInfo: Sendable {
 
     struct QuotaUsage: Sendable {
         let utilization: Double  // Percentage used (0-100)
-        let resetsAt: String     // ISO8601 date string
+        let resetsAt: String  // ISO8601 date string
 
         /// Remaining percentage (100 - utilization), clamped to 0-100
         var remaining: Double {
@@ -66,16 +64,57 @@ actor ClaudeCodeQuotaFetcher {
 
     /// URLSession for network requests
     private var session: URLSession
+    private let vault: MonitorCredentialStore
 
     /// Cache for quota data to reduce API calls
     private var quotaCache: [String: CachedQuota] = [:]
 
+    private enum CredentialSource: Sendable {
+        case owned(MonitorAccount)
+        case file(String)
+        case keychain(String)
+
+        var id: String {
+            switch self {
+            case .owned(let account): "owned:" + account.id
+            case .file(let path): "file:" + path
+            case .keychain(let account): "keychain:" + account
+            }
+        }
+    }
+
+    private struct CredentialSnapshot: Sendable {
+        var credential: MonitorOAuthCredential
+        let data: Data?
+
+        func hasSameTokens(as other: CredentialSnapshot) -> Bool {
+            credential.accessToken == other.credential.accessToken
+                && credential.refreshToken == other.credential.refreshToken
+        }
+    }
+
+    private struct PendingRefresh {
+        let original: CredentialSnapshot
+        let refreshed: CredentialSnapshot
+    }
+
+    private enum RefreshError: Error { case authenticationRequired }
+
+    // Actor reentrancy must not consume a rotating refresh token twice.
+    private var inFlight: [String: Task<ProviderQuotaData?, Never>] = [:]
+    // Retain a rotated token if its credential store is temporarily unwritable.
+    private var pendingRefreshes: [String: PendingRefresh] = [:]
+
     /// Cache TTL: 5 minutes
     private let cacheTTL: TimeInterval = 300
 
-    init() {
-        let config = ProxyConfigurationService.createProxiedConfigurationStatic(timeout: 15)
-        self.session = URLSession(configuration: config)
+    init(vault: MonitorCredentialStore = MonitorCredentialVault.shared, session: URLSession? = nil) {
+        self.vault = vault
+        self.session =
+            session
+            ?? URLSession(
+                configuration: ProxyConfigurationService.createProxiedConfigurationStatic(timeout: 15)
+            )
     }
 
     /// Update the URLSession with current proxy settings
@@ -89,14 +128,14 @@ actor ClaudeCodeQuotaFetcher {
         let timestamp: Date
 
         func isValid(ttl: TimeInterval) -> Bool {
-            Date().timeIntervalSince(timestamp) < ttl
+            !data.isForbidden && Date().timeIntervalSince(timestamp) < ttl
         }
     }
 
     /// Parse a quota usage object from JSON
     private func parseQuotaUsage(from json: [String: Any]?) -> ClaudeCodeQuotaInfo.QuotaUsage? {
         guard let json = json else { return nil }
-        
+
         // Handle both Int and Double for utilization
         let utilization: Double
         if let doubleVal = json["utilization"] as? Double {
@@ -106,26 +145,26 @@ actor ClaudeCodeQuotaFetcher {
         } else {
             return nil
         }
-        
+
         // resets_at can be null
         let resetsAt = json["resets_at"] as? String ?? ""
-        
+
         return ClaudeCodeQuotaInfo.QuotaUsage(utilization: utilization, resetsAt: resetsAt)
     }
-    
+
     /// Parse extra usage object from JSON
     private func parseExtraUsage(from json: [String: Any]?) -> ClaudeCodeQuotaInfo.ExtraUsage? {
         guard let json = json else { return nil }
-        
+
         let isEnabled = json["is_enabled"] as? Bool ?? false
-        
+
         // Only parse if enabled
         guard isEnabled else { return nil }
-        
+
         let monthlyLimit = json["monthly_limit"] as? Double
         let usedCredits = json["used_credits"] as? Double
         let utilization = json["utilization"] as? Double
-        
+
         return ClaudeCodeQuotaInfo.ExtraUsage(
             isEnabled: isEnabled,
             monthlyLimit: monthlyLimit,
@@ -134,20 +173,180 @@ actor ClaudeCodeQuotaFetcher {
         )
     }
 
-    /// Check if the access token is expired based on the auth file's "expired" field
-    private func isTokenExpired(json: [String: Any]) -> Bool {
-        guard let expiredStr = json["expired"] as? String else { return false }
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let expiryDate = formatter.date(from: expiredStr) {
-            return Date() > expiryDate.addingTimeInterval(-60) // 60s buffer
+    private func credentialSnapshot(data: Data) -> CredentialSnapshot? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        let oauth = json["claudeAiOauth"] as? [String: Any]
+        guard let accessToken = (oauth?["accessToken"] as? String) ?? (json["access_token"] as? String),
+            !accessToken.isEmpty
+        else { return nil }
+        let expiresAt: Date?
+        if let milliseconds = oauth?["expiresAt"] as? Double {
+            expiresAt = Date(timeIntervalSince1970: milliseconds / 1000)
+        } else if let expiry = json["expired"] as? String {
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            expiresAt = formatter.date(from: expiry) ?? ISO8601DateFormatter().date(from: expiry)
+        } else {
+            expiresAt = nil
         }
-        // Fallback without fractional seconds
-        let fallback = ISO8601DateFormatter()
-        if let expiryDate = fallback.date(from: expiredStr) {
-            return Date() > expiryDate.addingTimeInterval(-60)
+        return CredentialSnapshot(
+            credential: MonitorOAuthCredential(
+                accessToken: accessToken,
+                refreshToken: (oauth?["refreshToken"] as? String) ?? (json["refresh_token"] as? String),
+                expiresAt: expiresAt,
+                extra: [:]
+            ),
+            data: data
+        )
+    }
+
+    private func loadCredential(from source: CredentialSource) async -> CredentialSnapshot? {
+        switch source {
+        case .owned(let account):
+            guard let credential = await vault.reloadLatest(accountID: account.id) else { return nil }
+            return CredentialSnapshot(credential: credential, data: nil)
+        case .file(let path):
+            guard let data = FileManager.default.contents(atPath: path) else { return nil }
+            return credentialSnapshot(data: data)
+        case .keychain(let account):
+            guard let record = KeychainHelper.readExternalCredentialRecord(service: "Claude Code-credentials", account: account) else {
+                return nil
+            }
+            return credentialSnapshot(data: record.data)
         }
-        return false
+    }
+
+    private func persistRefresh(
+        _ refreshed: CredentialSnapshot,
+        replacing original: CredentialSnapshot,
+        source: CredentialSource
+    ) async -> Bool {
+        guard let latest = await loadCredential(from: source), latest.hasSameTokens(as: original) else { return false }
+        do {
+            switch source {
+            case .owned(let account):
+                try await vault.save(refreshed.credential, metadata: account)
+            case .file(let path):
+                guard let data = updatedAuthData(latest.data, credential: refreshed.credential) else { return false }
+                try SecureAtomicFileWriter.write(data, to: URL(fileURLWithPath: path))
+            case .keychain(let account):
+                guard let originalData = latest.data,
+                    let data = updatedAuthData(originalData, credential: refreshed.credential)
+                else { return false }
+                return KeychainHelper.compareAndSwapExternalCredential(
+                    service: "Claude Code-credentials", account: account,
+                    expectedData: originalData, newData: data
+                )
+            }
+            return true
+        } catch {
+            NSLog("[ClaudeQuota] Could not persist refreshed credential; retaining it for this session")
+            return false
+        }
+    }
+
+    private func latestCredential(from source: CredentialSource) async -> CredentialSnapshot? {
+        guard let latest = await loadCredential(from: source) else { return nil }
+        guard let pending = pendingRefreshes[source.id] else { return latest }
+        // A new login or another client's rotation always takes precedence.
+        guard latest.hasSameTokens(as: pending.original) else {
+            pendingRefreshes.removeValue(forKey: source.id)
+            return latest
+        }
+        if await persistRefresh(pending.refreshed, replacing: pending.original, source: source) {
+            pendingRefreshes.removeValue(forKey: source.id)
+        }
+        return pending.refreshed
+    }
+
+    private func renewCredential(_ original: CredentialSnapshot, source: CredentialSource) async throws -> CredentialSnapshot {
+        guard let refreshToken = original.credential.refreshToken, !refreshToken.isEmpty else {
+            throw RefreshError.authenticationRequired
+        }
+        do {
+            let tokens = try await refreshAccessToken(refreshToken: refreshToken)
+            var refreshed = original
+            refreshed.credential.accessToken = tokens.accessToken
+            refreshed.credential.refreshToken = tokens.refreshToken ?? refreshToken
+            refreshed.credential.expiresAt = tokens.expiresIn.map { Date().addingTimeInterval(TimeInterval($0)) }
+            // If a previous write failed, storage still holds the earlier generation.
+            let stored = pendingRefreshes[source.id]?.original ?? original
+            pendingRefreshes[source.id] = PendingRefresh(original: stored, refreshed: refreshed)
+            if await persistRefresh(refreshed, replacing: stored, source: source) {
+                pendingRefreshes.removeValue(forKey: source.id)
+                return refreshed
+            }
+            return await latestCredential(from: source) ?? refreshed
+        } catch {
+            if let latest = await latestCredential(from: source), !latest.hasSameTokens(as: original) {
+                return latest
+            }
+            throw error
+        }
+    }
+
+    private func fetchQuota(source: CredentialSource, email: String, forceRefresh: Bool) async -> ProviderQuotaData? {
+        if let task = inFlight[source.id] { return await task.value }
+        let task = Task { await self.fetchCredentialQuota(source: source, email: email, forceRefresh: forceRefresh) }
+        inFlight[source.id] = task
+        defer { inFlight.removeValue(forKey: source.id) }
+        return await task.value
+    }
+
+    private func fetchCredentialQuota(source: CredentialSource, email: String, forceRefresh: Bool) async -> ProviderQuotaData? {
+        guard var snapshot = await latestCredential(from: source) else { return nil }
+        if !forceRefresh, let cached = quotaCache[email], cached.isValid(ttl: cacheTTL) { return cached.data }
+
+        var didRefresh = false
+        if snapshot.credential.expiresAt.map({ $0.timeIntervalSinceNow < 60 }) == true,
+            snapshot.credential.refreshToken?.isEmpty == false
+        {
+            didRefresh = true
+            do {
+                snapshot = try await renewCredential(snapshot, source: source)
+            } catch {
+                // A failed proactive refresh does not invalidate a still-usable access token.
+                let response = await fetchUsageFromAPI(accessToken: snapshot.credential.accessToken)
+                if case .authenticationError = response {
+                    return quotaResult(error is RefreshError ? .authenticationError : .otherError, email: email)
+                }
+                return quotaResult(response, email: email)
+            }
+        }
+
+        var response = await fetchUsageFromAPI(accessToken: snapshot.credential.accessToken)
+        if case .authenticationError = response {
+            if let latest = await latestCredential(from: source), !latest.hasSameTokens(as: snapshot) {
+                snapshot = latest
+                response = await fetchUsageFromAPI(accessToken: snapshot.credential.accessToken)
+            }
+            if case .authenticationError = response, !didRefresh {
+                do {
+                    snapshot = try await renewCredential(snapshot, source: source)
+                    response = await fetchUsageFromAPI(accessToken: snapshot.credential.accessToken)
+                } catch {
+                    response = error is RefreshError ? .authenticationError : .otherError
+                }
+            }
+        }
+        return quotaResult(response, email: email)
+    }
+
+    private func quotaResult(_ result: ClaudeAPIResult, email: String) -> ProviderQuotaData? {
+        switch result {
+        case .success(let info):
+            guard let quota = quotaData(from: info) else { return quotaCache[email]?.data }
+            quotaCache[email] = CachedQuota(data: quota, timestamp: quota.lastUpdated)
+            return quota
+        case .authenticationError, .permissionError:
+            var quota = quotaCache[email]?.data ?? ProviderQuotaData(models: [], lastUpdated: Date())
+            quota.isForbidden = true
+            // Keep the last successful values and timestamp, but never TTL-cache an auth failure.
+            quotaCache[email] = CachedQuota(data: quota, timestamp: quota.lastUpdated)
+            return quota
+        case .otherError:
+            return quotaCache[email]?.data
+        }
     }
 
     /// Refresh an expired access token using the refresh token
@@ -161,25 +360,32 @@ actor ClaudeCodeQuotaFetcher {
         request.httpMethod = "POST"
         request.addValue("application/json", forHTTPHeaderField: "Content-Type")
 
+        // Omitting scope retains the original grant; newer CLI scopes may not
+        // have been authorized by older logins (RFC 6749 section 6).
         let params: [String: Any] = [
             "grant_type": "refresh_token",
             "refresh_token": refreshToken,
             "client_id": clientId,
-            "scope": "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload",
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: params)
 
         let (data, response) = try await session.data(for: request)
 
-        guard let httpResponse = response as? HTTPURLResponse,
-              200...299 ~= httpResponse.statusCode else {
-            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-            NSLog("[ClaudeQuota] Token refresh failed with HTTP \(statusCode)")
-            throw URLError(.userAuthenticationRequired)
+        guard let httpResponse = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        guard 200...299 ~= httpResponse.statusCode else {
+            NSLog("[ClaudeQuota] Token refresh failed with HTTP \(httpResponse.statusCode)")
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            if httpResponse.statusCode == 401
+                || (httpResponse.statusCode == 400 && json?["error"] as? String == "invalid_grant")
+            {
+                throw RefreshError.authenticationRequired
+            }
+            throw URLError(.badServerResponse)
         }
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let newAccessToken = json["access_token"] as? String else {
+            let newAccessToken = json["access_token"] as? String, !newAccessToken.isEmpty
+        else {
             throw URLError(.cannotParseResponse)
         }
 
@@ -189,61 +395,27 @@ actor ClaudeCodeQuotaFetcher {
         return (newAccessToken, newRefreshToken, expiresIn)
     }
 
-    /// Update the auth file on disk with refreshed token data
-    private func updateAuthFile(
-        at path: String,
-        expectedRefreshToken: String?,
-        accessToken: String,
-        refreshToken: String?,
-        expiresIn: Int?
-    ) {
-        guard let latestData = FileManager.default.contents(atPath: path),
-              let latestJSON = try? JSONSerialization.jsonObject(with: latestData) as? [String: Any] else { return }
-        let latestOAuth = latestJSON["claudeAiOauth"] as? [String: Any]
-        let latestRefresh = latestJSON["refresh_token"] as? String ?? latestOAuth?["refreshToken"] as? String
-        guard latestRefresh == expectedRefreshToken else { return }
-        let updatedJSON = updatedAuthJSON(
-            latestJSON,
-            accessToken: accessToken,
-            refreshToken: refreshToken,
-            expiresIn: expiresIn
-        )
-        if let data = try? JSONSerialization.data(withJSONObject: updatedJSON, options: [.prettyPrinted, .sortedKeys]) {
-            try? SecureAtomicFileWriter.write(data, to: URL(fileURLWithPath: path))
-        }
-    }
-
-    private func updatedAuthJSON(
-        _ json: [String: Any],
-        accessToken: String,
-        refreshToken: String?,
-        expiresIn: Int?
-    ) -> [String: Any] {
-        var updatedJSON = json
-        let now = Date()
-        let formatter = ISO8601DateFormatter()
-        if var oauth = updatedJSON["claudeAiOauth"] as? [String: Any] {
-            oauth["accessToken"] = accessToken
-            if let refreshToken { oauth["refreshToken"] = refreshToken }
-            if let expiresIn {
-                oauth["expiresAt"] = Int(now.addingTimeInterval(TimeInterval(expiresIn)).timeIntervalSince1970 * 1000)
-            }
-            updatedJSON["claudeAiOauth"] = oauth
+    private func updatedAuthData(_ data: Data?, credential: MonitorOAuthCredential) -> Data? {
+        guard let data,
+            var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        if var oauth = json["claudeAiOauth"] as? [String: Any] {
+            oauth["accessToken"] = credential.accessToken
+            oauth["refreshToken"] = credential.refreshToken
+            oauth["expiresAt"] = credential.expiresAt.map { Int($0.timeIntervalSince1970 * 1000) }
+            json["claudeAiOauth"] = oauth
         } else {
-            updatedJSON["access_token"] = accessToken
-            if let refreshToken { updatedJSON["refresh_token"] = refreshToken }
-            updatedJSON["last_refresh"] = formatter.string(from: now)
-            if let expiresIn {
-                updatedJSON["expired"] = formatter.string(from: now.addingTimeInterval(TimeInterval(expiresIn)))
-            }
+            json["access_token"] = credential.accessToken
+            json["refresh_token"] = credential.refreshToken
+            json["expired"] = credential.expiresAt?.ISO8601Format()
+            json["last_refresh"] = Date().ISO8601Format()
         }
-
-        return updatedJSON
+        return try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
     }
 
     /// Fetch usage data from Anthropic OAuth API
     /// - Returns: ClaudeAPIResult indicating success, auth error, or other error
-    private func fetchUsageFromAPI(accessToken: String, email: String?) async -> ClaudeAPIResult {
+    private func fetchUsageFromAPI(accessToken: String) async -> ClaudeAPIResult {
         guard let url = URL(string: usageURL) else {
             return .otherError
         }
@@ -259,17 +431,12 @@ actor ClaudeCodeQuotaFetcher {
         do {
             let (data, response) = try await session.data(for: request)
 
-            // Check HTTP status code
-            if let httpResponse = response as? HTTPURLResponse {
-                // 401 Unauthorized indicates authentication error
-                if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
-                    return .authenticationError
-                }
-                // Other non-2xx status codes
-                if !(200...299 ~= httpResponse.statusCode) {
-                    NSLog("[ClaudeQuota] HTTP error: \(httpResponse.statusCode)")
-                    return .otherError
-                }
+            guard let httpResponse = response as? HTTPURLResponse else { return .otherError }
+            if httpResponse.statusCode == 401 { return .authenticationError }
+            if httpResponse.statusCode == 403 { return .permissionError }
+            guard 200...299 ~= httpResponse.statusCode else {
+                NSLog("[ClaudeQuota] HTTP error: \(httpResponse.statusCode)")
+                return .otherError
             }
 
             guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -281,13 +448,14 @@ actor ClaudeCodeQuotaFetcher {
             if json["type"] as? String == "error" {
                 // Check if it's an authentication error
                 if let errorObj = json["error"] as? [String: Any],
-                   let errorType = errorObj["type"] as? String,
-                   errorType == "authentication_error" {
+                    let errorType = errorObj["type"] as? String,
+                    errorType == "authentication_error"
+                {
                     // Token expired or invalid
-                    NSLog("[ClaudeQuota] Authentication error for \(email ?? "unknown")")
+                    NSLog("[ClaudeQuota] Usage authentication failed")
                     return .authenticationError
                 }
-                NSLog("[ClaudeQuota] API error: \(json)")
+                NSLog("[ClaudeQuota] Usage API returned an error")
                 return .otherError
             }
 
@@ -298,15 +466,14 @@ actor ClaudeCodeQuotaFetcher {
             let sevenDayOpus = parseQuotaUsage(from: json["seven_day_opus"] as? [String: Any])
             let extraUsage = parseExtraUsage(from: json["extra_usage"] as? [String: Any])
 
-            return .success(ClaudeCodeQuotaInfo(
-                accessToken: accessToken,
-                email: email,
-                fiveHour: fiveHour,
-                sevenDay: sevenDay,
-                sevenDaySonnet: sevenDaySonnet,
-                sevenDayOpus: sevenDayOpus,
-                extraUsage: extraUsage
-            ))
+            return .success(
+                ClaudeCodeQuotaInfo(
+                    fiveHour: fiveHour,
+                    sevenDay: sevenDay,
+                    sevenDaySonnet: sevenDaySonnet,
+                    sevenDayOpus: sevenDayOpus,
+                    extraUsage: extraUsage
+                ))
         } catch {
             NSLog("[ClaudeQuota] Network error: \(error.localizedDescription)")
             return .otherError
@@ -321,50 +488,62 @@ actor ClaudeCodeQuotaFetcher {
     ) async -> [String: ProviderQuotaData] {
         let expandedPath = NSString(string: authDir).expandingTildeInPath
         let fileManager = FileManager.default
-        let legacyFiles = (try? fileManager.contentsOfDirectory(atPath: expandedPath))?
+        let legacyFiles =
+            (try? fileManager.contentsOfDirectory(atPath: expandedPath))?
             .filter { $0.hasPrefix("claude-") && $0.hasSuffix(".json") }
             .map { (expandedPath as NSString).appendingPathComponent($0) } ?? []
         let claudeHome = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"]?.trimmingCharacters(in: .whitespacesAndNewlines)
         let nativeBase = (claudeHome?.isEmpty == false ? claudeHome! : NSString(string: "~/.claude").expandingTildeInPath)
         let nativePath = (nativeBase as NSString).appendingPathComponent(".credentials.json")
         let nativePaths = fileManager.fileExists(atPath: nativePath) ? [nativePath] : []
-        var results = includeMonitorCredentials
-            ? await fetchOwnedQuotas(forceRefresh: forceRefresh)
-            : [:]
-        for (key, quota) in await fetchNativeKeychainQuotas(forceRefresh: forceRefresh) where results[key] == nil {
-            results[key] = quota
+        var results: [String: ProviderQuotaData] = [:]
+        var selectedKeys: Set<String> = []
+        if includeMonitorCredentials {
+            for account in await vault.accounts() where account.provider == .claude && !account.isDisabled {
+                selectedKeys.insert(account.accountKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+                results[account.accountKey] = await fetchOwnedQuota(account: account, forceRefresh: forceRefresh)
+            }
+        }
+        if let key = nativeKeychainIdentity(),
+            selectedKeys.insert(key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()).inserted
+        {
+            results.merge(await fetchNativeKeychainQuotas(forceRefresh: forceRefresh)) { existing, _ in existing }
         }
         for filePath in nativePaths {
-            guard let quota = await fetchQuotaFromAuthFile(at: filePath, forceRefresh: forceRefresh),
-                  results[quota.email] == nil else { continue }
+            guard let key = authFileIdentity(at: filePath),
+                selectedKeys.insert(key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()).inserted,
+                let quota = await fetchQuotaFromAuthFile(at: filePath, forceRefresh: forceRefresh)
+            else { continue }
             results[quota.email] = quota.data
         }
 
-        if let desktop = await fetchClaudeDesktopQuota(forceRefresh: forceRefresh),
-           results[desktop.key] == nil {
+        if selectedKeys.insert("claude desktop").inserted,
+            let desktop = await fetchClaudeDesktopQuota(forceRefresh: forceRefresh)
+        {
             results[desktop.key] = desktop.value
         }
 
         for filePath in legacyFiles {
-            guard let quota = await fetchQuotaFromAuthFile(at: filePath, forceRefresh: forceRefresh),
-                  results[quota.email] == nil else { continue }
+            guard let key = authFileIdentity(at: filePath),
+                selectedKeys.insert(key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()).inserted,
+                let quota = await fetchQuotaFromAuthFile(at: filePath, forceRefresh: forceRefresh)
+            else { continue }
             results[quota.email] = quota.data
         }
-        
+
         return results
     }
 
     /// Fetch quota for exactly one canonical Claude account.
-    func fetchQuota(accountKey: String, forceRefresh: Bool = false) async -> ProviderQuotaData? {
-        if let account = await MonitorCredentialVault.shared.accounts().first(where: {
+    func fetchQuota(accountKey: String, forceRefresh: Bool = false, allowUserInteraction: Bool = false) async -> ProviderQuotaData? {
+        if let account = await vault.accounts().first(where: {
             $0.provider == .claude && !$0.isDisabled && $0.accountKey == accountKey
-        }), let quota = await fetchOwnedQuota(account: account, forceRefresh: forceRefresh) {
-            return quota
+        }) {
+            return await fetchOwnedQuota(account: account, forceRefresh: forceRefresh, allowUserInteraction: allowUserInteraction)
         }
 
-        if nativeKeychainIdentity() == accountKey,
-           let quota = await fetchNativeKeychainQuotas(forceRefresh: forceRefresh)[accountKey] {
-            return quota
+        if nativeKeychainIdentity() == accountKey {
+            return await fetchNativeKeychainQuotas(forceRefresh: forceRefresh)[accountKey]
         }
 
         let fileManager = FileManager.default
@@ -380,7 +559,8 @@ actor ClaudeCodeQuotaFetcher {
         }
 
         let expandedPath = NSString(string: authDir).expandingTildeInPath
-        let legacyFiles = (try? fileManager.contentsOfDirectory(atPath: expandedPath))?
+        let legacyFiles =
+            (try? fileManager.contentsOfDirectory(atPath: expandedPath))?
             .filter { $0.hasPrefix("claude-") && $0.hasSuffix(".json") } ?? []
         for filename in legacyFiles {
             let path = (expandedPath as NSString).appendingPathComponent(filename)
@@ -392,7 +572,8 @@ actor ClaudeCodeQuotaFetcher {
 
     private func authFileIdentity(at path: String) -> String? {
         guard let data = FileManager.default.contents(atPath: path),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
         let oauth = json["claudeAiOauth"] as? [String: Any]
         guard json["access_token"] as? String != nil || oauth?["accessToken"] as? String != nil else { return nil }
         return json["email"] as? String ?? oauth?["email"] as? String ?? "Claude Code"
@@ -400,9 +581,10 @@ actor ClaudeCodeQuotaFetcher {
 
     private func nativeKeychainIdentity() -> String? {
         guard let record = KeychainHelper.readExternalCredentialRecord(service: "Claude Code-credentials"),
-              let json = try? JSONSerialization.jsonObject(with: record.data) as? [String: Any],
-              let oauth = json["claudeAiOauth"] as? [String: Any],
-              oauth["accessToken"] as? String != nil else { return nil }
+            let json = try? JSONSerialization.jsonObject(with: record.data) as? [String: Any],
+            let oauth = json["claudeAiOauth"] as? [String: Any],
+            oauth["accessToken"] as? String != nil
+        else { return nil }
         return oauth["email"] as? String ?? "Claude Code"
     }
 
@@ -412,131 +594,26 @@ actor ClaudeCodeQuotaFetcher {
             return (key, cached.data)
         }
         guard let credential = ClaudeDesktopCredentialReader.load() else { return nil }
-        let response = await fetchUsageFromAPI(accessToken: credential.accessToken, email: key)
-        guard case .success(let info) = response, let quota = quotaData(from: info) else { return nil }
-        quotaCache[key] = CachedQuota(data: quota, timestamp: Date())
+        let response = await fetchUsageFromAPI(accessToken: credential.accessToken)
+        guard let quota = quotaResult(response, email: key) else { return nil }
         return (key, quota)
     }
 
     private func fetchNativeKeychainQuotas(forceRefresh: Bool) async -> [String: ProviderQuotaData] {
         guard let record = KeychainHelper.readExternalCredentialRecord(service: "Claude Code-credentials"),
-              let json = try? JSONSerialization.jsonObject(with: record.data) as? [String: Any],
-              let oauth = json["claudeAiOauth"] as? [String: Any],
-              var accessToken = oauth["accessToken"] as? String else { return [:] }
+            let json = try? JSONSerialization.jsonObject(with: record.data) as? [String: Any],
+            let oauth = json["claudeAiOauth"] as? [String: Any]
+        else { return [:] }
         let email = oauth["email"] as? String ?? "Claude Code"
-        if !forceRefresh, let cached = quotaCache[email], cached.isValid(ttl: cacheTTL) {
-            return [email: cached.data]
-        }
-        let refreshToken = oauth["refreshToken"] as? String
-        do {
-            if isTokenExpired(json: normalizedExpiryJSON(json)), let refreshToken {
-                let refreshed = try await refreshAccessToken(refreshToken: refreshToken)
-                accessToken = refreshed.accessToken
-                persistClaudeKeychainRefresh(
-                    record: record,
-                    json: json,
-                    accessToken: refreshed.accessToken,
-                    expectedRefreshToken: refreshToken,
-                    newRefreshToken: refreshed.refreshToken ?? refreshToken,
-                    expiresIn: refreshed.expiresIn
-                )
-            }
-            var response = await fetchUsageFromAPI(accessToken: accessToken, email: email)
-            if case .authenticationError = response,
-               let latest = KeychainHelper.readExternalCredentialRecord(service: "Claude Code-credentials", account: record.account),
-               let latestJSON = try? JSONSerialization.jsonObject(with: latest.data) as? [String: Any],
-               let latestOAuth = latestJSON["claudeAiOauth"] as? [String: Any],
-               let latestRefreshToken = latestOAuth["refreshToken"] as? String {
-                let refreshed = try await refreshAccessToken(refreshToken: latestRefreshToken)
-                accessToken = refreshed.accessToken
-                persistClaudeKeychainRefresh(
-                    record: latest,
-                    json: latestJSON,
-                    accessToken: refreshed.accessToken,
-                    expectedRefreshToken: latestRefreshToken,
-                    newRefreshToken: refreshed.refreshToken ?? latestRefreshToken,
-                    expiresIn: refreshed.expiresIn
-                )
-                response = await fetchUsageFromAPI(accessToken: accessToken, email: email)
-            }
-            guard case .success(let info) = response, let quota = quotaData(from: info) else { return [:] }
-            quotaCache[email] = CachedQuota(data: quota, timestamp: Date())
-            return [email: quota]
-        } catch {
-            return quotaCache[email].map { [email: $0.data] } ?? [:]
-        }
+        guard let quota = await fetchQuota(source: .keychain(record.account), email: email, forceRefresh: forceRefresh) else { return [:] }
+        return [email: quota]
     }
 
-    private func persistClaudeKeychainRefresh(
-        record: (data: Data, account: String),
-        json: [String: Any],
-        accessToken: String,
-        expectedRefreshToken: String,
-        newRefreshToken: String,
-        expiresIn: Int?
-    ) {
-        guard let oauth = json["claudeAiOauth"] as? [String: Any],
-              oauth["refreshToken"] as? String == expectedRefreshToken else { return }
-        let updated = updatedAuthJSON(
-            json,
-            accessToken: accessToken,
-            refreshToken: newRefreshToken,
-            expiresIn: expiresIn
-        )
-        guard let data = try? JSONSerialization.data(withJSONObject: updated, options: [.prettyPrinted, .sortedKeys]) else { return }
-        _ = KeychainHelper.compareAndSwapExternalCredential(
-            service: "Claude Code-credentials",
-            account: record.account,
-            expectedData: record.data,
-            newData: data
-        )
-    }
-
-    private func fetchOwnedQuotas(forceRefresh: Bool) async -> [String: ProviderQuotaData] {
-        var results: [String: ProviderQuotaData] = [:]
-        for account in await MonitorCredentialVault.shared.accounts().filter({ $0.provider == .claude && !$0.isDisabled }) {
-            if let data = await fetchOwnedQuota(account: account, forceRefresh: forceRefresh) {
-                results[account.accountKey] = data
-            }
+    func fetchOwnedQuota(account: MonitorAccount, forceRefresh: Bool, allowUserInteraction: Bool = false) async -> ProviderQuotaData? {
+        if allowUserInteraction, await vault.credential(for: account.id) == nil {
+            guard await vault.credentialForUserInitiatedAccess(for: account.id) != nil else { return nil }
         }
-        return results
-    }
-
-    private func fetchOwnedQuota(account: MonitorAccount, forceRefresh: Bool) async -> ProviderQuotaData? {
-            guard var credential = await MonitorCredentialVault.shared.credential(for: account.id) else { return nil }
-            if !forceRefresh, let cached = quotaCache[account.accountKey], cached.isValid(ttl: cacheTTL) {
-                return cached.data
-            }
-            do {
-                if credential.expiresAt.map({ $0.timeIntervalSinceNow < 300 }) ?? false,
-                   let refreshToken = credential.refreshToken {
-                    let refreshed = try await refreshAccessToken(refreshToken: refreshToken)
-                    credential.accessToken = refreshed.accessToken
-                    credential.refreshToken = refreshed.refreshToken ?? refreshToken
-                    credential.expiresAt = refreshed.expiresIn.map { Date().addingTimeInterval(TimeInterval($0)) }
-                    try await MonitorCredentialVault.shared.save(credential, metadata: account)
-                }
-                var response = await fetchUsageFromAPI(accessToken: credential.accessToken, email: account.accountKey)
-                if case .authenticationError = response {
-                    if let latest = await MonitorCredentialVault.shared.reloadLatest(accountID: account.id) {
-                        credential = latest
-                    }
-                    guard let refreshToken = credential.refreshToken else { return nil }
-                    let refreshed = try await refreshAccessToken(refreshToken: refreshToken)
-                    credential.accessToken = refreshed.accessToken
-                    credential.refreshToken = refreshed.refreshToken ?? refreshToken
-                    credential.expiresAt = refreshed.expiresIn.map { Date().addingTimeInterval(TimeInterval($0)) }
-                    try await MonitorCredentialVault.shared.save(credential, metadata: account)
-                    response = await fetchUsageFromAPI(accessToken: credential.accessToken, email: account.accountKey)
-                }
-                if case .success(let info) = response, let data = quotaData(from: info) {
-                    quotaCache[account.accountKey] = CachedQuota(data: data, timestamp: Date())
-                    return data
-                }
-            } catch {
-                return quotaCache[account.accountKey]?.data
-            }
-        return nil
+        return await fetchQuota(source: .owned(account), email: account.accountKey, forceRefresh: forceRefresh)
     }
 
     private func quotaData(from info: ClaudeCodeQuotaInfo) -> ProviderQuotaData? {
@@ -564,112 +641,26 @@ actor ClaudeCodeQuotaFetcher {
         guard !models.isEmpty else { return nil }
         return ProviderQuotaData(models: models, lastUpdated: Date(), isForbidden: false, planType: nil)
     }
-    
+
     /// Fetch quota from a single auth file
     /// - Parameters:
     ///   - path: Path to the auth file
     ///   - forceRefresh: If true, bypass cache
-    private func fetchQuotaFromAuthFile(at path: String, forceRefresh: Bool = false) async -> (email: String, data: ProviderQuotaData)? {
-        let fileManager = FileManager.default
-
-        guard let data = fileManager.contents(atPath: path),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
-        }
-
-        let nestedOAuth = json["claudeAiOauth"] as? [String: Any]
-        guard var accessToken = (json["access_token"] as? String) ?? (nestedOAuth?["accessToken"] as? String) else {
-            return nil
-        }
-        let email = (json["email"] as? String) ?? (nestedOAuth?["email"] as? String) ?? "Claude Code"
-
-        // Check cache first (unless force refresh)
-        if !forceRefresh, let cached = quotaCache[email], cached.isValid(ttl: cacheTTL) {
-            return (email, cached.data)
-        }
-
-        // Refresh expired token before fetching usage
-        let refreshToken = (json["refresh_token"] as? String) ?? (nestedOAuth?["refreshToken"] as? String)
-        if isTokenExpired(json: normalizedExpiryJSON(json)), let refreshToken {
-            do {
-                let refreshed = try await refreshAccessToken(refreshToken: refreshToken)
-                accessToken = refreshed.accessToken
-                updateAuthFile(at: path, expectedRefreshToken: refreshToken, accessToken: refreshed.accessToken, refreshToken: refreshed.refreshToken ?? refreshToken, expiresIn: refreshed.expiresIn)
-                NSLog("[ClaudeQuota] Token refreshed for \(email)")
-            } catch {
-                NSLog("[ClaudeQuota] Token refresh failed for \(email): \(error.localizedDescription)")
-                // Fall through with expired token; API call will return authenticationError
-            }
-        }
-
-        // Fetch usage from API using the token
-        var result = await fetchUsageFromAPI(accessToken: accessToken, email: email)
-        if case .authenticationError = result {
-            do {
-                guard let latestData = fileManager.contents(atPath: path),
-                      let latestJSON = try? JSONSerialization.jsonObject(with: latestData) as? [String: Any] else {
-                    return (email, ProviderQuotaData(models: [], lastUpdated: Date(), isForbidden: true))
-                }
-                let latestOAuth = latestJSON["claudeAiOauth"] as? [String: Any]
-                guard let latestRefreshToken = (latestJSON["refresh_token"] as? String) ?? (latestOAuth?["refreshToken"] as? String) else {
-                    return (email, ProviderQuotaData(models: [], lastUpdated: Date(), isForbidden: true))
-                }
-                let refreshed = try await refreshAccessToken(refreshToken: latestRefreshToken)
-                accessToken = refreshed.accessToken
-                updateAuthFile(at: path, expectedRefreshToken: latestRefreshToken, accessToken: refreshed.accessToken, refreshToken: refreshed.refreshToken ?? latestRefreshToken, expiresIn: refreshed.expiresIn)
-                result = await fetchUsageFromAPI(accessToken: accessToken, email: email)
-            } catch {
-                // The authentication result below is kept so the UI can ask for a new login.
-            }
-        }
-
-        switch result {
-        case .success(let info):
-            guard let quotaData = quotaData(from: info) else { return nil }
-
-            // Update cache
-            quotaCache[email] = CachedQuota(data: quotaData, timestamp: Date())
-
-            return (email, quotaData)
-
-        case .authenticationError:
-            // Token expired and refresh failed - return isForbidden to trigger re-authentication UI
-            let quotaData = ProviderQuotaData(
-                models: [],
-                lastUpdated: Date(),
-                isForbidden: true,  // Indicates re-authentication needed
-                planType: nil
-            )
-            // Don't cache auth errors - allow retry
-            return (email, quotaData)
-
-        case .otherError:
-            // Return cached data if API fails with non-auth error
-            if let cached = quotaCache[email] {
-                return (email, cached.data)
-            }
-            return nil
-        }
+    func fetchQuotaFromAuthFile(at path: String, forceRefresh: Bool = false) async -> (email: String, data: ProviderQuotaData)? {
+        guard let email = authFileIdentity(at: path),
+            let quota = await fetchQuota(source: .file(path), email: email, forceRefresh: forceRefresh)
+        else { return nil }
+        return (email, quota)
     }
-    
+
     /// Clear the quota cache
     func clearCache() {
         quotaCache.removeAll()
     }
-    
+
     /// Clear cache for a specific email
     func clearCache(for email: String) {
         quotaCache.removeValue(forKey: email)
     }
 
-    private func normalizedExpiryJSON(_ json: [String: Any]) -> [String: Any] {
-        guard let oauth = json["claudeAiOauth"] as? [String: Any] else { return json }
-        var normalized = json
-        if let expiresAt = oauth["expiresAt"] as? Double {
-            normalized["expired"] = Date(timeIntervalSince1970: expiresAt / 1000).ISO8601Format()
-        } else if let expiresAt = oauth["expiresAt"] as? NSNumber {
-            normalized["expired"] = Date(timeIntervalSince1970: expiresAt.doubleValue / 1000).ISO8601Format()
-        }
-        return normalized
-    }
 }

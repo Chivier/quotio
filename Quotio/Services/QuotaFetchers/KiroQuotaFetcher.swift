@@ -165,9 +165,9 @@ actor KiroQuotaFetcher {
 
         for authFile in kiroFiles {
             guard let tokenData = await authService.readAuthToken(from: authFile) else { continue }
-            let key = authFile.email
-                ?? tokenData.extras?["profileArn"]
-                ?? authFile.filename.replacingOccurrences(of: ".json", with: "")
+            let key = KiroAccountIdentity.canonicalKey(
+                email: authFile.email, profileARN: tokenData.extras?["profileArn"], filename: authFile.filename
+            )
             guard results[key] == nil,
                   let quota = await fetchQuota(tokenData: tokenData, filePath: authFile.filePath) else { continue }
             results[key] = quota
@@ -177,6 +177,8 @@ actor KiroQuotaFetcher {
 
     /// Fetch quota for exactly one canonical Kiro account.
     func fetchQuota(accountKey: String) async -> ProviderQuotaData? {
+        let id = MonitorAccount.make(provider: .kiro, accountKey: accountKey, source: .nativeCredential).id
+        guard !Task.isCancelled, await !MonitorMetadataStore.shared.isExcluded(id) else { return nil }
         if let account = await MonitorCredentialVault.shared.accounts().first(where: {
             $0.provider == .kiro && !$0.isDisabled && $0.accountKey == accountKey
         }) {
@@ -186,9 +188,9 @@ actor KiroQuotaFetcher {
         let authService = DirectAuthFileService()
         for authFile in await kiroAuthFiles(using: authService) {
             guard let tokenData = await authService.readAuthToken(from: authFile) else { continue }
-            let key = authFile.email
-                ?? tokenData.extras?["profileArn"]
-                ?? authFile.filename.replacingOccurrences(of: ".json", with: "")
+            let key = KiroAccountIdentity.canonicalKey(
+                email: authFile.email, profileARN: tokenData.extras?["profileArn"], filename: authFile.filename
+            )
             guard key == accountKey else { continue }
             return await fetchQuota(tokenData: tokenData, filePath: authFile.filePath)
         }
@@ -204,9 +206,10 @@ actor KiroQuotaFetcher {
     }
 
     private func fetchOwnedQuota(account: MonitorAccount) async -> ProviderQuotaData? {
+            guard !Task.isCancelled, await !MonitorMetadataStore.shared.isExcluded(account.id) else { return nil }
             guard var credential = await MonitorCredentialVault.shared.credential(for: account.id) else { return nil }
             if credential.expiresAt.map({ $0.timeIntervalSinceNow < 300 }) ?? false {
-                guard await refreshOwnedCredential(&credential, account: account) else { return nil }
+                _ = await refreshOwnedCredential(&credential, account: account)
             }
             var tokenData = ownedTokenData(credential)
             let region = credential.extra["region"] ?? defaultRegion
@@ -303,6 +306,8 @@ actor KiroQuotaFetcher {
                 continue
             }
 
+            guard !Task.isCancelled,
+                  await !MonitorMetadataStore.shared.isExcluded(MonitorAccount.makeLegacy(authFile).id) else { continue }
             let (needsRefresh, _) = shouldRefreshToken(tokenData)
             if needsRefresh {
                 if let _ = await refreshTokenWithExpiry(tokenData: tokenData, filePath: authFile.filePath) {
@@ -316,33 +321,17 @@ actor KiroQuotaFetcher {
 
     private func kiroAuthFiles(using authService: DirectAuthFileService) async -> [DirectAuthFile] {
         var files = await authService.scanAllAuthFiles().filter { $0.provider == .kiro }
-        guard fileManager.fileExists(atPath: kiroIDEAuthPath),
-              !files.contains(where: { $0.filePath == kiroIDEAuthPath }) else {
-            return files
+        if !files.contains(where: { $0.filePath == kiroIDEAuthPath }),
+           let native = MonitorAccountDiscovery.kiroAuthFile(at: kiroIDEAuthPath) {
+            files.insert(native, at: 0)
         }
-
-        var email: String?
-        var expiry: Date?
-        if let data = fileManager.contents(atPath: kiroIDEAuthPath),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            email = json["email"] as? String
-            let rawExpiry = json["expiresAt"] as? String
-                ?? json["expires_at"] as? String
-                ?? json["expiry"] as? String
-            expiry = parseExpiryDate(rawExpiry)
+        var visible: [DirectAuthFile] = []
+        for file in files {
+            guard !Task.isCancelled else { break }
+            let id = MonitorAccount.makeLegacy(file).id
+            if await !MonitorMetadataStore.shared.isExcluded(id) { visible.append(file) }
         }
-        files.insert(DirectAuthFile(
-            id: kiroIDEAuthPath,
-            provider: .kiro,
-            email: email,
-            login: nil,
-            expired: expiry,
-            accountType: nil,
-            filePath: kiroIDEAuthPath,
-            source: .nativeCredential,
-            filename: URL(fileURLWithPath: kiroIDEAuthPath).lastPathComponent
-        ), at: 0)
-        return files
+        return visible
     }
     
     private func shouldRefreshToken(_ tokenData: AuthTokenData) -> (shouldRefresh: Bool, reason: String) {
@@ -385,19 +374,13 @@ actor KiroQuotaFetcher {
 
         let (needsRefresh, _) = shouldRefreshToken(tokenData)
         if needsRefresh {
+            hasAttemptedRefresh = true
             if let (refreshed, newExpiry) = await refreshTokenWithExpiry(tokenData: tokenData, filePath: filePath) {
                 currentToken = refreshed
                 tokenExpiresAt = newExpiry
-                hasAttemptedRefresh = true
-            } else {
-                return ProviderQuotaData(
-                    models: [ModelQuota(name: "Error", percentage: 0, resetTime: "Token Refresh Failed")],
-                    lastUpdated: Date(),
-                    isForbidden: true,
-                    planType: "Expired",
-                    tokenExpiresAt: tokenExpiresAt
-                )
             }
+            // A failed refresh is not proof of invalid authentication. Ask the
+            // usage endpoint with the existing token before classifying it.
         }
 
         let region = extractRegionFromProfileArn(tokenData.extras?["profileArn"]) ?? tokenData.extras?["region"] ?? defaultRegion
@@ -410,7 +393,7 @@ actor KiroQuotaFetcher {
             if let (refreshed, newExpiry) = await refreshTokenWithExpiry(tokenData: latestTokenData, filePath: filePath) {
                 let latestRegion = extractRegionFromProfileArn(latestTokenData.extras?["profileArn"]) ?? latestTokenData.extras?["region"] ?? defaultRegion
                 let retryResult = await fetchUsageAPI(token: refreshed, tokenExpiresAt: newExpiry, profileArn: latestTokenData.extras?["profileArn"], region: latestRegion, tokenData: latestTokenData)
-                return retryResult.quotaData ?? ProviderQuotaData(models: [], lastUpdated: Date(), isForbidden: true, planType: "Unauthorized", tokenExpiresAt: newExpiry)
+                return retryResult.quotaData
             }
         }
 
@@ -489,10 +472,7 @@ actor KiroQuotaFetcher {
 
     private func fetchUsageAPI(token: String, tokenExpiresAt: Date?, profileArn: String?, region: String, tokenData: AuthTokenData) async -> UsageAPIResult {
         guard var components = URLComponents(string: usageEndpoint(region: region)) else {
-            return UsageAPIResult(statusCode: 0, quotaData: ProviderQuotaData(
-                models: [ModelQuota(name: "Error", percentage: 0, resetTime: "Invalid URL")],
-                lastUpdated: Date(), isForbidden: false, planType: "Error", tokenExpiresAt: tokenExpiresAt
-            ))
+            return UsageAPIResult(statusCode: 0, quotaData: nil)
         }
 
         var queryItems: [URLQueryItem] = [
@@ -505,10 +485,7 @@ actor KiroQuotaFetcher {
         components.queryItems = queryItems
 
         guard let url = components.url else {
-            return UsageAPIResult(statusCode: 0, quotaData: ProviderQuotaData(
-                models: [ModelQuota(name: "Error", percentage: 0, resetTime: "Invalid URL")],
-                lastUpdated: Date(), isForbidden: false, planType: "Error", tokenExpiresAt: tokenExpiresAt
-            ))
+            return UsageAPIResult(statusCode: 0, quotaData: nil)
         }
 
         var request = URLRequest(url: url)
@@ -529,21 +506,14 @@ actor KiroQuotaFetcher {
             let (data, response) = try await session.data(for: request)
 
             guard let httpResponse = response as? HTTPURLResponse else {
-                return UsageAPIResult(statusCode: 0, quotaData: ProviderQuotaData(
-                    models: [ModelQuota(name: "Error", percentage: 0, resetTime: "Invalid Response Type")],
-                    lastUpdated: Date(), isForbidden: false, planType: "Error", tokenExpiresAt: tokenExpiresAt
-                ))
+                return UsageAPIResult(statusCode: 0, quotaData: nil)
             }
 
             if httpResponse.statusCode != 200 {
-                if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
-                    return UsageAPIResult(statusCode: httpResponse.statusCode, quotaData: nil)
-                }
-                let errorMsg = "HTTP \(httpResponse.statusCode)"
-                return UsageAPIResult(statusCode: httpResponse.statusCode, quotaData: ProviderQuotaData(
-                    models: [ModelQuota(name: "Error", percentage: 0, resetTime: errorMsg)],
-                    lastUpdated: Date(), isForbidden: false, planType: "Error", tokenExpiresAt: tokenExpiresAt
-                ))
+                return UsageAPIResult(
+                    statusCode: httpResponse.statusCode,
+                    quotaData: Self.quotaForHTTPFailure(statusCode: httpResponse.statusCode, tokenExpiresAt: tokenExpiresAt)
+                )
             }
 
             // Decode response
@@ -563,24 +533,34 @@ actor KiroQuotaFetcher {
                     accountIdentity: accountIdentity
                 )
             } catch {
-                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                    let keys = json.keys.sorted().joined(separator: ",")
-                    return UsageAPIResult(statusCode: 200, quotaData: ProviderQuotaData(
-                        models: [ModelQuota(name: "Debug: Keys: \(keys)", percentage: 0, resetTime: "Decode Error: \(error.localizedDescription)")],
-                        lastUpdated: Date(), isForbidden: false, planType: "Error", tokenExpiresAt: tokenExpiresAt
-                    ))
-                }
-                return UsageAPIResult(statusCode: 200, quotaData: ProviderQuotaData(
-                    models: [ModelQuota(name: "Error", percentage: 0, resetTime: error.localizedDescription)],
-                    lastUpdated: Date(), isForbidden: false, planType: "Error", tokenExpiresAt: tokenExpiresAt
-                ))
+                return UsageAPIResult(statusCode: 200, quotaData: nil)
             }
         } catch {
-            return UsageAPIResult(statusCode: 0, quotaData: ProviderQuotaData(
-                models: [ModelQuota(name: "Error", percentage: 0, resetTime: error.localizedDescription)],
-                lastUpdated: Date(), isForbidden: false, planType: "Error", tokenExpiresAt: tokenExpiresAt
-            ))
+            return UsageAPIResult(statusCode: 0, quotaData: nil)
         }
+    }
+
+    nonisolated static func quotaForHTTPFailure(statusCode: Int, tokenExpiresAt: Date?) -> ProviderQuotaData? {
+        guard statusCode == 401 || statusCode == 403 else { return nil }
+        return ProviderQuotaData(models: [], lastUpdated: Date(), isForbidden: true, tokenExpiresAt: tokenExpiresAt)
+    }
+
+    /// Earlier snapshots encoded errors as 0% and absent limits as 100%.
+    /// Remove those fabricated metrics without discarding genuine exhausted quota.
+    nonisolated static func sanitizedCachedQuota(_ quota: ProviderQuotaData) -> ProviderQuotaData? {
+        var result = quota
+        if quota.isForbidden {
+            result.models = []
+            return result
+        }
+        let models = quota.models.filter {
+            $0.name != "Error" && !$0.name.hasPrefix("Debug: Keys:")
+                && !($0.name == "kiro-standard" && $0.resetTime == "Unknown")
+        }
+        guard models.count != quota.models.count else { return quota }
+        guard !models.isEmpty else { return nil }
+        result.models = models
+        return result
     }
 
     /// Refresh Kiro token based on auth method and persist to disk
@@ -816,15 +796,13 @@ actor KiroQuotaFetcher {
                 // Check for active free trial (Bonus Credits)
                 let hasActiveTrial = breakdown.freeTrialInfo?.freeTrialStatus == "ACTIVE"
 
-                if hasActiveTrial, let freeTrialInfo = breakdown.freeTrialInfo {
+                if hasActiveTrial, let freeTrialInfo = breakdown.freeTrialInfo,
+                   let total = freeTrialInfo.usageLimitWithPrecision ?? freeTrialInfo.usageLimit,
+                   total.isFinite, total > 0 {
                     // Show trial/bonus quota
                     let used = freeTrialInfo.currentUsageWithPrecision ?? freeTrialInfo.currentUsage ?? 0
-                    let total = freeTrialInfo.usageLimitWithPrecision ?? freeTrialInfo.usageLimit ?? 0
 
-                    var percentage: Double = 0
-                    if total > 0 {
-                        percentage = min(100, max(0, (total - used) / total * 100))
-                    }
+                    let percentage = min(100, max(0, (total - used) / total * 100))
 
                     // Calculate free trial expiry time
                     var trialResetStr = resetTimeStr
@@ -847,9 +825,8 @@ actor KiroQuotaFetcher {
                 let regularTotal = breakdown.usageLimitWithPrecision ?? breakdown.usageLimit ?? 0
 
                 // Add regular quota if it has meaningful limits
-                if regularTotal > 0 {
-                    var percentage: Double = 0
-                    percentage = min(100, max(0, (regularTotal - regularUsed) / regularTotal * 100))
+                if regularTotal.isFinite, regularTotal > 0 {
+                    let percentage = min(100, max(0, (regularTotal - regularUsed) / regularTotal * 100))
 
                     // Use different name based on whether trial is active
                     let quotaName = hasActiveTrial ? "\(displayName) (Base)" : displayName
@@ -862,10 +839,6 @@ actor KiroQuotaFetcher {
             }
         }
 
-        // Fallback if no limits found
-        if models.isEmpty {
-            models.append(ModelQuota(name: "kiro-standard", percentage: 100, resetTime: "Unknown"))
-        }
 
         return ProviderQuotaData(
             models: models,

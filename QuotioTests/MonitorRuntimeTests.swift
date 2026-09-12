@@ -1667,7 +1667,7 @@ final class MonitorRuntimeTests: XCTestCase {
             try await vault.save(second, metadata: account)
             let loadedSecond = await vault.credential(for: account.id)
             XCTAssertEqual(loadedSecond?.accessToken, "second")
-            await vault.delete(accountID: account.id)
+            try await vault.delete(accountID: account.id)
             let deleted = await vault.credential(for: account.id)
             XCTAssertNil(deleted)
         }
@@ -1721,7 +1721,8 @@ final class MonitorRuntimeTests: XCTestCase {
 
         let accounts = await store.accounts()
         let disabled = await store.disabledAccountIDs()
-        XCTAssertEqual(accounts, [account])
+        XCTAssertEqual(accounts.map(\.id), [account.id])
+        XCTAssertEqual(accounts.first?.isDisabled, true)
         XCTAssertEqual(disabled, Set([account.id]))
     }
 
@@ -1762,7 +1763,7 @@ final class MonitorRuntimeTests: XCTestCase {
         )
 
         try await store.setRemoved(true, accountID: account.id)
-        try await store.saveAccount(account)
+        try await store.saveAccount(account, restoringRemoved: true)
 
         let removed = await store.removedAccountIDs()
         let accounts = await store.accounts()
@@ -1798,6 +1799,217 @@ final class MonitorRuntimeTests: XCTestCase {
         XCTAssertNil(bootstrap.quotas[.claude])
         XCTAssertFalse(bootstrap.accounts.contains { $0.id == account.id })
         XCTAssertTrue(refreshed.isEmpty, "A refresh must not resurrect a removed account")
+    }
+
+    @MainActor
+    func testKiroNativeFallbackMatchesFetcherAndMigratesOnlyItsSource() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let path = directory.appendingPathComponent("kiro-auth-token.json")
+        try JSONSerialization.data(withJSONObject: ["accessToken": "fixture"]).write(to: path)
+        let file = try XCTUnwrap(MonitorAccountDiscovery.kiroAuthFile(at: path.path))
+        let fetchedKey = KiroAccountIdentity.canonicalKey(email: nil, profileARN: nil, filename: file.filename)
+        XCTAssertEqual(MonitorAccount.makeLegacy(file).accountKey, fetchedKey)
+        let metadata = MonitorMetadataStore(url: directory.appendingPathComponent("accounts.json"))
+        let old = MonitorAccount.make(provider: .kiro, accountKey: "Kiro", source: .nativeCredential)
+        let current = MonitorAccount.makeLegacy(file)
+        try await metadata.setRemoved(true, accountID: old.id)
+        try await metadata.reconcileAliases([current.id: KiroAccountIdentity.aliases(for: file)])
+        let visible = await metadata.filteringQuotas([.kiro: [fetchedKey: ideQuota(80), "unrelated": ideQuota(40)]])
+        XCTAssertNil(visible[.kiro]?[fetchedKey])
+        XCTAssertEqual(visible[.kiro]?["unrelated"]?.models.first?.percentage, 40)
+    }
+
+    func testReusedKiroFilenameDoesNotTransferRemovalToNewProfile() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let metadata = MonitorMetadataStore(url: directory.appendingPathComponent("accounts.json"))
+        let old = MonitorAccount.make(provider: .kiro, accountKey: "old-profile", source: .nativeCredential)
+        let replacement = MonitorAccount.make(provider: .kiro, accountKey: "new-profile", source: .nativeCredential)
+        let filename = MonitorAccount.make(provider: .kiro, accountKey: "kiro-auth-token", source: .nativeCredential)
+        try await metadata.setRemoved(true, accountID: filename.id)
+        try await metadata.reconcileAliases([old.id: [old.id, filename.id]])
+        try await metadata.reconcileAliases([replacement.id: [replacement.id, filename.id]])
+        let visible = await metadata.filteringQuotas([.kiro: [old.accountKey: ideQuota(80), replacement.accountKey: ideQuota(40)]])
+        XCTAssertNil(visible[.kiro]?[old.accountKey])
+        XCTAssertEqual(visible[.kiro]?[replacement.accountKey]?.models.first?.percentage, 40)
+    }
+
+    func testOwnedRemovalRejectsDelayedSaveAndAllowsExplicitLogin() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let metadata = MonitorMetadataStore(url: directory.appendingPathComponent("accounts.json"))
+        let account = MonitorAccount.make(provider: .kiro, accountKey: "owned@example.com", source: .quotioKeychain, canDelete: true)
+        let other = MonitorAccount.make(provider: .kiro, accountKey: "other@example.com", source: .quotioKeychain, canDelete: true)
+        try await metadata.saveAccount(account)
+        try await metadata.saveAccount(other)
+        let coordinator = MonitorRefreshCoordinator(
+            discovery: MonitorAccountDiscovery(
+                vault: MetadataCredentialVault(metadata: metadata),
+                directAuthService: DirectAuthFileService(authDirectory: directory.appendingPathComponent("auth")),
+                metadata: metadata, includesNativeSources: false
+            ),
+            snapshots: MonitorSnapshotStore(url: directory.appendingPathComponent("snapshots.json"))
+        )
+        try await coordinator.deleteOwnedAccount(accountID: account.id)
+        do {
+            try await metadata.saveAccount(account)
+            XCTFail("A token refresh must not undo a persisted deletion")
+        } catch {}
+        let afterDelete = await metadata.accounts()
+        XCTAssertEqual(afterDelete.map(\.id), [other.id])
+        let visible = await coordinator.filteringRemovedAccounts(from: [.kiro: [account.accountKey: ideQuota(80), other.accountKey: ideQuota(30)]])
+        XCTAssertNil(visible[.kiro]?[account.accountKey])
+        XCTAssertEqual(visible[.kiro]?[other.accountKey]?.models.first?.percentage, 30)
+        try await metadata.saveAccount(account, restoringRemoved: true)
+        let restored = await coordinator.filteringRemovedAccounts(from: [.kiro: [account.accountKey: ideQuota(80)]])
+        XCTAssertEqual(restored[.kiro]?[account.accountKey]?.models.first?.percentage, 80)
+    }
+
+    func testDelayedKiroRefreshCannotRestoreDeletedPreviousQuotaOrSnapshot() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let snapshots = directory.appendingPathComponent("snapshots.json")
+        let metadata = directory.appendingPathComponent("accounts.json")
+        let coordinator = makeIsolatedCoordinator(snapshots: snapshots, metadata: metadata)
+        let account = MonitorAccount.make(provider: .kiro, accountKey: "removed@example.com", source: .nativeCredential)
+        let previous = [account.accountKey: ideQuota(70), "survivor@example.com": ideQuota(25)]
+        let gate = RefreshGate()
+        let refresh = Task {
+            await coordinator.refresh(provider: .kiro, force: true, previous: previous) {
+                await gate.suspend()
+                return [:]
+            }
+        }
+        await gate.waitUntilSuspended()
+        try await coordinator.removeDiscoveredAccount(accountID: account.id)
+        await gate.release()
+        let result = await refresh.value
+        XCTAssertNil(result[account.accountKey])
+        XCTAssertEqual(result["survivor@example.com"]?.models.first?.percentage, 25)
+        // An already-completed batch may still hold a pre-delete value.
+        await coordinator.finish(quotas: [.kiro: previous])
+        let persisted = await MonitorSnapshotStore(url: snapshots).load()
+        XCTAssertNil(persisted[.kiro]?[account.accountKey])
+        let reboot = await makeIsolatedCoordinator(snapshots: snapshots, metadata: metadata).bootstrap()
+        XCTAssertNil(reboot.quotas[.kiro]?[account.accountKey])
+        XCTAssertFalse(reboot.accounts.contains { $0.id == account.id })
+        XCTAssertEqual(reboot.quotas[.kiro]?["survivor@example.com"]?.models.first?.percentage, 25)
+    }
+
+    func testKiroSourceAliasesShareRemovalWithoutBlockingOtherProfiles() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let auth = directory.appendingPathComponent("auth")
+        try FileManager.default.createDirectory(at: auth, withIntermediateDirectories: true)
+        let first = auth.appendingPathComponent("kiro-first.json")
+        let second = auth.appendingPathComponent("kiro-second.json")
+        let firstData = try JSONSerialization.data(withJSONObject: ["type": "kiro", "accessToken": "fixture", "profileArn": "profile:first", "provider": "Google"])
+        try firstData.write(to: first)
+        try JSONSerialization.data(withJSONObject: ["type": "kiro", "accessToken": "fixture", "profile_arn": "profile:second", "provider": "Google"]).write(to: second)
+        let metadata = MonitorMetadataStore(url: directory.appendingPathComponent("accounts.json"))
+        let discovery = MonitorAccountDiscovery(vault: EmptyCredentialVault(), directAuthService: DirectAuthFileService(authDirectory: auth), metadata: metadata, includesNativeSources: false)
+        let oldID = MonitorAccount.make(provider: .kiro, accountKey: "kiro-first", source: .legacyCLIProxy).id
+        try await metadata.setRemoved(true, accountID: oldID)
+        let discovered = await discovery.discover()
+        XCTAssertEqual(discovered.map(\.accountKey), ["profile:second"])
+        let visible = await metadata.filteringQuotas([.kiro: ["profile:first": ideQuota(80), "kiro-first": ideQuota(60), "profile:second": ideQuota(20)]])
+        XCTAssertEqual(Set(visible[.kiro]?.keys ?? Dictionary<String, ProviderQuotaData>().keys), ["profile:second"])
+        XCTAssertEqual(try Data(contentsOf: first), firstData, "Discovery and removal must preserve external credentials")
+        let native = try XCTUnwrap(MonitorAccountDiscovery.kiroAuthFile(at: first.path))
+        XCTAssertEqual(native.menuBarAccountKey, "profile:first")
+        _ = try await metadata.restoreRemovedAccounts()
+        let restored = await discovery.discover()
+        XCTAssertEqual(Set(restored.map(\.accountKey)), ["profile:first", "profile:second"])
+    }
+
+    func testDisabledKiroAndLegacyErrorSnapshotsCannotPublishNumericQuota() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let metadataURL = directory.appendingPathComponent("accounts.json")
+        let snapshotsURL = directory.appendingPathComponent("snapshots.json")
+        let metadata = MonitorMetadataStore(url: metadataURL)
+        let disabled = MonitorAccount.make(provider: .kiro, accountKey: "disabled", source: .nativeCredential)
+        try await metadata.setDisabled(true, accountID: disabled.id)
+        let error = ProviderQuotaData(models: [ModelQuota(name: "Error", percentage: 0, resetTime: "HTTP 503")], lastUpdated: Date())
+        let forbidden = ProviderQuotaData(models: error.models, lastUpdated: Date(), isForbidden: true)
+        let snapshot: [AIProvider: [String: ProviderQuotaData]] = [.kiro: ["disabled": ideQuota(80), "transient": error, "forbidden": forbidden, "exhausted": ideQuota(0)]]
+        await MonitorSnapshotStore(url: snapshotsURL).store(snapshot)
+        let coordinator = makeIsolatedCoordinator(snapshots: snapshotsURL, metadata: metadataURL)
+        let boot = await coordinator.bootstrap()
+        XCTAssertNil(boot.quotas[.kiro]?["disabled"])
+        XCTAssertNil(boot.quotas[.kiro]?["transient"])
+        XCTAssertEqual(boot.quotas[.kiro]?["forbidden"]?.models.count, 0)
+        XCTAssertEqual(boot.quotas[.kiro]?["exhausted"]?.models.first?.percentage, 0)
+        let persisted = await MonitorSnapshotStore(url: snapshotsURL).load()
+        XCTAssertNil(persisted[.kiro]?["disabled"])
+        XCTAssertNil(persisted[.kiro]?["transient"])
+        let result = await coordinator.refresh(provider: .kiro, force: true, previous: ["exhausted": ideQuota(0)]) { ["disabled": error] }
+        XCTAssertNil(result["disabled"])
+        XCTAssertEqual(result["exhausted"]?.models.first?.percentage, 0)
+    }
+
+    func testKiroHTTPFailuresAreNotQuotaMeasurements() async {
+        let forbidden = KiroQuotaFetcher.quotaForHTTPFailure(statusCode: 401, tokenExpiresAt: nil)
+        XCTAssertEqual(forbidden?.isForbidden, true)
+        XCTAssertEqual(forbidden?.models.count, 0)
+        XCTAssertNil(KiroQuotaFetcher.quotaForHTTPFailure(statusCode: 503, tokenExpiresAt: nil))
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let coordinator = makeIsolatedCoordinator(snapshots: directory.appendingPathComponent("snapshots"), metadata: directory.appendingPathComponent("accounts"))
+        let result = await coordinator.refresh(provider: .kiro, force: true, previous: ["account": ideQuota(37)]) {
+            guard let error = KiroQuotaFetcher.quotaForHTTPFailure(statusCode: 503, tokenExpiresAt: nil) else { return [:] }
+            return ["account": error]
+        }
+        XCTAssertEqual(result["account"]?.models.first?.percentage, 37)
+    }
+
+    func testRemovalWriteFailureLeavesAccountVisible() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let target = directory.appendingPathComponent("target.json")
+        let link = directory.appendingPathComponent("accounts.json")
+        try Data("{\"accounts\":[],\"disabledAccountIDs\":[]}".utf8).write(to: target)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+        let account = MonitorAccount.make(provider: .kiro, accountKey: "unchanged", source: .nativeCredential)
+        let coordinator = makeIsolatedCoordinator(snapshots: directory.appendingPathComponent("snapshots.json"), metadata: link)
+        do {
+            try await coordinator.removeDiscoveredAccount(accountID: account.id)
+            XCTFail("Permanent deletion must report a metadata write failure")
+        } catch {}
+        let visible = await coordinator.filteringRemovedAccounts(from: [.kiro: [account.accountKey: ideQuota(90)]])
+        XCTAssertEqual(visible[.kiro]?[account.accountKey]?.models.first?.percentage, 90)
+    }
+
+    private struct MetadataCredentialVault: MonitorCredentialStore {
+        let metadata: MonitorMetadataStore
+        func accounts() async -> [MonitorAccount] { await metadata.accounts() }
+        func credential(for accountID: String) async -> MonitorOAuthCredential? { nil }
+        func reloadLatest(accountID: String) async -> MonitorOAuthCredential? { nil }
+        func save(_ credential: MonitorOAuthCredential, metadata account: MonitorAccount) async throws { try await metadata.saveAccount(account) }
+        func delete(accountID: String) async throws { try await metadata.deleteAccount(accountID) }
+    }
+
+    private actor RefreshGate {
+        private var continuation: CheckedContinuation<Void, Never>?
+        private var start: CheckedContinuation<Void, Never>?
+        func suspend() async {
+            await withCheckedContinuation { continuation in
+                self.continuation = continuation
+                start?.resume()
+                start = nil
+            }
+        }
+        func waitUntilSuspended() async {
+            if continuation != nil { return }
+            await withCheckedContinuation { start = $0 }
+        }
+        func release() {
+            continuation?.resume()
+            continuation = nil
+        }
     }
 
     @MainActor
@@ -2025,7 +2237,9 @@ final class MonitorRuntimeTests: XCTestCase {
         MonitorRefreshCoordinator(
             discovery: MonitorAccountDiscovery(
                 vault: EmptyCredentialVault(),
-                metadata: MonitorMetadataStore(url: metadata)
+                directAuthService: DirectAuthFileService(authDirectory: metadata.deletingLastPathComponent().appendingPathComponent("auth")),
+                metadata: MonitorMetadataStore(url: metadata),
+                includesNativeSources: false
             ),
             snapshots: MonitorSnapshotStore(url: snapshots)
         )

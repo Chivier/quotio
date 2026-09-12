@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **claude-quota**: Keep usage monitoring working across OAuth token expiry and rotation. Refresh the original authorization grant, reload credentials rotated by another client, retain rotated tokens when persistence temporarily fails, and preserve the last successful quota on transient failures. Avoid falling back to obsolete credentials for the same account and allow explicit foreground Keychain access recovery.
+- **claude-auth**: Open the complete authorization-code flow from quota recovery instead of leaving a browser-only spinner. Preserve pending authorization after input/network errors and retain exchanged credentials for Keychain-save retries. Validate the reconnecting account, ignore canceled attempts, and verify usage with the new login before reporting success.
+- **quota-display**: Default to average remaining quota consistently across dashboard, provider summaries, and paired menu-bar metrics. Exclude failed and unavailable measurements without discarding genuine zero quota, and show missing data as a dash.
+- **monitor**: Keep deleted and disabled accounts out of delayed refresh results, snapshots, and rediscovery. Reconcile proven Kiro source identities without suppressing unrelated profiles, preserve deletion markers until explicit restoration, and stop treating Kiro errors as numeric quota.
+- **development**: Disable Sparkle updates in local Debug builds so official releases cannot overwrite local repairs.
+
 ## [0.30.0] - 2026-08-25
 
 ## [0.29.1] - 2026-08-23

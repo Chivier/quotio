@@ -12,7 +12,7 @@ final class MenuBarQuotaPairTests: XCTestCase {
             ModelQuota(name: "seven-day-opus", percentage: 27, resetTime: ""),
         ]
 
-        let pair = try XCTUnwrap(MenuBarQuotaPair.resolve(for: .claude, from: models))
+        let pair = try XCTUnwrap(MenuBarQuotaPair.resolve(for: .claude, from: models, aggregationMode: .lowest))
 
         XCTAssertEqual(pair.top, MenuBarQuotaMetric(labelKey: "quota.metric.fiveHour", remainingPercentage: 81))
         XCTAssertEqual(pair.bottom, MenuBarQuotaMetric(labelKey: "quota.metric.weekly", remainingPercentage: 12))
@@ -26,10 +26,24 @@ final class MenuBarQuotaPairTests: XCTestCase {
             ModelQuota(name: "codex-spark-weekly", percentage: 66, resetTime: ""),
         ]
 
-        let pair = try XCTUnwrap(MenuBarQuotaPair.resolve(for: .codex, from: models))
+        let pair = try XCTUnwrap(MenuBarQuotaPair.resolve(for: .codex, from: models, aggregationMode: .lowest))
 
         XCTAssertEqual(pair.top.remainingPercentage, 43)
         XCTAssertEqual(pair.bottom.remainingPercentage, 51)
+    }
+
+    func testAverageKeepsSessionAndWeeklyLimitsSeparate() throws {
+        let models = [
+            ModelQuota(name: "codex-session", percentage: 0, resetTime: ""),
+            ModelQuota(name: "codex-spark", percentage: 100, resetTime: ""),
+            ModelQuota(name: "codex-weekly", percentage: 40, resetTime: ""),
+            ModelQuota(name: "codex-spark-weekly", percentage: 80, resetTime: ""),
+        ]
+
+        let pair = try XCTUnwrap(MenuBarQuotaPair.resolve(for: .codex, from: models, aggregationMode: .average))
+
+        XCTAssertEqual(pair.top.remainingPercentage, 50)
+        XCTAssertEqual(pair.bottom.remainingPercentage, 60)
     }
 
     func testAmpUsesAgentAndOrbUsage() throws {
@@ -38,7 +52,7 @@ final class MenuBarQuotaPairTests: XCTestCase {
             ModelQuota(name: "amp-orb-usage", percentage: 98, resetTime: ""),
         ]
 
-        let pair = try XCTUnwrap(MenuBarQuotaPair.resolve(for: .amp, from: models))
+        let pair = try XCTUnwrap(MenuBarQuotaPair.resolve(for: .amp, from: models, aggregationMode: .average))
 
         XCTAssertEqual(pair.top, MenuBarQuotaMetric(labelKey: "amp.quota.agent", remainingPercentage: 64))
         XCTAssertEqual(pair.bottom, MenuBarQuotaMetric(labelKey: "amp.quota.orb", remainingPercentage: 98))
@@ -49,7 +63,7 @@ final class MenuBarQuotaPairTests: XCTestCase {
             ModelQuota(name: "amp-agent-usage", percentage: 64, resetTime: ""),
         ]
 
-        XCTAssertNil(MenuBarQuotaPair.resolve(for: .amp, from: models))
+        XCTAssertNil(MenuBarQuotaPair.resolve(for: .amp, from: models, aggregationMode: .average))
     }
 
     func testAntigravityUsesLowestProviderLimitForEachWindow() throws {
@@ -60,7 +74,7 @@ final class MenuBarQuotaPairTests: XCTestCase {
             ModelQuota(name: "antigravity-claude-gpt-weekly", percentage: 67, resetTime: ""),
         ]
 
-        let pair = try XCTUnwrap(MenuBarQuotaPair.resolve(for: .antigravity, from: models))
+        let pair = try XCTUnwrap(MenuBarQuotaPair.resolve(for: .antigravity, from: models, aggregationMode: .lowest))
 
         XCTAssertEqual(pair.top.remainingPercentage, 31)
         XCTAssertEqual(pair.bottom.remainingPercentage, 55)
@@ -72,7 +86,7 @@ final class MenuBarQuotaPairTests: XCTestCase {
             ModelQuota(name: "devin-weekly", percentage: 49, resetTime: ""),
         ]
 
-        let pair = try XCTUnwrap(MenuBarQuotaPair.resolve(for: .devin, from: models))
+        let pair = try XCTUnwrap(MenuBarQuotaPair.resolve(for: .devin, from: models, aggregationMode: .average))
 
         XCTAssertEqual(pair.top, MenuBarQuotaMetric(labelKey: "quota.metric.daily", remainingPercentage: 84))
         XCTAssertEqual(pair.bottom, MenuBarQuotaMetric(labelKey: "quota.metric.weekly", remainingPercentage: 49))
@@ -83,7 +97,7 @@ final class MenuBarQuotaPairTests: XCTestCase {
             ModelQuota(name: "devin-weekly", percentage: 49, resetTime: ""),
         ]
 
-        XCTAssertNil(MenuBarQuotaPair.resolve(for: .devin, from: models))
+        XCTAssertNil(MenuBarQuotaPair.resolve(for: .devin, from: models, aggregationMode: .average))
     }
 
     func testCursorRequiresBoundedOnDemandUsage() throws {
@@ -92,17 +106,17 @@ final class MenuBarQuotaPairTests: XCTestCase {
             ModelQuota(name: "on-demand", percentage: 25, resetTime: "", used: 75, limit: 100, remaining: 25),
         ]
 
-        let pair = try XCTUnwrap(MenuBarQuotaPair.resolve(for: .cursor, from: models))
+        let pair = try XCTUnwrap(MenuBarQuotaPair.resolve(for: .cursor, from: models, aggregationMode: .average))
 
         XCTAssertEqual(pair.top, MenuBarQuotaMetric(labelKey: "quota.metric.planUsage", remainingPercentage: 80))
         XCTAssertEqual(pair.bottom, MenuBarQuotaMetric(labelKey: "quota.metric.onDemand", remainingPercentage: 25))
-        XCTAssertNil(MenuBarQuotaPair.resolve(for: .cursor, from: Array(models.prefix(1))))
+        XCTAssertNil(MenuBarQuotaPair.resolve(for: .cursor, from: Array(models.prefix(1)), aggregationMode: .average))
 
         let unboundedModels = [
             models[0],
             ModelQuota(name: "on-demand", percentage: 100, resetTime: "", used: 75),
         ]
-        XCTAssertNil(MenuBarQuotaPair.resolve(for: .cursor, from: unboundedModels))
+        XCTAssertNil(MenuBarQuotaPair.resolve(for: .cursor, from: unboundedModels, aggregationMode: .average))
     }
 
     func testCodexWithoutSessionDoesNotUseStackedLayout() {
@@ -110,25 +124,37 @@ final class MenuBarQuotaPairTests: XCTestCase {
             ModelQuota(name: "codex-weekly", percentage: 42, resetTime: ""),
         ]
 
-        XCTAssertNil(MenuBarQuotaPair.resolve(for: .codex, from: models))
+        XCTAssertNil(MenuBarQuotaPair.resolve(for: .codex, from: models, aggregationMode: .average))
     }
 
-    func testUnknownValuesDoNotOverrideKnownMinimum() throws {
+    func testInvalidValuesDoNotOverrideKnownAverage() throws {
         let models = [
             ModelQuota(name: "codex-session", percentage: -1, resetTime: ""),
             ModelQuota(name: "codex-spark", percentage: 38, resetTime: ""),
+            ModelQuota(name: "codex-session", percentage: 0, resetTime: "", presentation: .status(text: "Disabled")),
+            ModelQuota(name: "codex-spark", percentage: .nan, resetTime: ""),
+            ModelQuota(name: "codex-weekly", percentage: .infinity, resetTime: ""),
+            ModelQuota(name: "codex-spark-weekly", percentage: 101, resetTime: ""),
         ]
 
-        let pair = try XCTUnwrap(MenuBarQuotaPair.resolve(for: .codex, from: models))
+        let pair = try XCTUnwrap(MenuBarQuotaPair.resolve(for: .codex, from: models, aggregationMode: .average))
 
         XCTAssertEqual(pair.top.remainingPercentage, 38)
         XCTAssertEqual(pair.bottom.remainingPercentage, -1)
     }
 
+    func testPairRequiresAtLeastOneAvailableWindow() {
+        let unavailable = [
+            ModelQuota(name: "five-hour-session", percentage: -1, resetTime: ""),
+            ModelQuota(name: "seven-day-weekly", percentage: .nan, resetTime: ""),
+        ]
+        XCTAssertNil(MenuBarQuotaPair.resolve(for: .claude, from: unavailable, aggregationMode: .average))
+    }
+
     func testUnsupportedProviderDoesNotResolvePair() {
         let models = [ModelQuota(name: "copilot-chat", percentage: 70, resetTime: "")]
 
-        XCTAssertNil(MenuBarQuotaPair.resolve(for: .copilot, from: models))
+        XCTAssertNil(MenuBarQuotaPair.resolve(for: .copilot, from: models, aggregationMode: .average))
     }
 
     @MainActor

@@ -117,6 +117,11 @@ final class StatusBarMenuBuilder {
     // MARK: - Data Helpers
     
     private var providersWithData: [AIProvider] {
+        // Discovery already applies removal and disabled-account preferences.
+        // Raw auth files must not bring a hidden provider back into Monitor UI.
+        if modeManager.isMonitorMode {
+            return Self.monitorProviders(viewModel.monitorAccounts).sorted { $0.displayName < $1.displayName }
+        }
         var providers = Set<AIProvider>()
         
         // From direct auth files (scanned from filesystem - available immediately)
@@ -131,9 +136,6 @@ final class StatusBarMenuBuilder {
             }
         }
 
-        if modeManager.isMonitorMode {
-            providers.formUnion(Self.monitorProviders(viewModel.monitorAccounts))
-        }
         
         return Self.filterProviders(
             providers,
@@ -268,7 +270,12 @@ final class StatusBarMenuBuilder {
         trackedAccounts: [MonitorAccount],
         statusMessage: (MonitorAccount) -> String?
     ) -> [MenuBarAccountRow] {
-        var rows = quotaRows.map {
+        let disabledKeys = Set(trackedAccounts.lazy.filter(\.isDisabled).map {
+            $0.accountKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        })
+        var rows = quotaRows.filter {
+            !disabledKeys.contains($0.accountKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+        }.map {
             MenuBarAccountRow(accountKey: $0.accountKey, email: $0.email, data: $0.data, statusMessage: nil)
         }
         let listed = Set(rows.map(\.accountKey))

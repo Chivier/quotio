@@ -6838,6 +6838,34 @@
         }
       }
     },
+    "dashboard.averageQuota" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Average Quota"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Quota moyen"
+          }
+        },
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hạn mức trung bình"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "平均配额"
+          }
+        }
+      }
+    },
     "dashboard.clickToInstall" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -11202,6 +11230,86 @@
         "fr" : { "stringUnit" : { "state" : "translated", "value" : "Saisissez le code d’appareil %@ dans le navigateur." } },
         "vi" : { "stringUnit" : { "state" : "translated", "value" : "Nhập mã thiết bị %@ trong trình duyệt." } },
         "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "请在浏览器中输入设备代码 %@。" } }
+      }
+    },
+    "oauth.claude.awaitingCode" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Finish authorization, then paste the code below" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Terminez l’autorisation, puis collez le code ci-dessous" } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Hoàn tất cấp quyền, rồi dán mã bên dưới" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "完成网页授权后，请在下方粘贴授权码" } }
+      }
+    },
+    "oauth.claude.codeInstructions" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Open the link, authorize the intended Claude account, then copy the complete code from the final page (including #state when present). This flow does not return to Quotio automatically." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Ouvrez le lien, autorisez le compte Claude voulu, puis copiez le code complet de la dernière page (avec #state s’il est présent). Le retour dans Quotio n’est pas automatique." } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Mở liên kết, cấp quyền cho đúng tài khoản Claude, rồi sao chép toàn bộ mã ở trang cuối (gồm #state nếu có). Luồng này không tự quay lại Quotio." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "打开链接并确认授权的是目标 Claude 账号，再复制最后页面上的完整授权码（如有 #state，请一并复制）。此流程不会自动跳回 Quotio。" } }
+      }
+    },
+    "oauth.claude.saving" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Exchanging authorization and saving credentials…" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Échange du code et enregistrement des identifiants…" } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Đang đổi mã và lưu thông tin đăng nhập…" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "正在交换授权并保存凭据…" } }
+      }
+    },
+    "oauth.claude.verifying" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Checking usage with the new login…" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Vérification du quota avec la nouvelle connexion…" } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Đang kiểm tra hạn mức bằng thông tin đăng nhập mới…" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "正在使用新凭据验证配额访问…" } }
+      }
+    },
+    "oauth.claude.savedButUnavailable" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Login saved; usage is not available yet" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Connexion enregistrée ; quota pas encore disponible" } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Đã lưu đăng nhập; hạn mức chưa khả dụng" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "登录已保存，但配额访问尚未通过验证" } }
+      }
+    },
+    "oauth.claude.usageRejected" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Claude rejected usage access for the new login. Check this account’s plan and permissions. The saved login has not been discarded." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Claude a refusé l’accès au quota. Vérifiez l’abonnement et les autorisations du compte. La connexion enregistrée est conservée." } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Claude từ chối truy cập hạn mức. Kiểm tra gói và quyền của tài khoản. Thông tin đăng nhập đã lưu vẫn được giữ lại." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "Claude 拒绝了新凭据的配额访问。请检查该账号的套餐和授权权限；已保存的登录不会被丢弃。" } }
+      }
+    },
+    "oauth.claude.usageUnavailable" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "The usage request did not complete. Check the network or proxy, then retry verification without signing in again." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "La requête de quota n’a pas abouti. Vérifiez le réseau ou le proxy, puis réessayez sans vous reconnecter." } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Yêu cầu hạn mức chưa hoàn tất. Kiểm tra mạng hoặc proxy rồi xác minh lại mà không cần đăng nhập lại." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "配额请求未完成。请检查网络或代理，然后重试验证，无需再次登录。" } }
+      }
+    },
+    "oauth.claude.verifyAgain" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Retry usage verification" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Revérifier le quota" } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Xác minh lại hạn mức" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "重试配额验证" } }
+      }
+    },
+    "oauth.claude.saveAgain" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Retry saving login" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Réessayer l’enregistrement" } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Thử lưu đăng nhập lại" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "重试保存登录" } }
+      }
+    },
+    "oauth.claude.accountMismatch" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "The browser authorized a different Claude account. Restart authorization and choose the account you are reconnecting. No credentials were replaced." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Le navigateur a autorisé un autre compte Claude. Recommencez en choisissant le compte à reconnecter. Aucun identifiant n’a été remplacé." } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Trình duyệt đã cấp quyền cho tài khoản Claude khác. Bắt đầu lại và chọn đúng tài khoản. Không có thông tin đăng nhập nào bị thay thế." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "浏览器授权的是另一个 Claude 账号。请重新开始授权并选择正在恢复的账号；未替换任何凭据。" } }
       }
     },
     "oauth.authorizationCode" : {
@@ -19359,6 +19467,34 @@
         }
       }
     },
+    "settings.updates.localBuild" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Updates are disabled in local development builds to preserve local changes."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Les mises à jour sont désactivées dans les versions de développement locales afin de préserver les modifications locales."
+          }
+        },
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Các bản cập nhật bị tắt trong bản dựng phát triển cục bộ để giữ nguyên các thay đổi cục bộ."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "本地开发版本已停用自动更新，避免覆盖本地修改。"
+          }
+        }
+      }
+    },
     "settings.updates" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -19510,25 +19646,25 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Average remaining"
+            "value" : "Average remaining (default)"
           }
         },
         "fr" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Moyenne restante"
+            "value" : "Moyenne restante (par défaut)"
           }
         },
         "vi" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Trung bình còn lại"
+            "value" : "Trung bình còn lại (mặc định)"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "平均剩余"
+            "value" : "平均剩余（默认）"
           }
         }
       }
@@ -19568,25 +19704,25 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Lowest remaining (default)"
+            "value" : "Lowest remaining"
           }
         },
         "fr" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Plus bas restant (par défaut)"
+            "value" : "Plus bas restant"
           }
         },
         "vi" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Thấp nhất còn lại (mặc định)"
+            "value" : "Thấp nhất còn lại"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "最低剩余（默认）"
+            "value" : "最低剩余"
           }
         }
       }

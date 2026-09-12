@@ -192,4 +192,19 @@ final class AccountSortingTests: XCTestCase {
 
         XCTAssertTrue(rows.isEmpty)
     }
+
+    func testMenuBarSkipsDisabledAccountEvenWhenRefreshReturnedQuota() {
+        let rows = StatusBarMenuBuilder.accountRows(
+            quotaRows: [
+                (accountKey: "HIDDEN@example.com", email: "hidden@example.com", data: quota(displayName: "hidden@example.com")),
+                (accountKey: "visible@example.com", email: "visible@example.com", data: quota(displayName: "visible@example.com")),
+            ],
+            trackedAccounts: [
+                trackedAccount("hidden@example.com", disabled: true),
+                trackedAccount("visible@example.com"),
+            ]
+        ) { _ in nil }
+
+        XCTAssertEqual(rows.map(\.accountKey), ["visible@example.com"])
+    }
 }

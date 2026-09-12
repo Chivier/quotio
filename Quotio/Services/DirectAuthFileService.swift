@@ -25,6 +25,7 @@ struct DirectAuthFile: Identifiable, Sendable, Hashable {
     /// key. Older Quotio versions keyed Copilot files by the JSON `login` field;
     /// those keys must still migrate onto the canonical key (#404).
     nonisolated var legacyIdentityKeys: [String] = []
+    nonisolated var kiroProfileARN: String? = nil
 
     /// Source location of the auth file
     enum AuthFileSource: String, Sendable {
@@ -66,10 +67,9 @@ struct DirectAuthFile: Identifiable, Sendable, Hashable {
             return key
         }
         if provider == .kiro {
-            if let email = email, !email.isEmpty {
-                return email
-            }
-            return filename.replacingOccurrences(of: ".json", with: "")
+            return KiroAccountIdentity.canonicalKey(
+                email: email, profileARN: kiroProfileARN, filename: filename
+            )
         }
         if let email = email, !email.isEmpty {
             return email
@@ -171,7 +171,7 @@ actor DirectAuthFileService {
         }
         
         // Extract metadata
-        var email = json["email"] as? String
+        let email = json["email"] as? String
         var login = json["login"] as? String
         var legacyIdentityKeys: [String] = []
         if provider == .copilot {
@@ -193,11 +193,14 @@ actor DirectAuthFileService {
         }
         let accountType = json["account_type"] as? String
         
-        // For Kiro: if email is empty, try to use provider (e.g., "Google") as identifier
-        if provider == .kiro && (email == nil || email?.isEmpty == true) {
-            if let authProvider = json["provider"] as? String {
-                email = "Kiro (\(authProvider))"
+        // A login provider (Google/GitHub) is not an account identity. Keep old
+        // synthetic keys only as migration aliases for the very same file.
+        if provider == .kiro {
+            if email?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false,
+               let authProvider = json["provider"] as? String {
+                legacyIdentityKeys.append("Kiro (\(authProvider))")
             }
+            legacyIdentityKeys.append(filename.replacingOccurrences(of: ".json", with: ""))
         }
         
         // Parse expired date
@@ -218,7 +221,8 @@ actor DirectAuthFileService {
             filePath: filePath,
             source: .cliProxyApi,
             filename: filename,
-            legacyIdentityKeys: legacyIdentityKeys
+            legacyIdentityKeys: legacyIdentityKeys,
+            kiroProfileARN: json["profile_arn"] as? String ?? json["profileArn"] as? String
         )
     }
     

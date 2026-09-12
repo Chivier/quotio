@@ -17,6 +17,7 @@ struct ProvidersScreen: View {
     @Environment(QuotaViewModel.self) private var viewModel
     @State private var isImporterPresented = false
     @State private var selectedProvider: AIProvider?
+    @State private var reconnectAccountKey: String?
     @State private var showProxyRequiredAlert = false
     @State private var showIDEScanSheet = false
     @State private var customProviderSheetMode: CustomProviderSheetMode?
@@ -178,9 +179,9 @@ struct ProvidersScreen: View {
             toolbarContent
         }
         .sheet(item: $selectedProvider) { provider in
-            OAuthSheet(provider: provider) {
+            OAuthSheet(provider: provider, expectedAccountKey: reconnectAccountKey) {
                 selectedProvider = nil
-                viewModel.oauthState = nil
+                reconnectAccountKey = nil
             }
             .environment(viewModel)
         }
@@ -561,7 +562,8 @@ struct ProvidersScreen: View {
             editingWarpToken = nil
             showWarpConnectionSheet = true
         } else {
-            viewModel.oauthState = nil
+            viewModel.cancelOAuth()
+            reconnectAccountKey = nil
             selectedProvider = provider
         }
     }
@@ -593,7 +595,8 @@ struct ProvidersScreen: View {
             .claude, .codex, .copilot, .kiro, .antigravity,
         ]
         if modeManager.isMonitorMode, builtInMonitorLoginProviders.contains(account.provider) {
-            viewModel.oauthState = nil
+            viewModel.cancelOAuth()
+            reconnectAccountKey = account.menuBarAccountKey
             selectedProvider = account.provider
         } else if account.provider.supportsManualAuth {
             handleAddProvider(account.provider)
@@ -737,7 +740,7 @@ struct ProvidersScreen: View {
     }
 }
 
-private struct AccountRecoveryHelpSheet: View {
+struct AccountRecoveryHelpSheet: View {
     let account: AccountRowData
     let onRefresh: () -> Void
     let onDismiss: () -> Void
@@ -1039,44 +1042,47 @@ struct MenuBarHintView: View {
 struct OAuthSheet: View {
     @Environment(QuotaViewModel.self) private var viewModel
     let provider: AIProvider
+    var expectedAccountKey: String? = nil
+    var autoStart: Bool = false
     let onDismiss: () -> Void
-    
+
     @State private var hasStartedAuth = false
     @State private var selectedKiroMethod: AuthCommand = .kiroImport
     @State private var manualOAuthCode = ""
     @State private var modeManager = OperatingModeManager.shared
-    
+
     private var isPolling: Bool {
-        viewModel.oauthState?.status == .polling || viewModel.oauthState?.status == .waiting
+        guard let state = viewModel.oauthState, state.provider == provider else { return false }
+        return [.polling, .waiting, .awaitingCode, .exchanging, .savingCredentials, .verifying].contains(state.status)
     }
-    
+
     private var isSuccess: Bool {
         viewModel.oauthState?.status == .success
     }
-    
+
     private var isError: Bool {
         viewModel.oauthState?.status == .error
     }
-    
+
     private var kiroAuthMethods: [AuthCommand] {
         if modeManager.isMonitorMode { return [.kiroAWSLogin] }
         return [.kiroImport, .kiroGoogleLogin, .kiroAWSAuthCode, .kiroAWSLogin]
     }
-    
+
     var body: some View {
         VStack(spacing: 28) {
             ProviderIcon(provider: provider, size: 64)
-            
+
             VStack(spacing: 8) {
                 Text("oauth.connect".localized() + " " + provider.displayName)
                     .font(.title2)
                     .fontWeight(.bold)
-                
+
                 Text("oauth.authenticateWith".localized() + " " + provider.displayName)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
-            
+
             if provider == .kiro {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("oauth.authMethod".localized())
@@ -1089,14 +1095,14 @@ struct OAuthSheet: View {
                     }
                     .pickerStyle(.menu)
                     .labelsHidden()
-                    
 
                 }
                 .frame(maxWidth: 320)
             }
 
             if !modeManager.isMonitorMode,
-               viewModel.proxyManager.isLegacyAuthWarningNeeded(for: provider) {
+                viewModel.proxyManager.isLegacyAuthWarningNeeded(for: provider)
+            {
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundStyle(.orange)
@@ -1109,48 +1115,66 @@ struct OAuthSheet: View {
                 .background(Color.orange.opacity(0.08))
                 .clipShape(RoundedRectangle(cornerRadius: 10))
             }
-            
+
             if let state = viewModel.oauthState, state.provider == provider {
                 OAuthStatusView(status: state.status, error: state.error, state: state.state, authURL: state.authURL, provider: provider)
                     .transition(.opacity.combined(with: .scale(scale: 0.95)))
             }
 
-            if modeManager.isMonitorMode, provider == .claude, viewModel.oauthState?.status == .polling {
-                HStack(spacing: 8) {
-                    TextField("oauth.authorizationCode".localized(), text: $manualOAuthCode)
+            if modeManager.isMonitorMode, viewModel.oauthState?.acceptsClaudeCode == true {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("oauth.claude.codeInstructions".localized())
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    SecureField("oauth.authorizationCode".localized(), text: $manualOAuthCode)
                         .textFieldStyle(.roundedBorder)
+                        .onSubmit { submitClaudeCode() }
                     Button("oauth.complete".localized()) {
-                        Task { await viewModel.completeMonitorOAuthCode(manualOAuthCode, provider: provider) }
+                        submitClaudeCode()
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(manualOAuthCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
                 .frame(maxWidth: 360)
             }
-            
+
             HStack(spacing: 16) {
                 Button("action.cancel".localized(), role: .cancel) {
                     viewModel.cancelOAuth()
                     onDismiss()
                 }
                 .buttonStyle(.bordered)
-                
-                if isError {
+
+                if viewModel.oauthState?.status == .verificationFailed {
+                    Button("oauth.claude.verifyAgain".localized()) {
+                        Task { await viewModel.retryClaudeLoginVerification() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                } else if isError, viewModel.oauthState?.credentialsReady == true {
+                    Button("oauth.claude.saveAgain".localized()) {
+                        Task { await viewModel.completeMonitorOAuthCode("", provider: provider) }
+                    }
+                    .buttonStyle(.borderedProminent)
+                } else if isError {
                     Button {
                         hasStartedAuth = false
                         Task {
-                            await viewModel.startOAuth(for: provider, authMethod: provider == .kiro ? selectedKiroMethod : nil)
+                            await viewModel.startOAuth(
+                                for: provider, authMethod: provider == .kiro ? selectedKiroMethod : nil,
+                                expectedAccountKey: expectedAccountKey)
                         }
                     } label: {
                         Label("oauth.retry".localized(), systemImage: "arrow.clockwise")
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(.orange)
-                } else if !isSuccess {
+                } else if !isSuccess && viewModel.oauthState?.acceptsClaudeCode != true {
                     Button {
                         hasStartedAuth = true
                         Task {
-                            await viewModel.startOAuth(for: provider, authMethod: provider == .kiro ? selectedKiroMethod : nil)
+                            await viewModel.startOAuth(
+                                for: provider, authMethod: provider == .kiro ? selectedKiroMethod : nil,
+                                expectedAccountKey: expectedAccountKey)
                         }
                     } label: {
                         if isPolling {
@@ -1174,10 +1198,28 @@ struct OAuthSheet: View {
             if newStatus == .success {
                 Task {
                     try? await Task.sleep(nanoseconds: 1_500_000_000)
+                    guard viewModel.oauthState?.provider == provider, viewModel.oauthState?.status == .success else { return }
                     onDismiss()
                 }
             }
         }
+        .task {
+            if autoStart, !hasStartedAuth {
+                hasStartedAuth = true
+                await viewModel.startOAuth(for: provider, expectedAccountKey: expectedAccountKey)
+            }
+        }
+        .onDisappear {
+            manualOAuthCode = ""
+            viewModel.cancelOAuth()
+        }
+    }
+
+    private func submitClaudeCode() {
+        guard !manualOAuthCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let code = manualOAuthCode
+        manualOAuthCode = ""
+        Task { await viewModel.completeMonitorOAuthCode(code, provider: provider) }
     }
 }
 
@@ -1187,13 +1229,13 @@ private struct OAuthStatusView: View {
     let state: String?
     let authURL: String?
     let provider: AIProvider
-    
+
     /// Stable rotation angle for spinner animation (fixes UUID() infinite re-render)
     @State private var rotationAngle: Double = 0
-    
+
     /// Visual feedback for copy action
     @State private var copied = false
-    
+
     var body: some View {
         Group {
             switch status {
@@ -1206,14 +1248,55 @@ private struct OAuthStatusView: View {
                         .foregroundStyle(.secondary)
                 }
                 .padding(.vertical, 16)
-                
+
+            case .awaitingCode:
+                VStack(spacing: 12) {
+                    Text("oauth.claude.awaitingCode".localized())
+                        .font(.headline)
+                    if let authURL, let url = URL(string: authURL) {
+                        HStack {
+                            Button("oauth.copyLink".localized()) {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(authURL, forType: .string)
+                            }
+                            Button("oauth.openLink".localized()) { NSWorkspace.shared.open(url) }
+                                .buttonStyle(.borderedProminent)
+                        }
+                    }
+                }
+                .padding(.vertical, 8)
+
+            case .exchanging, .savingCredentials, .verifying:
+                VStack(spacing: 12) {
+                    ProgressView()
+                    Text((status == .verifying ? "oauth.claude.verifying" : "oauth.claude.saving").localized())
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 16)
+
+            case .verificationFailed:
+                VStack(spacing: 12) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text("oauth.claude.savedButUnavailable".localized())
+                        .font(.headline)
+                    if let error {
+                        Text(error)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                }
+                .padding(.vertical, 16)
+
             case .polling:
                 VStack(spacing: 12) {
                     ZStack {
                         Circle()
                             .stroke(provider.color.opacity(0.2), lineWidth: 4)
                             .frame(width: 60, height: 60)
-                        
+
                         Circle()
                             .trim(from: 0, to: 0.7)
                             .stroke(provider.color, style: StrokeStyle(lineWidth: 4, lineCap: .round))
@@ -1224,19 +1307,19 @@ private struct OAuthStatusView: View {
                                     rotationAngle = 360
                                 }
                             }
-                        
+
                         Image(systemName: "person.badge.key.fill")
                             .font(.title2)
                             .foregroundStyle(provider.color)
                     }
-                    
+
                     // For Copilot Device Code flow, show device code with copy button
                     if (provider == .copilot || provider == .kiro), let deviceCode = state, !deviceCode.isEmpty {
                         VStack(spacing: 8) {
                             Text("oauth.enterCodeInBrowser".localized())
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
-                            
+
                             HStack(spacing: 12) {
                                 Text(deviceCode)
                                     .font(.system(size: 24, weight: .bold, design: .monospaced))
@@ -1245,7 +1328,7 @@ private struct OAuthStatusView: View {
                                     .padding(.vertical, 8)
                                     .background(provider.color.opacity(0.1))
                                     .cornerRadius(8)
-                                
+
                                 Button {
                                     NSPasteboard.general.clearContents()
                                     NSPasteboard.general.setString(deviceCode, forType: .string)
@@ -1256,7 +1339,7 @@ private struct OAuthStatusView: View {
                                 .buttonStyle(.subtle)
                                 .help("action.copyCode".localized())
                             }
-                            
+
                             Text("oauth.waitingForAuth".localized())
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
@@ -1271,14 +1354,14 @@ private struct OAuthStatusView: View {
                         Text("oauth.waitingForAuth".localized())
                             .font(.subheadline)
                             .fontWeight(.medium)
-                        
+
                         // Show auth URL with copy/open buttons
                         if let urlString = authURL, let url = URL(string: urlString) {
                             VStack(spacing: 12) {
                                 Text("oauth.copyLinkOrOpen".localized())
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
-                                
+
                                 HStack(spacing: 12) {
                                     Button {
                                         NSPasteboard.general.clearContents()
@@ -1288,10 +1371,12 @@ private struct OAuthStatusView: View {
                                             copied = false
                                         }
                                     } label: {
-                                        Label(copied ? "oauth.copied".localized() : "oauth.copyLink".localized(), systemImage: copied ? "checkmark" : "doc.on.doc")
+                                        Label(
+                                            copied ? "oauth.copied".localized() : "oauth.copyLink".localized(),
+                                            systemImage: copied ? "checkmark" : "doc.on.doc")
                                     }
                                     .buttonStyle(.bordered)
-                                    
+
                                     Button {
                                         NSWorkspace.shared.open(url)
                                     } label: {
@@ -1309,33 +1394,33 @@ private struct OAuthStatusView: View {
                     }
                 }
                 .padding(.vertical, 16)
-                
+
             case .success:
                 VStack(spacing: 12) {
                     Image(systemName: "checkmark.circle.fill")
                         .font(.system(size: 48))
                         .foregroundStyle(.green)
-                    
+
                     Text("oauth.success".localized())
                         .font(.headline)
                         .foregroundStyle(.green)
-                    
+
                     Text("oauth.closingSheet".localized())
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 .padding(.vertical, 16)
-                
+
             case .error:
                 VStack(spacing: 12) {
                     Image(systemName: "xmark.circle.fill")
                         .font(.system(size: 48))
                         .foregroundStyle(.red)
-                    
+
                     Text("oauth.failed".localized())
                         .font(.headline)
                         .foregroundStyle(.red)
-                    
+
                     if let error = error {
                         Text(error)
                             .font(.caption)
