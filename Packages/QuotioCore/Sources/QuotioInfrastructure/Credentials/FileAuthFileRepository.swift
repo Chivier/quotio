@@ -74,6 +74,17 @@ public actor FileAuthFileRepository: AuthFileRepository {
             return credential(accessToken: token)
         case "kiro":
             return readKiroCredential(json: json, fileURL: url)
+        case "kimi":
+            guard let accessToken = json["access_token"] as? String else { return nil }
+            return AuthFileCredential(
+                accessToken: accessToken,
+                refreshToken: json["refresh_token"] as? String,
+                expiresAt: json["expired"] as? String,
+                clientID: nil,
+                clientSecret: nil,
+                authMethod: nil,
+                extras: (json["device_id"] as? String).map { ["device_id": $0] }
+            )
         default:
             guard let token = json["access_token"] as? String ?? json["token"] as? String else {
                 return nil
@@ -183,6 +194,7 @@ public actor FileAuthFileRepository: AuthFileRepository {
             ("iflow-", "iflow"),
             ("kiro-", "kiro"),
             ("vertex-", "vertex"),
+            ("kimi-", "kimi"),
         ]
         guard let match = prefixes.first(where: { url.lastPathComponent.hasPrefix($0.0) }) else {
             return nil
@@ -374,6 +386,7 @@ public actor FileAuthFileRepository: AuthFileRepository {
             "vertex": "vertex",
             "cursor": "cursor",
             "trae": "trae",
+            "kimi": "kimi",
         ]
         return canonical[type.lowercased()].map(AccountProviderID.init(rawValue:))
     }

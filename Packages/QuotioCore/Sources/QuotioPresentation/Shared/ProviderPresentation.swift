@@ -20,6 +20,8 @@ public extension QuotaProvider {
         case .amp: "Amp"
         case .trae: "Trae"
         case .glm: "Z.ai"
+        case .kimi: "Kimi Code"
+        case .minimax: "MiniMax"
         case .warp: "Warp"
         case .clinePass: "ClinePass"
         }
@@ -43,6 +45,8 @@ public extension QuotaProvider {
         case .amp: "bolt.fill"
         case .trae: "cursorarrow.rays"
         case .glm: "brain"
+        case .kimi: "k.circle.fill"
+        case .minimax: "waveform.path"
         case .warp: "terminal.fill"
         case .clinePass: "cpu"
         }
@@ -66,6 +70,8 @@ public extension QuotaProvider {
         case .amp: "amp"
         case .trae: "trae"
         case .glm: "glm"
+        case .kimi: "kimi"
+        case .minimax: "minimax"
         case .warp: "warp"
         case .clinePass: "clinepass"
         }
@@ -89,6 +95,8 @@ public extension QuotaProvider {
         case .amp: Color(hex: "FF5543") ?? .red
         case .trae: Color(hex: "00B4D8") ?? .cyan
         case .glm: Color(hex: "3B82F6") ?? .blue
+        case .kimi: Color(hex: "1783FF") ?? .blue
+        case .minimax: Color(hex: "E2167E") ?? .pink
         case .warp: Color(hex: "01E5FF") ?? .cyan
         case .clinePass: Color(hex: "61A3FA") ?? .blue
         }
@@ -101,6 +109,7 @@ public extension QuotaProvider {
         case .qwen: "/qwen-auth-url"
         case .iflow: "/iflow-auth-url"
         case .antigravity: "/antigravity-auth-url"
+        case .kimi: "/kimi-auth-url"
         default: ""
         }
     }
@@ -123,6 +132,8 @@ public extension QuotaProvider {
         case .amp: "AM"
         case .trae: "TR"
         case .glm: "G"
+        case .kimi: "K"
+        case .minimax: "MM"
         case .warp: "W"
         case .clinePass: "CL"
         }
@@ -142,6 +153,8 @@ public extension QuotaProvider {
         case .amp: "amp-menubar"
         case .trae: "trae-menubar"
         case .glm: "glm-menubar"
+        case .kimi: "kimi-menubar"
+        case .minimax: "minimax-menubar"
         case .warp: "warp-menubar"
         case .clinePass: "clinepass-menubar"
         case .factoryDroid, .devin, .grok, .openRouter: nil

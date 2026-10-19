@@ -160,7 +160,7 @@ struct AccountRowData: Identifiable, Hashable {
             isDisabled: monitorAccount.isDisabled,
             canDelete: monitorAccount.canDelete,
             canEdit: monitorAccount.source == .quotioKeychain
-                && [.factoryDroid, .openRouter, .amp].contains(monitorAccount.provider)
+                && [.factoryDroid, .openRouter, .amp, .kimi, .minimax].contains(monitorAccount.provider)
         )
     }
 

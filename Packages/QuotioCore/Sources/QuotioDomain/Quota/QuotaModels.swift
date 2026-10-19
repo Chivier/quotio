@@ -17,6 +17,8 @@ public enum QuotaProvider: String, CaseIterable, Codable, Identifiable, Sendable
     case amp
     case trae
     case glm
+    case kimi
+    case minimax
     case warp
     case clinePass = "clinepass"
 
@@ -54,7 +56,7 @@ public enum QuotaProvider: String, CaseIterable, Codable, Identifiable, Sendable
 
     public var usesAPIKeyAuth: Bool {
         switch self {
-        case .glm, .warp, .clinePass, .factoryDroid, .openRouter, .amp:
+        case .glm, .kimi, .minimax, .warp, .clinePass, .factoryDroid, .openRouter, .amp:
             true
         default:
             false
@@ -63,7 +65,7 @@ public enum QuotaProvider: String, CaseIterable, Codable, Identifiable, Sendable
 
     public var isQuotaTrackingOnly: Bool {
         switch self {
-        case .cursor, .trae, .factoryDroid, .devin, .grok, .openRouter, .amp, .warp:
+        case .cursor, .trae, .factoryDroid, .devin, .grok, .openRouter, .amp, .minimax, .warp:
             true
         default:
             false

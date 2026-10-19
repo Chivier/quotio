@@ -1,0 +1,98 @@
+{
+  "kimi.apiKey.hint": {
+    "en": "Stored securely in Keychain. Create a key in the Kimi Code console.",
+    "fr": "Stocké en toute sécurité dans le trousseau. Créez une clé dans la console Kimi Code.",
+    "vi": "Được lưu an toàn trong Keychain. Tạo khóa trong bảng điều khiển Kimi Code.",
+    "zh-Hans": "安全存储在钥匙串中。请在 Kimi Code 控制台创建密钥。"
+  },
+  "kimi.apiKey.label": {
+    "en": "Kimi Code API Key",
+    "fr": "Clé API Kimi Code",
+    "vi": "Khóa API Kimi Code",
+    "zh-Hans": "Kimi Code API 密钥"
+  },
+  "kimi.apiKey.placeholder": {
+    "en": "Enter your Kimi Code API key",
+    "fr": "Saisissez votre clé API Kimi Code",
+    "vi": "Nhập khóa API Kimi Code",
+    "zh-Hans": "输入您的 Kimi Code API 密钥"
+  },
+  "kimi.apiKey.rotateHint": {
+    "en": "Enter a replacement key. The current key is never revealed.",
+    "fr": "Saisissez une clé de remplacement. La clé actuelle n’est jamais révélée.",
+    "vi": "Nhập khóa thay thế. Khóa hiện tại sẽ không bao giờ được hiển thị.",
+    "zh-Hans": "输入替换密钥。当前密钥绝不会显示。"
+  },
+  "kimi.connection.edit": {
+    "en": "Rotate Kimi Code Key",
+    "fr": "Remplacer la clé Kimi Code",
+    "vi": "Thay khóa Kimi Code",
+    "zh-Hans": "更换 Kimi Code 密钥"
+  },
+  "kimi.connection.subtitle": {
+    "en": "Monitor rolling and weekly Kimi Code subscription limits",
+    "fr": "Surveillez les limites glissantes et hebdomadaires de l’abonnement Kimi Code",
+    "vi": "Theo dõi hạn mức định kỳ và hàng tuần của gói Kimi Code",
+    "zh-Hans": "监控 Kimi Code 订阅的滚动窗口和周额度"
+  },
+  "kimi.connection.title": {
+    "en": "Connect Kimi Code",
+    "fr": "Connecter Kimi Code",
+    "vi": "Kết nối Kimi Code",
+    "zh-Hans": "连接 Kimi Code"
+  },
+  "kimi.label.placeholder": {
+    "en": "Personal, Work, …",
+    "fr": "Personnel, Travail, …",
+    "vi": "Cá nhân, Công việc, …",
+    "zh-Hans": "个人、工作、…"
+  },
+  "minimax.apiKey.hint": {
+    "en": "Stored securely in Keychain. Only Token Plan subscription keys can query usage.",
+    "fr": "Stocké en toute sécurité dans le trousseau. Seules les clés d’abonnement Token Plan peuvent consulter l’utilisation.",
+    "vi": "Được lưu an toàn trong Keychain. Chỉ khóa đăng ký Token Plan mới có thể truy vấn mức dùng.",
+    "zh-Hans": "安全存储在钥匙串中。只有 Token Plan 订阅密钥可以查询用量。"
+  },
+  "minimax.apiKey.label": {
+    "en": "MiniMax Subscription Key",
+    "fr": "Clé d’abonnement MiniMax",
+    "vi": "Khóa đăng ký MiniMax",
+    "zh-Hans": "MiniMax 订阅密钥"
+  },
+  "minimax.apiKey.placeholder": {
+    "en": "Enter your sk-cp-… subscription key",
+    "fr": "Saisissez votre clé d’abonnement sk-cp-…",
+    "vi": "Nhập khóa đăng ký sk-cp-…",
+    "zh-Hans": "输入您的 sk-cp-… 订阅密钥"
+  },
+  "minimax.apiKey.rotateHint": {
+    "en": "Enter a replacement key. The current key is never revealed.",
+    "fr": "Saisissez une clé de remplacement. La clé actuelle n’est jamais révélée.",
+    "vi": "Nhập khóa thay thế. Khóa hiện tại sẽ không bao giờ được hiển thị.",
+    "zh-Hans": "输入替换密钥。当前密钥绝不会显示。"
+  },
+  "minimax.connection.edit": {
+    "en": "Rotate MiniMax Subscription Key",
+    "fr": "Remplacer la clé d’abonnement MiniMax",
+    "vi": "Thay khóa đăng ký MiniMax",
+    "zh-Hans": "更换 MiniMax 订阅密钥"
+  },
+  "minimax.connection.subtitle": {
+    "en": "Monitor the 5-hour and weekly MiniMax Token Plan limits",
+    "fr": "Surveillez les limites de 5 heures et hebdomadaires du MiniMax Token Plan",
+    "vi": "Theo dõi hạn mức 5 giờ và hàng tuần của MiniMax Token Plan",
+    "zh-Hans": "监控 MiniMax Token Plan 的 5 小时和周额度"
+  },
+  "minimax.connection.title": {
+    "en": "Connect MiniMax Token Plan",
+    "fr": "Connecter MiniMax Token Plan",
+    "vi": "Kết nối MiniMax Token Plan",
+    "zh-Hans": "连接 MiniMax Token Plan"
+  },
+  "minimax.label.placeholder": {
+    "en": "Personal, Work, …",
+    "fr": "Personnel, Travail, …",
+    "vi": "Cá nhân, Công việc, …",
+    "zh-Hans": "个人、工作、…"
+  }
+}
