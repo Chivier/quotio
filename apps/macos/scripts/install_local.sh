@@ -13,7 +13,8 @@ IDENTITY="${LOCAL_SIGNING_IDENTITY:-Quotio Local Signing}"
 DERIVED_DATA="${PROJECT_DIR}/build/DebugDerivedData"
 BUILT_APP="${DERIVED_DATA}/Build/Products/Debug/Quotio.app"
 TARGET_APP="/Applications/Quotio.app"
-PREVIOUS_APP="/Applications/Quotio.previous.app"
+# Kept outside /Applications so Spotlight and Launchpad show only one Quotio.
+PREVIOUS_APP="${PROJECT_DIR}/build/Quotio.previous.app"
 ENTITLEMENTS="${PROJECT_DIR}/Quotio/Quotio.entitlements"
 
 if ! security find-certificate -c "${IDENTITY}" >/dev/null 2>&1; then
