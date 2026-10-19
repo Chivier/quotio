@@ -17,17 +17,24 @@ public struct QuotaFetchRequest: Equatable, Sendable {
     public let scope: QuotaFetchScope
     public let mode: QuotaOperatingMode
     public let force: Bool
+    /// True only for a refresh the user started for one account. Fetchers may then use
+    /// the user-initiated credential paths, which can present a macOS Keychain prompt to
+    /// regain access to an item this build cannot read. Scheduled and provider-wide
+    /// refreshes must stay prompt-free.
+    public let allowsUserInteraction: Bool
 
     public init(
         provider: QuotaProvider,
         scope: QuotaFetchScope = .provider,
         mode: QuotaOperatingMode,
-        force: Bool = false
+        force: Bool = false,
+        allowsUserInteraction: Bool = false
     ) {
         self.provider = provider
         self.scope = scope
         self.mode = mode
         self.force = force
+        self.allowsUserInteraction = allowsUserInteraction
     }
 }
 
