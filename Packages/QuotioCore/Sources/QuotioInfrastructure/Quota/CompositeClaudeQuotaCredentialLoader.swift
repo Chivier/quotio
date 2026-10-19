@@ -28,20 +28,40 @@ public struct CompositeClaudeQuotaCredentialLoader: ClaudeQuotaCredentialLoading
   }
 
   public func credentials(for mode: QuotaOperatingMode) async -> [ClaudeQuotaCredential] {
+    await credentials(for: QuotaFetchRequest(provider: .claude, mode: mode))
+  }
+
+  public func credentials(for request: QuotaFetchRequest) async -> [ClaudeQuotaCredential] {
     var result: [ClaudeQuotaCredential] = []
-    if mode == .monitor {
-      let disabled = await metadata.disabledAccountIDs()
+    var unreadable: [ClaudeQuotaCredential] = []
+    if request.mode == .monitor {
+      let excluded = await metadata.excludedQuotaAccountIDs()
       for account in await vault.accounts()
       where account.providerID.rawValue == QuotaProvider.claude.rawValue
-        && !account.isDisabled && !disabled.contains(account.id)
+        && !account.isDisabled && !excluded.contains(account.id)
       {
-        guard let credential = await vault.credential(for: account.id) else { continue }
+        var credential = await vault.credential(for: account.id)
+        if credential == nil, request.allowsUserInteraction,
+          case .account(let key) = request.scope, key == account.accountKey
+        {
+          credential = await vault.credentialForUserInitiatedAccess(for: account.id)
+        }
+        guard let credential else {
+          if await vault.credentialState(for: account.id) == .unreadable {
+            unreadable.append(
+              .init(
+                accountKey: account.accountKey, accessToken: "", ownedAccountID: account.id,
+                isReadable: false))
+          }
+          continue
+        }
         result.append(
           .init(
             accountKey: account.accountKey,
             accessToken: credential.accessToken,
             refreshToken: credential.refreshToken,
-            expiresAt: credential.expiresAt
+            expiresAt: credential.expiresAt,
+            ownedAccountID: account.id
           ))
       }
     }
@@ -54,12 +74,16 @@ public struct CompositeClaudeQuotaCredentialLoader: ClaudeQuotaCredentialLoading
     {
       result.append(credential)
     }
-    result.append(contentsOf: await local.credentials(for: mode))
+    result.append(contentsOf: await local.credentials(for: request.mode))
     if let credential = await desktop?.credential() {
       result.append(credential)
     }
 
-    return ClaudeQuotaCredential.uniqueByAccountKey(result)
+    // An unreadable owned account stays visible, but never hides a readable
+    // credential for the same account.
+    let unique = ClaudeQuotaCredential.uniqueByAccountKey(result)
+    let keys = Set(unique.map(\.accountKey))
+    return unique + unreadable.filter { !keys.contains($0.accountKey) }
   }
 
   public func persist(
@@ -68,26 +92,49 @@ public struct CompositeClaudeQuotaCredentialLoader: ClaudeQuotaCredentialLoading
     for credential: ClaudeQuotaCredential,
     mode: QuotaOperatingMode
   ) async {
-    if mode == .monitor,
-      let account = await vault.accounts().first(where: {
-        $0.providerID.rawValue == QuotaProvider.claude.rawValue
-          && $0.accountKey == credential.accountKey
-      }),
-      var stored = await vault.reloadLatest(accountID: account.id),
-      stored.refreshToken == expectedRefreshToken
-    {
-      stored.accessToken = refresh.accessToken
-      stored.refreshToken = refresh.refreshToken ?? expectedRefreshToken
-      stored.expiresAt = refresh.expiresAt ?? stored.expiresAt
-      try? await vault.save(stored, metadata: account)
-      return
-    }
+    _ = await persist(
+      refresh, replacing: expectedRefreshToken, for: credential,
+      request: QuotaFetchRequest(provider: .claude, mode: mode))
+  }
 
-    await local.persist(
-      refresh,
-      replacing: expectedRefreshToken,
-      for: credential,
-      mode: mode
-    )
+  /// A Quotio-owned login is written to the vault only; anything else goes to the
+  /// local loader, which refuses CLI-owned files.
+  public func persist(
+    _ refresh: QuotaTokenRefresh,
+    replacing expectedRefreshToken: String,
+    for credential: ClaudeQuotaCredential,
+    request: QuotaFetchRequest
+  ) async -> Bool {
+    guard let accountID = credential.ownedAccountID else {
+      guard credential.allowsRefresh else { return false }
+      return await local.persist(
+        refresh, replacing: expectedRefreshToken, for: credential, request: request)
+    }
+    guard let account = await vault.accounts().first(where: { $0.id == accountID }) else {
+      return false
+    }
+    var stored: StoredCredential
+    if let latest = await vault.reloadLatest(accountID: accountID) {
+      // A newer login or another client's rotation already replaced the token.
+      guard latest.refreshToken == expectedRefreshToken else { return false }
+      stored = latest
+    } else {
+      stored = StoredCredential(
+        accessToken: credential.accessToken, refreshToken: expectedRefreshToken, idToken: nil,
+        accountID: nil, expiresAt: credential.expiresAt, extra: [:])
+    }
+    stored.accessToken = refresh.accessToken
+    stored.refreshToken = refresh.refreshToken ?? expectedRefreshToken
+    stored.expiresAt = refresh.expiresAt ?? stored.expiresAt
+    do {
+      if request.allowsUserInteraction {
+        try await vault.saveUserInitiated(stored, metadata: account)
+      } else {
+        try await vault.save(stored, metadata: account)
+      }
+      return true
+    } catch {
+      return false
+    }
   }
 }

@@ -15,16 +15,24 @@ public struct ClaudeQuotaCredential: Equatable, Sendable {
   /// as dead, so renewing on its behalf can sign the user out. See
   /// ``ClaudeCredentialOwnership``.
   public let allowsRefresh: Bool
+  /// The vault account ID of a login Quotio owns; rotations go to the vault only.
+  public let ownedAccountID: String?
+  /// `false` for a Quotio-owned account whose stored item exists but cannot be read
+  /// without user interaction. It keeps the row visible and lets a rotation the
+  /// fetcher still holds in memory serve it.
+  public let isReadable: Bool
 
   public init(
     accountKey: String, accessToken: String, refreshToken: String? = nil, expiresAt: Date? = nil,
-    allowsRefresh: Bool = true
+    allowsRefresh: Bool = true, ownedAccountID: String? = nil, isReadable: Bool = true
   ) {
     self.accountKey = accountKey
     self.accessToken = accessToken
     self.refreshToken = refreshToken
     self.expiresAt = expiresAt
     self.allowsRefresh = allowsRefresh
+    self.ownedAccountID = ownedAccountID
+    self.isReadable = isReadable
   }
 
   /// Keeps one credential per account without letting an external read-only
@@ -49,7 +57,8 @@ public struct ClaudeQuotaCredential: Equatable, Sendable {
           accessToken: credential.accessToken,
           refreshToken: credential.refreshToken,
           expiresAt: credential.expiresAt,
-          allowsRefresh: false
+          allowsRefresh: false,
+          ownedAccountID: credential.ownedAccountID
         )
       }
       if let index = positions[credential.accountKey] {
@@ -73,21 +82,46 @@ public struct ClaudeQuotaCredential: Equatable, Sendable {
 
 public protocol ClaudeQuotaCredentialLoading: Sendable {
   func credentials(for mode: QuotaOperatingMode) async -> [ClaudeQuotaCredential]
+  /// Credentials for one fetch. A user-started single-account request may use the
+  /// prompting vault read; every other request must stay prompt-free.
+  func credentials(for request: QuotaFetchRequest) async -> [ClaudeQuotaCredential]
   func persist(
     _ refresh: QuotaTokenRefresh,
     replacing expectedRefreshToken: String,
     for credential: ClaudeQuotaCredential,
     mode: QuotaOperatingMode
   ) async
+  /// Writes a rotated credential back to its owner and reports whether it was
+  /// stored. A `false` result means the caller still holds the only copy.
+  func persist(
+    _ refresh: QuotaTokenRefresh,
+    replacing expectedRefreshToken: String,
+    for credential: ClaudeQuotaCredential,
+    request: QuotaFetchRequest
+  ) async -> Bool
 }
 
 extension ClaudeQuotaCredentialLoading {
+  public func credentials(for request: QuotaFetchRequest) async -> [ClaudeQuotaCredential] {
+    await credentials(for: request.mode)
+  }
+
   public func persist(
     _ refresh: QuotaTokenRefresh,
     replacing expectedRefreshToken: String,
     for credential: ClaudeQuotaCredential,
     mode: QuotaOperatingMode
   ) async {}
+
+  public func persist(
+    _ refresh: QuotaTokenRefresh,
+    replacing expectedRefreshToken: String,
+    for credential: ClaudeQuotaCredential,
+    request: QuotaFetchRequest
+  ) async -> Bool {
+    await persist(refresh, replacing: expectedRefreshToken, for: credential, mode: request.mode)
+    return true
+  }
 }
 
 public struct LocalClaudeQuotaCredentialLoader: ClaudeQuotaCredentialLoading {
@@ -120,16 +154,31 @@ public struct LocalClaudeQuotaCredentialLoader: ClaudeQuotaCredentialLoading {
     for credential: ClaudeQuotaCredential,
     mode: QuotaOperatingMode
   ) async {
-    for path in credentialPaths() {
-      if Self.persist(
+    _ = writeBack(refresh, replacing: expectedRefreshToken, for: credential)
+  }
+
+  public func persist(
+    _ refresh: QuotaTokenRefresh,
+    replacing expectedRefreshToken: String,
+    for credential: ClaudeQuotaCredential,
+    request: QuotaFetchRequest
+  ) async -> Bool {
+    writeBack(refresh, replacing: expectedRefreshToken, for: credential)
+  }
+
+  private func writeBack(
+    _ refresh: QuotaTokenRefresh,
+    replacing expectedRefreshToken: String,
+    for credential: ClaudeQuotaCredential
+  ) -> Bool {
+    credentialPaths().contains { path in
+      Self.persist(
         refresh,
         replacing: expectedRefreshToken,
         for: credential,
         path: path,
         environment: environment
-      ) {
-        return
-      }
+      )
     }
   }
 
@@ -379,6 +428,24 @@ public actor ClaudeQuotaFetcher: QuotaFetching {
   private let session: any QuotaHTTPSession
   private let now: @Sendable () -> Date
   private var cache: [String: (quota: ProviderQuota, date: Date)] = [:]
+  /// Actor reentrancy must never spend one single-use refresh token twice.
+  private var inFlight: [String: Task<ProviderQuota?, Never>] = [:]
+  /// Rotations whose write-back failed, keyed by account key. The rotated token is
+  /// the only valid one, so it serves the account and is re-persisted until its
+  /// owner accepts it.
+  private var pendingRefreshes: [String: PendingRefresh] = [:]
+
+  private struct PendingRefresh: Sendable {
+    let original: String
+    let refresh: QuotaTokenRefresh
+    let credential: ClaudeQuotaCredential
+  }
+
+  private enum RefreshFailure: Error {
+    /// The token endpoint rejected the refresh token; only a new login helps.
+    case rejected
+    case unavailable
+  }
 
   public init(
     credentials: any ClaudeQuotaCredentialLoading = LocalClaudeQuotaCredentialLoader(),
@@ -392,7 +459,7 @@ public actor ClaudeQuotaFetcher: QuotaFetching {
   }
 
   public func fetch(_ request: QuotaFetchRequest) async throws -> QuotaProviderOutput {
-    let loaded = await credentials.credentials(for: request.mode).filter {
+    let loaded = await credentials.credentials(for: request).filter {
       Self.includes($0.accountKey, scope: request.scope)
     }
     var quotas: [String: ProviderQuota] = [:]
@@ -403,7 +470,7 @@ public actor ClaudeQuotaFetcher: QuotaFetching {
         quotas[credential.accountKey] = cached.quota
         continue
       }
-      if let quota = await fetchQuota(credential, mode: request.mode) {
+      if let quota = await deduplicatedQuota(credential, request: request) {
         quotas[credential.accountKey] = quota
         if !quota.isForbidden { cache[credential.accountKey] = (quota, now()) }
       }
@@ -453,6 +520,19 @@ public actor ClaudeQuotaFetcher: QuotaFetching {
     return metrics.isEmpty ? nil : ProviderQuota(models: metrics, lastUpdated: now)
   }
 
+  private func deduplicatedQuota(
+    _ credential: ClaudeQuotaCredential,
+    request: QuotaFetchRequest
+  ) async -> ProviderQuota? {
+    let key = credential.accountKey
+    if let task = inFlight[key] { return await task.value }
+    let task = Task { await self.fetchQuota(credential, request: request) }
+    inFlight[key] = task
+    let quota = await task.value
+    inFlight.removeValue(forKey: key)
+    return quota
+  }
+
   /// Quota for one Claude credential.
   ///
   /// A credential Quotio does not own is read-only: its refresh token is never
@@ -461,43 +541,49 @@ public actor ClaudeQuotaFetcher: QuotaFetching {
   /// dead on `invalid_grant`, so renewing on its behalf can sign the user out of
   /// Claude Code. An expired access token there simply yields no fresh quota
   /// until the CLI renews it itself, which is the correct outcome for an observer.
+  ///
+  /// Only HTTP 401 means the access token expired. A 403 is a permission answer
+  /// that a refresh cannot change, so it never spends a refresh token.
   private func fetchQuota(
     _ original: ClaudeQuotaCredential,
-    mode: QuotaOperatingMode
+    request: QuotaFetchRequest
   ) async -> ProviderQuota? {
-    var credential = original
-    var token = credential.accessToken
+    guard var credential = await applyingPendingRefresh(to: original, request: request) else {
+      return cache[original.accountKey]?.quota
+    }
+    var didRefresh = false
     if credential.allowsRefresh, let expiry = credential.expiresAt,
       expiry.timeIntervalSince(now()) < 60,
-      let refresh = credential.refreshToken,
-      let refreshed = try? await refreshToken(refresh)
+      let refresh = credential.refreshToken
     {
-      await credentials.persist(
-        refreshed,
-        replacing: refresh,
-        for: credential,
-        mode: mode
-      )
-      credential = Self.applying(refreshed, to: credential)
-      token = refreshed.accessToken
+      didRefresh = true
+      // A failed proactive refresh does not invalidate a still-usable access token.
+      if let refreshed = try? await refreshToken(refresh) {
+        credential = await adopt(refreshed, replacing: refresh, for: credential, request: request)
+      }
     }
-    var response = try? await usage(token: token)
-    if credential.allowsRefresh, let status = response?.1.statusCode,
-      status == 401 || status == 403,
-      let latest = await credentials.credentials(for: mode).first(where: {
-        $0.accountKey == credential.accountKey
-      }),
-      latest.allowsRefresh,
-      let refresh = latest.refreshToken,
-      let refreshed = try? await refreshToken(refresh)
-    {
-      await credentials.persist(
-        refreshed,
-        replacing: refresh,
-        for: latest,
-        mode: mode
-      )
-      response = try? await usage(token: refreshed.accessToken)
+    var response = try? await usage(token: credential.accessToken)
+    if credential.allowsRefresh, response?.1.statusCode == 401 {
+      if let reloaded = await credentials.credentials(for: request).first(where: {
+        $0.accountKey == credential.accountKey && $0.isReadable
+      }), reloaded.allowsRefresh,
+        let latest = await applyingPendingRefresh(to: reloaded, request: request),
+        latest.accessToken != credential.accessToken
+      {
+        credential = latest
+        response = try? await usage(token: credential.accessToken)
+      }
+      if response?.1.statusCode == 401, !didRefresh, let refresh = credential.refreshToken {
+        do {
+          let refreshed = try await refreshToken(refresh)
+          credential = await adopt(refreshed, replacing: refresh, for: credential, request: request)
+          response = try? await usage(token: credential.accessToken)
+        } catch RefreshFailure.rejected {
+          return forbidden(credential)
+        } catch {
+          return cache[credential.accountKey]?.quota
+        }
+      }
     }
     guard let (data, http) = response else { return cache[credential.accountKey]?.quota }
     if http.statusCode == 401 || http.statusCode == 403 {
@@ -506,10 +592,61 @@ public actor ClaudeQuotaFetcher: QuotaFetching {
       // ask the user to sign in to Quotio for a credential Quotio does not
       // manage, so fall back to cached data instead.
       guard credential.allowsRefresh else { return cache[credential.accountKey]?.quota }
-      return ProviderQuota(lastUpdated: now(), isForbidden: true)
+      return forbidden(credential)
     }
     guard 200...299 ~= http.statusCode else { return cache[credential.accountKey]?.quota }
     return Self.mapUsage(data, now: now()) ?? cache[credential.accountKey]?.quota
+  }
+
+  /// Keeps the last successful values, flagged as needing a new login.
+  private func forbidden(_ credential: ClaudeQuotaCredential) -> ProviderQuota {
+    var quota = cache[credential.accountKey]?.quota ?? ProviderQuota(lastUpdated: now())
+    quota.isForbidden = true
+    return quota
+  }
+
+  /// Persists a rotation and always returns the rotated credential: the old refresh
+  /// token is spent, so the new one must serve this request even if its owner
+  /// refused the write. A refused write is retried on the next fetch.
+  private func adopt(
+    _ refreshed: QuotaTokenRefresh,
+    replacing refreshToken: String,
+    for credential: ClaudeQuotaCredential,
+    request: QuotaFetchRequest
+  ) async -> ClaudeQuotaCredential {
+    let rotated = Self.applying(refreshed, to: credential)
+    if await credentials.persist(
+      refreshed, replacing: refreshToken, for: credential, request: request)
+    {
+      pendingRefreshes.removeValue(forKey: credential.accountKey)
+    } else {
+      pendingRefreshes[credential.accountKey] = PendingRefresh(
+        original: refreshToken, refresh: refreshed, credential: rotated)
+    }
+    return rotated
+  }
+
+  /// The credential to use for `loaded`, preferring a rotation that could not be
+  /// written yet. `nil` when an unreadable owned account has nothing in memory.
+  private func applyingPendingRefresh(
+    to loaded: ClaudeQuotaCredential,
+    request: QuotaFetchRequest
+  ) async -> ClaudeQuotaCredential? {
+    guard let pending = pendingRefreshes[loaded.accountKey] else {
+      return loaded.isReadable ? loaded : nil
+    }
+    // A new login or another client's rotation always takes precedence.
+    if loaded.isReadable, loaded.refreshToken != pending.original {
+      pendingRefreshes.removeValue(forKey: loaded.accountKey)
+      return loaded
+    }
+    let target = loaded.isReadable ? loaded : pending.credential
+    if await credentials.persist(
+      pending.refresh, replacing: pending.original, for: target, request: request)
+    {
+      pendingRefreshes.removeValue(forKey: loaded.accountKey)
+    }
+    return pending.credential
   }
 
   private func usage(token: String) async throws -> (Data, HTTPURLResponse) {
@@ -534,17 +671,24 @@ public actor ClaudeQuotaFetcher: QuotaFetching {
       "grant_type": "refresh_token", "refresh_token": refresh,
       "client_id": Self.clientID, "scope": Self.refreshScope,
     ])
-    let (data, response) = try await session.data(for: request)
-    guard let http = response as? HTTPURLResponse, 200...299 ~= http.statusCode,
-      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-      let access = json["access_token"] as? String
-    else { throw InfrastructureQuotaFetchError.forbidden }
-    let expiry = (json["expires_in"] as? NSNumber).map {
+    guard let (data, response) = try? await session.data(for: request),
+      let http = response as? HTTPURLResponse
+    else { throw RefreshFailure.unavailable }
+    let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    if http.statusCode == 401
+      || (http.statusCode == 400 && json?["error"] as? String == "invalid_grant")
+    {
+      throw RefreshFailure.rejected
+    }
+    guard 200...299 ~= http.statusCode, let access = json?["access_token"] as? String else {
+      throw RefreshFailure.unavailable
+    }
+    let expiry = (json?["expires_in"] as? NSNumber).map {
       now().addingTimeInterval($0.doubleValue)
     }
     return QuotaTokenRefresh(
       accessToken: access,
-      refreshToken: json["refresh_token"] as? String,
+      refreshToken: json?["refresh_token"] as? String,
       expiresAt: expiry
     )
   }
@@ -558,7 +702,8 @@ public actor ClaudeQuotaFetcher: QuotaFetching {
       accessToken: refresh.accessToken,
       refreshToken: refresh.refreshToken ?? credential.refreshToken,
       expiresAt: refresh.expiresAt ?? credential.expiresAt,
-      allowsRefresh: credential.allowsRefresh
+      allowsRefresh: credential.allowsRefresh,
+      ownedAccountID: credential.ownedAccountID
     )
   }
 
