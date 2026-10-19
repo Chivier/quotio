@@ -252,7 +252,8 @@ enum CompositionRoot {
             coordinator: QuotaRefreshCoordinator(
                 registry: registry,
                 snapshots: PersistentQuotaSnapshotStore(),
-                clock: SystemDateProvider()
+                clock: SystemDateProvider(),
+                visibility: metadataRepository
             )
         )
         let dashboardScreenModel = DashboardScreenModel(
@@ -695,7 +696,8 @@ private final class ProductionAppRuntimeServices: AppRuntimeServices {
                     await quotaController.refresh(provider: provider)
                 },
                 refreshAccount: { [quotaController] account in
-                    await quotaController.refresh(account: account)
+                    // A click on one account's refresh control is a direct user action.
+                    await quotaController.refresh(account: account, allowsCredentialAccessPrompt: true)
                 },
                 toggleProxy: { [proxyManagement] in
                     await proxyManagement.toggleProxy()
@@ -836,7 +838,8 @@ private final class ProductionAppRuntimeServices: AppRuntimeServices {
             activeAntigravityEmail: antigravityAccountScreenModel.snapshot.activeAccount?.email,
             menuBarPreferences: menuBarSettings.preferences,
             appearanceMode: appearanceManager.appearanceMode,
-            language: languageManager.currentLanguage
+            language: languageManager.currentLanguage,
+            accountStatusMessages: quotaController.menuStatusMessages()
         )
     }
 
@@ -857,11 +860,14 @@ private final class ProductionAppRuntimeServices: AppRuntimeServices {
                    accountQuotas: accountQuotas
                ) {
                 isForbidden = quotaData.isForbidden
-                if !quotaData.models.isEmpty {
-                    let models = quotaData.models.map { (name: $0.name, percentage: $0.percentage) }
-                    displayPercent = menuBarSettings.totalUsagePercent(models: models)
+                if !isForbidden {
+                    displayPercent = menuBarSettings.totalUsagePercent(for: quotaData)
                     if menuBarSettings.stackPairedQuotaMetrics {
-                        quotaPair = MenuBarQuotaPair.resolve(for: provider, from: quotaData.models)
+                        quotaPair = MenuBarQuotaPair.resolve(
+                            for: provider,
+                            from: quotaData.models,
+                            aggregationMode: menuBarSettings.modelAggregationMode
+                        )
                     }
                 }
             }

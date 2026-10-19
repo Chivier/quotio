@@ -22,6 +22,30 @@ public protocol AccountManaging: Sendable {
         apiKey: String,
         existingAccountID: String?
     ) async throws
+
+    /// Removes an account from Quotio. A Quotio-owned credential is deleted; a credential
+    /// owned by another app or CLI is only hidden and stays untouched at its source.
+    func remove(accountID: String) async throws
+    @discardableResult
+    func restoreRemovedAccounts() async -> Int
+    func removedAccountCount() async -> Int
+    /// Credential state of every Quotio-owned account, keyed by account ID.
+    func credentialStates() async -> [String: StoredCredentialState]
+    /// Asks macOS for access to an owned credential this build cannot read. Must only be
+    /// called in direct response to a user action.
+    func restoreCredentialAccess(accountID: String) async -> Bool
+}
+
+extension AccountManaging {
+    public func remove(accountID: String) async throws {
+        try await delete(accountID: accountID)
+    }
+
+    @discardableResult
+    public func restoreRemovedAccounts() async -> Int { 0 }
+    public func removedAccountCount() async -> Int { 0 }
+    public func credentialStates() async -> [String: StoredCredentialState] { [:] }
+    public func restoreCredentialAccess(accountID: String) async -> Bool { false }
 }
 
 public actor AccountService: AccountManaging {
@@ -60,6 +84,38 @@ public actor AccountService: AccountManaging {
             throw AccountServiceFailure.deletionNotAllowed
         }
         await credentialVault.delete(accountID: accountID)
+    }
+
+    public func remove(accountID: String) async throws {
+        // A row restored from a quota snapshot may no longer be discoverable; hiding its
+        // identity still keeps a later refresh from bringing it back.
+        let account = await discovery.discoverAccounts().first { $0.id == accountID }
+        if let account, account.canDelete, account.source == .quotioKeychain {
+            await credentialVault.delete(accountID: accountID)
+        } else {
+            try await metadataRepository.setRemoved(true, accountID: accountID)
+        }
+    }
+
+    @discardableResult
+    public func restoreRemovedAccounts() async -> Int {
+        (try? await metadataRepository.restoreRemovedAccounts()) ?? 0
+    }
+
+    public func removedAccountCount() async -> Int {
+        await metadataRepository.removedAccountIDs().count
+    }
+
+    public func credentialStates() async -> [String: StoredCredentialState] {
+        var states: [String: StoredCredentialState] = [:]
+        for account in await credentialVault.accounts() where account.source == .quotioKeychain {
+            states[account.id] = await credentialVault.credentialState(for: account.id)
+        }
+        return states
+    }
+
+    public func restoreCredentialAccess(accountID: String) async -> Bool {
+        await credentialVault.credentialForUserInitiatedAccess(for: accountID) != nil
     }
 
     public func saveAPIKey(
@@ -122,7 +178,9 @@ public actor AccountService: AccountManaging {
             )
         }
 
-        try await credentialVault.save(
+        // Entering a key is an explicit user action: it may rebuild a Keychain item that
+        // an older build owns, and it restores an account the user removed earlier.
+        try await credentialVault.saveUserInitiated(
             StoredCredential(
                 accessToken: trimmedKey,
                 refreshToken: nil,

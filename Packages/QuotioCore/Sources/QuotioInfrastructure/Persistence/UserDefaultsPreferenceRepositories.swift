@@ -78,7 +78,7 @@ public final class UserDefaultsMenuBarPreferencesRepository: MenuBarPreferencesR
             stackPairedQuotaMetrics: defaults.bool(forKey: "menuBarStackClaudeQuotaWindows"),
             hideSensitiveInfo: defaults.bool(forKey: "hideSensitiveInfo"),
             totalUsageMode: TotalUsageMode(rawValue: defaults.string(forKey: "totalUsageMode") ?? "") ?? .sessionOnly,
-            modelAggregationMode: ModelAggregationMode(rawValue: defaults.string(forKey: "modelAggregationMode") ?? "") ?? .lowest,
+            modelAggregationMode: ModelAggregationMode(rawValue: defaults.string(forKey: "modelAggregationMode") ?? "") ?? .average,
             hasUserModifiedMenuBar: defaults.bool(forKey: "hasUserModifiedMenuBar")
         )
     }

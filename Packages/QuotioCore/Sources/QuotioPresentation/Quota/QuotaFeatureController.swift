@@ -111,15 +111,46 @@ public final class QuotaFeatureController {
         await finishRefresh()
     }
 
-    public func refresh(account: QuotaAccountID) async {
+    /// - Parameter allowsCredentialAccessPrompt: true only when the user pressed the
+    ///   refresh control for this account; the fetcher may then ask macOS for access to
+    ///   a credential this build cannot read in the background.
+    public func refresh(account: QuotaAccountID, allowsCredentialAccessPrompt: Bool = false) async {
         guard account.provider.supportsQuotaOnlyMode else { return }
         await quota.refresh(
             provider: account.provider,
             scope: .account(account.accountKey),
             mode: operatingMode,
-            force: true
+            force: true,
+            allowsUserInteraction: allowsCredentialAccessPrompt
         )
         await finishRefresh()
+    }
+
+    /// Regains access to an owned credential whose Keychain item is bound to another
+    /// build, then refreshes that account. Runs only from an explicit user action.
+    func restoreCredentialAccess(for account: QuotaAccountID) async {
+        if let stored = storedAccount(for: account) {
+            _ = await accounts.restoreCredentialAccess(accountID: stored.id)
+        }
+        await refresh(account: account, allowsCredentialAccessPrompt: true)
+    }
+
+    func restoreRemovedAccounts() async {
+        guard await accounts.restoreRemovedAccounts() > 0 else { return }
+        await refreshAll(force: true)
+    }
+
+    var removedAccountCount: Int { accounts.removedAccountCount }
+
+    func isCredentialUnreadable(_ account: QuotaAccountID) -> Bool {
+        storedAccount(for: account).map(accounts.isCredentialUnreadable) ?? false
+    }
+
+    private func storedAccount(for account: QuotaAccountID) -> Account? {
+        accounts.accounts.first {
+            $0.providerID.rawValue == account.provider.rawValue
+                && $0.accountKey.caseInsensitiveCompare(account.accountKey) == .orderedSame
+        }
     }
 
     func refreshAutoDetectedProviders() async {
@@ -150,15 +181,21 @@ public final class QuotaFeatureController {
         return quota.providerQuotas[provider] ?? [:]
     }
 
+    /// Every account row can be removed. An owned credential is deleted; one owned by
+    /// another app or CLI is hidden in Quotio and left untouched at its source.
     func remove(account: QuotaAccountID) async {
-        if let storedAccount = accounts.accounts.first(where: {
-            $0.providerID.rawValue == account.provider.rawValue && $0.accountKey == account.accountKey
-        }), storedAccount.canDelete {
+        if let storedAccount = storedAccount(for: account) {
             if storedAccount.source == .localIDE {
+                // Imported IDE rows exist only as quota data; dropping it deletes them.
                 await accounts.setDisabled(false, accountID: storedAccount.id)
             } else {
-                try? await accounts.delete(accountID: storedAccount.id)
+                try? await accounts.remove(accountID: storedAccount.id)
             }
+        } else if operatingMode == .monitor {
+            try? await accounts.remove(accountID: AccountIdentity.make(
+                providerID: AccountProviderID(rawValue: account.provider.rawValue),
+                accountKey: account.accountKey
+            ).id)
         }
         await quota.removeQuota(for: account, mode: operatingMode)
         await finishRefresh()
@@ -238,18 +275,30 @@ public final class QuotaFeatureController {
     func monitorStatus(for account: Account) -> (status: String?, message: String?) {
         guard let provider = QuotaProvider(rawValue: account.providerID.rawValue) else { return (nil, nil) }
         let accountID = QuotaAccountID(provider: provider, accountKey: account.accountKey)
-        let updated = QuotaPolicy.lastUpdated(for: accountID, in: quota.providerQuotas)
+        let current = quota.providerQuotas[provider]?[account.accountKey]
+        let updated = current?.lastUpdated
+        // A Quotio-owned API key does not expire because a quota endpoint is briefly
+        // unavailable; only an explicit 401/403 proves the credential needs attention.
+        let hasStoredAPIKey = provider.usesAPIKeyAuth && account.source == .quotioKeychain
+        if current?.isForbidden == true {
+            return ("error", "monitor.status.authenticationRequired".localized())
+        }
+        if accounts.isCredentialUnreadable(account) {
+            return ("error", "monitor.status.credentialUnreadable".localized())
+        }
         if let issue = quota.state.accountIssues[accountID], updated == nil || updated! <= issue.occurredAt {
-            return ("outdated", message(for: issue))
+            return (hasStoredAPIKey ? "ready" : "outdated", message(for: issue))
         }
-        if let issue = quota.state.issues[provider], updated == nil || updated! <= issue.occurredAt {
-            return ("outdated", message(for: issue))
+        // A partial provider refresh records the affected accounts individually above.
+        if let issue = quota.state.issues[provider], issue.kind == .failed,
+           updated == nil || updated! <= issue.occurredAt {
+            return (hasStoredAPIKey ? "ready" : "outdated", message(for: issue))
         }
-        guard let updated else { return (nil, nil) }
+        guard let updated else { return hasStoredAPIKey ? ("ready", nil) : (nil, nil) }
         let staleAfter = refreshSettings.refreshCadence.intervalSeconds ?? 600
         if Date().timeIntervalSince(updated) > staleAfter {
             return (
-                "outdated",
+                hasStoredAPIKey ? "ready" : "outdated",
                 String(format: "monitor.status.outdated".localized(), updated.formatted(date: .abbreviated, time: .shortened))
             )
         }
@@ -257,6 +306,18 @@ public final class QuotaFeatureController {
             "ready",
             String(format: "monitor.status.updated".localized(), updated.formatted(date: .omitted, time: .shortened))
         )
+    }
+
+    /// Status lines for menu-bar rows whose account is not in a healthy state.
+    public func menuStatusMessages() -> [QuotaAccountID: String] {
+        guard operatingMode == .monitor else { return [:] }
+        var messages: [QuotaAccountID: String] = [:]
+        for account in accounts.accounts where !account.isDisabled {
+            let status = monitorStatus(for: account)
+            guard status.status != "ready", let message = status.message else { continue }
+            messages[QuotaAccountID(provider: account.provider, accountKey: account.accountKey)] = message
+        }
+        return messages
     }
 
     func synchronizeMenuBarSelection() {
@@ -326,6 +387,9 @@ public final class QuotaFeatureController {
     private func finishRefresh() async {
         await reloadAccounts()
         await removeDisabledMonitorQuotas()
+        if operatingMode == .monitor {
+            await quota.purgeExcludedAccounts(mode: operatingMode)
+        }
         checkQuotaNotifications()
         synchronizeMenuBarSelection()
         didChangeHandler?()

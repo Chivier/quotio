@@ -67,14 +67,21 @@ public final class QuotaScreenModel {
         provider: QuotaProvider,
         scope: QuotaFetchScope = .provider,
         mode: QuotaOperatingMode,
-        force: Bool = false
+        force: Bool = false,
+        allowsUserInteraction: Bool = false
     ) async {
         resetObservation(to: await coordinator.refresh(QuotaFetchRequest(
             provider: provider,
             scope: scope,
             mode: mode,
-            force: force
+            force: force,
+            allowsUserInteraction: allowsUserInteraction
         )))
+    }
+
+    public func purgeExcludedAccounts(mode: QuotaOperatingMode) async {
+        await coordinator.purgeExcludedAccounts(mode: mode)
+        resetObservation(to: await coordinator.snapshot)
     }
 
     public func refreshAll(

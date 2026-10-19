@@ -219,3 +219,9 @@ public actor FileAccountMetadataRepository: AccountMetadataRepository {
         try SecureAtomicFileWriter.write(try JSONEncoder().encode(payload), to: url)
     }
 }
+
+extension FileAccountMetadataRepository: QuotaAccountVisibilityProviding {
+    public func excludedAccountIDs() async -> Set<String> {
+        await excludedQuotaAccountIDs()
+    }
+}

@@ -510,6 +510,67 @@ final class QuotaRefreshCoordinatorTests: XCTestCase {
         XCTAssertTrue(saves.isEmpty)
     }
 
+    func testPartialRefreshMarksOnlyTheAccountsThatFailed() async {
+        let fetcher = StubQuotaFetcher(provider: .codex, outputs: [
+            QuotaProviderOutput(
+                quotas: ["fresh": Self.quota(80)],
+                credentialAvailability: .present,
+                credentialAccountKeys: ["fresh", "failed"]
+            ),
+        ])
+        let store = MemoryQuotaStore(initial: QuotaSnapshot(quotas: [
+            .codex: ["fresh": Self.quota(10), "failed": Self.quota(20)],
+        ]))
+        let coordinator = makeCoordinator(fetchers: [fetcher], store: store)
+        _ = await coordinator.bootstrap(mode: .monitor)
+
+        let snapshot = await coordinator.refresh(QuotaFetchRequest(provider: .codex, mode: .monitor))
+
+        XCTAssertEqual(snapshot.accountIssues[QuotaAccountID(provider: .codex, accountKey: "failed")]?.kind, .partial)
+        XCTAssertNil(snapshot.accountIssues[QuotaAccountID(provider: .codex, accountKey: "fresh")])
+    }
+
+    func testRenamedKeyWithEqualCountIsStillReportedAsPartial() async {
+        let fetcher = StubQuotaFetcher(provider: .copilot, outputs: [
+            QuotaProviderOutput(quotas: ["new-key": Self.quota(80)]),
+        ])
+        let store = MemoryQuotaStore(initial: QuotaSnapshot(quotas: [
+            .copilot: ["old-key": Self.quota(30)],
+        ]))
+        let coordinator = makeCoordinator(fetchers: [fetcher], store: store)
+        _ = await coordinator.bootstrap(mode: .monitor)
+
+        let snapshot = await coordinator.refresh(QuotaFetchRequest(provider: .copilot, mode: .monitor))
+
+        XCTAssertEqual(snapshot.issues[.copilot]?.kind, .partial)
+        XCTAssertEqual(snapshot.accountIssues[QuotaAccountID(provider: .copilot, accountKey: "old-key")]?.kind, .partial)
+    }
+
+    func testExcludedAccountsAreDroppedFromSnapshotsAndFetches() async {
+        let hidden = AccountIdentity.make(providerID: AccountProviderID(rawValue: "codex"), accountKey: "hidden@example.com").id
+        let fetcher = StubQuotaFetcher(provider: .codex, outputs: [
+            QuotaProviderOutput(quotas: [
+                "hidden@example.com": Self.quota(70),
+                "kept@example.com": Self.quota(60),
+            ]),
+        ])
+        let store = MemoryQuotaStore(initial: QuotaSnapshot(quotas: [
+            .codex: ["Hidden@example.com": Self.quota(10)],
+        ]))
+        let coordinator = QuotaRefreshCoordinator(
+            registry: QuotaProviderRegistry([fetcher]),
+            snapshots: store,
+            clock: TestClock(now: Date(timeIntervalSince1970: 1_000)),
+            visibility: StaticVisibility(excluded: [hidden])
+        )
+
+        let bootstrapped = await coordinator.bootstrap(mode: .monitor)
+        XCTAssertNil(bootstrapped.quotas[.codex], "A snapshot must not resurrect a removed account")
+
+        let refreshed = await coordinator.refresh(QuotaFetchRequest(provider: .codex, mode: .monitor))
+        XCTAssertEqual(Set(refreshed.quotas[.codex]?.keys ?? [:].keys), ["kept@example.com"])
+    }
+
     private func makeCoordinator(
         fetchers: [any QuotaFetching],
         store: MemoryQuotaStore = MemoryQuotaStore(),
@@ -620,4 +681,9 @@ private actor CompletionFlag {
 
 private enum TestError: Error {
     case failed
+}
+
+private struct StaticVisibility: QuotaAccountVisibilityProviding {
+    let excluded: Set<String>
+    func excludedAccountIDs() async -> Set<String> { excluded }
 }

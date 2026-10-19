@@ -7,6 +7,58 @@ import XCTest
 
 @MainActor
 final class StatusBarMenuSnapshotMapperTests: XCTestCase {
+    static let metrics = [QuotaMetric(name: "seven-day-weekly", percentage: 60, resetTime: "")]
+
+    func testProvidersWithOnlyEmptyRowsAreHidden() {
+        let snapshot = StatusBarMenuSnapshotMapper.makeSnapshot(
+            mode: .monitor,
+            proxyPort: 8317,
+            isProxyRunning: false,
+            tunnel: CloudflareTunnelSnapshot(),
+            directAuthProviders: [],
+            monitorAccounts: [Account.make(
+                providerID: AccountProviderID(rawValue: QuotaProvider.grok.rawValue),
+                accountKey: "pending@example.com",
+                source: .nativeCredential
+            )],
+            quota: QuotaSnapshot(quotas: [.claude: ["empty": ProviderQuota()]]),
+            installedAgents: [],
+            activeAntigravityEmail: nil,
+            menuBarPreferences: MenuBarPreferences(),
+            appearanceMode: .system,
+            language: .english
+        )
+
+        XCTAssertTrue(snapshot.providers.isEmpty)
+    }
+
+    func testDisabledTrackedAccountHidesItsQuotaRow() {
+        let rows = StatusBarMenuSnapshotMapper.accountRows(
+            quotaRows: [
+                (accountKey: "Off@example.com", email: "off@example.com", data: ProviderQuota(models: Self.metrics)),
+                (accountKey: "on@example.com", email: "on@example.com", data: ProviderQuota(models: Self.metrics)),
+            ],
+            trackedAccounts: [
+                Account.make(
+                    providerID: AccountProviderID(rawValue: "codex"),
+                    accountKey: "off@example.com",
+                    source: .nativeCredential,
+                    status: .disabled
+                ),
+                Account.make(
+                    providerID: AccountProviderID(rawValue: "codex"),
+                    accountKey: "failing@example.com",
+                    source: .quotioKeychain
+                ),
+            ],
+            provider: .codex,
+            statusMessages: [QuotaAccountID(provider: .codex, accountKey: "FAILING@example.com"): "Keychain access required"]
+        )
+
+        XCTAssertEqual(rows.map(\.accountKey), ["on@example.com", "failing@example.com"])
+        XCTAssertEqual(rows.last?.statusMessage, "Keychain access required")
+    }
+
     func testMonitorSnapshotMapsProvidersAccountsStateAndDisplaySettings() throws {
         let enabledMonitorAccount = Account.make(
             providerID: AccountProviderID(rawValue: QuotaProvider.amp.rawValue),
@@ -32,11 +84,11 @@ final class StatusBarMenuSnapshotMapperTests: XCTestCase {
         let quota = QuotaSnapshot(
             quotas: [
                 .antigravity: [
-                    "alpha-key": ProviderQuota(accountDisplayName: "alpha@example.com"),
-                    "zulu-key": ProviderQuota(accountDisplayName: "Zulu@example.com"),
+                    "alpha-key": ProviderQuota(models: Self.metrics, accountDisplayName: "alpha@example.com"),
+                    "zulu-key": ProviderQuota(models: Self.metrics, accountDisplayName: "Zulu@example.com"),
                 ],
                 .claude: [
-                    "claude-key": ProviderQuota(accountDisplayName: "claude@example.com"),
+                    "claude-key": ProviderQuota(models: Self.metrics, accountDisplayName: "claude@example.com"),
                 ],
             ],
             refreshingProviders: [.antigravity]
@@ -54,21 +106,29 @@ final class StatusBarMenuSnapshotMapperTests: XCTestCase {
             proxyPort: 8317,
             isProxyRunning: true,
             tunnel: tunnel,
-            directAuthProviders: [.antigravity, .claude],
+            directAuthProviders: [.antigravity, .claude, .copilot],
             monitorAccounts: [enabledMonitorAccount, disabledMonitorAccount],
             quota: quota,
             installedAgents: [],
             activeAntigravityEmail: "zulu@example.com",
             menuBarPreferences: preferences,
             appearanceMode: .dark,
-            language: .vietnamese
+            language: .vietnamese,
+            accountStatusMessages: [
+                QuotaAccountID(provider: .amp, accountKey: "monitor@example.com"): "Sign in again",
+            ]
         )
 
         XCTAssertFalse(snapshot.isLocalProxyMode)
         XCTAssertEqual(snapshot.proxyPort, 8317)
         XCTAssertTrue(snapshot.isProxyRunning)
         XCTAssertEqual(snapshot.tunnel, tunnel)
+        // Raw auth files (Copilot) do not add providers in Monitor mode, and the disabled
+        // Codex account is not listed.
         XCTAssertEqual(snapshot.providers.map(\.provider), [.amp, .antigravity, .claude])
+        let amp = try XCTUnwrap(snapshot.providers.first { $0.provider == .amp })
+        XCTAssertNil(amp.accounts.first?.quota, "A tracked account without quota keeps its row")
+        XCTAssertEqual(amp.accounts.first?.statusMessage, "Sign in again")
         XCTAssertEqual(snapshot.selectedProvider, .amp)
         XCTAssertTrue(snapshot.isLoadingQuotas)
         XCTAssertEqual(snapshot.displaySettings.quotaDisplayMode, .remaining)
@@ -98,7 +158,11 @@ final class StatusBarMenuSnapshotMapperTests: XCTestCase {
             tunnel: CloudflareTunnelSnapshot(),
             directAuthProviders: [.antigravity, .claude, .codex],
             monitorAccounts: [],
-            quota: QuotaSnapshot(),
+            quota: QuotaSnapshot(quotas: [
+                .antigravity: ["a": ProviderQuota(models: Self.metrics)],
+                .claude: ["c": ProviderQuota(models: Self.metrics)],
+                .codex: ["x": ProviderQuota(models: Self.metrics)],
+            ]),
             installedAgents: [.codexCLI],
             activeAntigravityEmail: nil,
             menuBarPreferences: MenuBarPreferences(selectedProvider: .claude),
@@ -114,6 +178,8 @@ final class StatusBarMenuSnapshotMapperTests: XCTestCase {
 
 @MainActor
 final class StatusBarMenuRendererTests: XCTestCase {
+    static let metrics = StatusBarMenuSnapshotMapperTests.metrics
+
     func testSelectedProviderRendersOnlyItsAccountGroup() {
         let unfiltered = makeSnapshot(selectedProvider: nil)
         let filtered = makeSnapshot(selectedProvider: .claude)
@@ -130,8 +196,9 @@ final class StatusBarMenuRendererTests: XCTestCase {
 
         let unfilteredItems = unfilteredMenu.items.filter { !$0.isHidden }
         let filteredItems = filteredMenu.items.filter { !$0.isHidden }
-        XCTAssertEqual(unfilteredItems.count, 11)
-        XCTAssertEqual(unfilteredItems.filter(\.isSeparatorItem).count, 4)
+        // Compact layout: no separators between provider groups.
+        XCTAssertEqual(unfilteredItems.count, 10)
+        XCTAssertEqual(unfilteredItems.filter(\.isSeparatorItem).count, 3)
         XCTAssertEqual(filteredItems.count, 7)
         XCTAssertEqual(filteredItems.filter(\.isSeparatorItem).count, 3)
     }
@@ -171,10 +238,10 @@ final class StatusBarMenuRendererTests: XCTestCase {
             monitorAccounts: [],
             quota: QuotaSnapshot(quotas: [
                 .claude: [
-                    "claude-key": ProviderQuota(accountDisplayName: "claude@example.com"),
+                    "claude-key": ProviderQuota(models: Self.metrics, accountDisplayName: "claude@example.com"),
                 ],
                 .codex: [
-                    "codex-key": ProviderQuota(accountDisplayName: "codex@example.com"),
+                    "codex-key": ProviderQuota(models: Self.metrics, accountDisplayName: "codex@example.com"),
                 ],
             ]),
             installedAgents: [],

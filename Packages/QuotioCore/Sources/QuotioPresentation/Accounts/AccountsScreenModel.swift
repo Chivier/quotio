@@ -9,6 +9,10 @@ public final class AccountsScreenModel {
     public private(set) var accounts: [Account] = []
     public private(set) var authFiles: [AuthFileDescriptor] = []
     public private(set) var failure: AccountServiceFailure?
+    /// Owned accounts whose stored credential exists but cannot be read by this build.
+    /// A previous quota may still be visible, so the problem must stay explicit.
+    public private(set) var unreadableCredentialAccountIDs: Set<String> = []
+    public private(set) var removedAccountCount = 0
 
     @ObservationIgnored private var accountAliases: [QuotaProvider: [String: String]] = [:]
     @ObservationIgnored private let accountService: any AccountManaging
@@ -24,6 +28,7 @@ public final class AccountsScreenModel {
 
     public func reloadAccounts() async {
         accounts = canonicalized(await accountService.accounts())
+        await reloadCredentialStates()
     }
 
     public func reloadAccounts(
@@ -35,6 +40,43 @@ public final class AccountsScreenModel {
             canonicalized(await accountService.accounts()),
             quotas: quotas
         )
+        await reloadCredentialStates()
+    }
+
+    public func isCredentialUnreadable(_ account: Account) -> Bool {
+        unreadableCredentialAccountIDs.contains(account.id)
+    }
+
+    private func reloadCredentialStates() async {
+        let states = await accountService.credentialStates()
+        unreadableCredentialAccountIDs = Set(states.compactMap { $0.value == .unreadable ? $0.key : nil })
+        removedAccountCount = await accountService.removedAccountCount()
+    }
+
+    /// Hides an externally owned account, or deletes a Quotio-owned one.
+    public func remove(accountID: String) async throws {
+        do {
+            try await accountService.remove(accountID: accountID)
+            await reloadAccounts()
+            failure = nil
+        } catch let error as AccountServiceFailure {
+            failure = error
+            throw error
+        }
+    }
+
+    @discardableResult
+    public func restoreRemovedAccounts() async -> Int {
+        let restored = await accountService.restoreRemovedAccounts()
+        await reloadAccounts()
+        return restored
+    }
+
+    /// Must only run in direct response to a user action; it may show a macOS prompt.
+    public func restoreCredentialAccess(accountID: String) async -> Bool {
+        let restored = await accountService.restoreCredentialAccess(accountID: accountID)
+        await reloadCredentialStates()
+        return restored
     }
 
     private func canonicalized(_ candidates: [Account]) -> [Account] {

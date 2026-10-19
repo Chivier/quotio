@@ -124,7 +124,7 @@ final class StatusBarMenuRenderer {
             menu.addItem(viewItem(for: pickerView))
             menu.addItem(NSMenuItem.separator())
 
-            for (index, providerSnapshot) in providers.enumerated() {
+            for providerSnapshot in providers {
                 let headerView = MenuProviderSectionHeader(
                     provider: providerSnapshot.provider,
                     isRefreshing: providerSnapshot.isRefreshing,
@@ -153,13 +153,6 @@ final class StatusBarMenuRenderer {
                         )
                         menu.addItem(cardItem)
                     }
-                }
-
-                // Separator between provider groups (not after the last one)
-                if index < providers.count - 1 {
-                    let separator = NSMenuItem.separator()
-                    providerFilterController.register(separator, scope: .allProvidersOnly)
-                    menu.addItem(separator)
                 }
             }
 
@@ -223,6 +216,7 @@ final class StatusBarMenuRenderer {
             accountKey: account.id.accountKey,
             email: account.email,
             data: account.quota,
+            statusMessage: account.statusMessage,
             provider: provider,
             subscriptionInfo: account.subscription,
             isActiveInIDE: account.isActiveInIDE,
@@ -238,16 +232,15 @@ final class StatusBarMenuRenderer {
         )
 
         let item = viewItem(for: cardView)
+        guard let quota = account.quota else { return item }
 
         let isAntigravitySummary = provider == .antigravity
-            && account.quota.models.contains { $0.name.hasPrefix("antigravity-") }
+            && quota.models.contains { $0.name.hasPrefix("antigravity-") }
 
-        if provider == .codex, let analytics = account.quota.analytics, !analytics.isEmpty {
-            let submenu = buildCodexAnalyticsSubmenu(analytics: analytics)
-            item.submenu = submenu
-        } else if provider == .antigravity && !account.quota.models.isEmpty && !isAntigravitySummary {
-            let submenu = buildAntigravitySubmenu(data: account.quota)
-            item.submenu = submenu
+        if provider == .codex, let analytics = quota.analytics, !analytics.isEmpty {
+            item.submenu = buildCodexAnalyticsSubmenu(analytics: analytics)
+        } else if provider == .antigravity && !quota.models.isEmpty && !isAntigravitySummary {
+            item.submenu = buildAntigravitySubmenu(data: quota)
         }
 
         return item
@@ -653,7 +646,8 @@ private struct MenuNetworkInfoView: View {
 private struct MenuAccountCardView: View {
     let accountKey: String
     let email: String
-    let data: ProviderQuota
+    let data: ProviderQuota?
+    let statusMessage: String?
     let provider: QuotaProvider
     let subscriptionInfo: QuotaSubscriptionInfo?
     let isActiveInIDE: Bool
@@ -670,6 +664,8 @@ private struct MenuAccountCardView: View {
     private var displayEmail: String {
         email.masked(if: settings.hideSensitiveInfo)
     }
+
+    private var quotaModels: [QuotaMetric] { data?.models ?? [] }
     
     // Modern Tier Badge Config
     private var tierConfig: (name: String, bgColor: Color, textColor: Color)? {
@@ -690,12 +686,12 @@ private struct MenuAccountCardView: View {
             return (info.tierDisplayName, .secondary.opacity(0.1), .secondary)
         }
         
-        if provider == .codex, let planName = codexPlanDisplayName(data.planType) {
+        if provider == .codex, let planName = codexPlanDisplayName(data?.planType) {
             let config = planConfig(for: planName)
             return (planName, config.bgColor, config.textColor)
         }
 
-        guard let planName = data.planDisplayName else { return nil }
+        guard let planName = data?.planDisplayName else { return nil }
         return planConfig(for: planName)
     }
 
@@ -763,12 +759,12 @@ private struct MenuAccountCardView: View {
     }
     
     private var isAntigravity: Bool {
-        provider == .antigravity && !data.models.isEmpty
+        provider == .antigravity && !quotaModels.isEmpty
     }
     
     private var antigravityGroups: [AntigravityDisplayGroup] {
         guard isAntigravity else { return [] }
-        let summaryModels = data.models.filter { $0.name.hasPrefix("antigravity-") }
+        let summaryModels = quotaModels.filter { $0.name.hasPrefix("antigravity-") }
         if !summaryModels.isEmpty {
             return summaryModels
                 .map { AntigravityDisplayGroup(name: $0.displayName, percentage: $0.percentage, resetTime: $0.resetTime) }
@@ -776,7 +772,7 @@ private struct MenuAccountCardView: View {
 
         var groups: [AntigravityDisplayGroup] = []
 
-        let gemini3ProModels = data.models.filter {
+        let gemini3ProModels = quotaModels.filter {
             $0.name.contains("gemini-3-pro") && !$0.name.contains("image")
         }
         if !gemini3ProModels.isEmpty {
@@ -785,21 +781,21 @@ private struct MenuAccountCardView: View {
             groups.append(AntigravityDisplayGroup(name: "Gemini 3 Pro", percentage: aggregatedPercent, resetTime: minModel?.resetTime))
         }
 
-        let gemini3FlashModels = data.models.filter { $0.name.contains("gemini-3-flash") }
+        let gemini3FlashModels = quotaModels.filter { $0.name.contains("gemini-3-flash") }
         if !gemini3FlashModels.isEmpty {
             let aggregatedPercent = settings.aggregateModelPercentages(gemini3FlashModels.map(\.percentage))
             let minModel = gemini3FlashModels.min(by: { $0.percentage < $1.percentage })
             groups.append(AntigravityDisplayGroup(name: "Gemini 3 Flash", percentage: aggregatedPercent, resetTime: minModel?.resetTime))
         }
 
-        let geminiImageModels = data.models.filter { $0.name.contains("image") }
+        let geminiImageModels = quotaModels.filter { $0.name.contains("image") }
         if !geminiImageModels.isEmpty {
             let aggregatedPercent = settings.aggregateModelPercentages(geminiImageModels.map(\.percentage))
             let minModel = geminiImageModels.min(by: { $0.percentage < $1.percentage })
             groups.append(AntigravityDisplayGroup(name: "Gemini 3 Image", percentage: aggregatedPercent, resetTime: minModel?.resetTime))
         }
 
-        let claudeModels = data.models.filter { $0.name.contains("claude") }
+        let claudeModels = quotaModels.filter { $0.name.contains("claude") }
         if !claudeModels.isEmpty {
             let aggregatedPercent = settings.aggregateModelPercentages(claudeModels.map(\.percentage))
             let minModel = claudeModels.min(by: { $0.percentage < $1.percentage })
@@ -810,38 +806,53 @@ private struct MenuAccountCardView: View {
     }
     
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 8) {
             headerSection
-            
             quotaContentSection
-            
-            footerSection
         }
-        .padding(12)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
         .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(isHovered ? Color.secondary.opacity(0.08) : Color.secondary.opacity(0.04))
         )
         .padding(.horizontal, 8)
-        .padding(.vertical, 4)
+        .padding(.vertical, 2)
         .onHover { isHovered = $0 }
     }
     
     // MARK: - Header
     
     private var headerSection: some View {
-        HStack(alignment: .center, spacing: 8) {
+        HStack(alignment: .center, spacing: 7) {
             // Provider Icon
             ProviderIconMono(provider: provider, size: 16)
                 .foregroundStyle(.secondary)
                 .opacity(0.8)
-            
-            // Email
-            Text(displayEmail)
-                .font(.system(size: 13, weight: .medium, design: .rounded))
-                .foregroundStyle(.primary)
-                .lineLimit(1)
-            
+
+            // Keep freshness attached to the account identity instead of spending a
+            // separate footer row on the same timestamp in every card.
+            VStack(alignment: .leading, spacing: 1) {
+                Text(displayEmail)
+                    .font(.system(size: 13, weight: .medium, design: .rounded))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+
+                if let data {
+                    HStack(spacing: 3) {
+                        Image(systemName: "clock")
+                            .font(.system(size: 8, weight: .medium))
+                        Text(data.lastUpdated.formatted(
+                            .relative(presentation: .numeric, unitsStyle: .abbreviated)
+                        ))
+                        .lineLimit(1)
+                    }
+                    .font(.system(size: 9, design: .rounded))
+                    .foregroundStyle(.tertiary)
+                }
+            }
+            .layoutPriority(1)
+
             Spacer()
 
             Button(action: onRefresh) {
@@ -859,6 +870,7 @@ private struct MenuAccountCardView: View {
             .buttonStyle(.plain)
             .disabled(!canRefresh)
             .help("action.refreshQuota".localized())
+            .accessibilityLabel("action.refreshQuota".localized())
             
             // Tier Badge
             if let config = tierConfig {
@@ -924,41 +936,53 @@ private struct MenuAccountCardView: View {
         let isCardStyle = displayStyle == .card
         let models: [ModelBadgeData] = {
             if isAntigravity {
-                return antigravityGroups.map { ModelBadgeData(name: $0.name, percentage: $0.percentage, resetTime: $0.resetTime) }
+                return antigravityGroups.map { ModelBadgeData(name: $0.name, percentage: $0.percentage, resetTime: $0.resetTime, lastUpdated: data?.lastUpdated) }
             } else {
-                let meterModels = data.models.filter { !$0.isStandaloneMetric }.map {
-                    ModelBadgeData(name: $0.displayName, percentage: $0.percentage, resetTime: $0.resetTime)
+                let meterModels = quotaModels.filter { !$0.isStandaloneMetric }.map {
+                    ModelBadgeData(name: $0.displayName, percentage: $0.percentage, resetTime: $0.resetTime, lastUpdated: data?.lastUpdated)
                 }
                 guard isCardStyle else { return meterModels }
-                let standaloneModels = data.models.filter(\.isStandaloneMetric).map {
-                    ModelBadgeData(name: $0.displayName, percentage: $0.percentage, resetTime: $0.resetTime, usage: $0.formattedUsage)
+                let standaloneModels = quotaModels.filter(\.isStandaloneMetric).map {
+                    ModelBadgeData(name: $0.displayName, percentage: $0.percentage, resetTime: $0.resetTime, lastUpdated: data?.lastUpdated, usage: $0.formattedUsage)
                 }
                 return meterModels + standaloneModels
             }
         }()
-        let standaloneModels = isAntigravity || isCardStyle ? [] : data.models.filter(\.isStandaloneMetric)
+        let standaloneModels = isAntigravity || isCardStyle ? [] : quotaModels.filter(\.isStandaloneMetric)
         let factorySections = provider == .factoryDroid
-            ? FactoryDroidQuotaSection.sections(from: data.models.filter { !$0.isStandaloneMetric })
+            ? FactoryDroidQuotaSection.sections(from: quotaModels.filter { !$0.isStandaloneMetric })
             : []
         
-        return VStack(spacing: 8) {
+        return VStack(spacing: 6) {
             if models.isEmpty && standaloneModels.isEmpty {
-                Text("dashboard.noQuotaData".localized())
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                    .frame(maxWidth: .infinity, alignment: .center)
-                    .padding(.vertical, 8)
+                HStack(spacing: 6) {
+                    Image(systemName: statusMessage == nil ? "info.circle" : "exclamationmark.circle")
+                        .font(.system(size: 10, weight: .medium))
+                    Text(statusMessage ?? "dashboard.noQuotaData".localized())
+                        .font(.system(size: 10, design: .rounded))
+                        .lineLimit(2)
+                }
+                .foregroundStyle(Color.secondary.opacity(statusMessage == nil ? 0.65 : 1))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 2)
             } else if !factorySections.isEmpty {
                 ForEach(factorySections) { section in
                     VStack(alignment: .leading, spacing: 6) {
                         FactoryDroidMenuSectionHeader(title: section.title)
                         quotaLayout(models: section.models.map {
-                            ModelBadgeData(name: $0.displayName, percentage: $0.percentage, resetTime: $0.resetTime)
+                            ModelBadgeData(name: $0.displayName, percentage: $0.percentage, resetTime: $0.resetTime, lastUpdated: data?.lastUpdated)
                         })
                     }
                 }
             } else if !models.isEmpty {
                 quotaLayout(models: models)
+            }
+            if let statusMessage, data != nil, !(models.isEmpty && standaloneModels.isEmpty) {
+                Label(statusMessage, systemImage: "exclamationmark.circle")
+                    .font(.system(size: 10, design: .rounded))
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             ForEach(standaloneModels) { model in
@@ -971,8 +995,7 @@ private struct MenuAccountCardView: View {
                         .font(.system(size: 10, weight: .semibold, design: .monospaced))
                         .foregroundStyle(.primary)
                 }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 5)
+                .padding(.vertical, 2)
                 .menuNativeTooltip(model.tooltip ?? "")
             }
         }
@@ -990,27 +1013,13 @@ private struct MenuAccountCardView: View {
         }
     }
     
-    // MARK: - Footer
-
-    private var footerSection: some View {
-        HStack(spacing: 12) {
-            // Reset info is now shown inside each metric, so only show last update here
-            Spacer()
-
-            // Last Update
-            Text(data.lastUpdated.formatted(.relative(presentation: .named)))
-                .font(.system(size: 10, design: .rounded))
-                .foregroundStyle(.secondary)
-        }
-    }
-    
     private var displayStyle: QuotaDisplayStyle { settings.quotaDisplayStyle }
     
     private var primaryResetModel: QuotaMetric? {
         let formatter = ISO8601DateFormatter()
         let now = Date()
         
-        let validModels = data.models.filter { model in
+        let validModels = quotaModels.filter { model in
             guard let date = formatter.date(from: model.resetTime) else { return false }
             return date > now
         }
@@ -1815,45 +1824,70 @@ private struct ModelBadgeData: Identifiable {
     let name: String
     let percentage: Double
     let resetTime: String?
+    let lastUpdated: Date?
     let usage: String?
 
-    init(name: String, percentage: Double, resetTime: String?, usage: String? = nil) {
+    init(
+        name: String,
+        percentage: Double,
+        resetTime: String?,
+        lastUpdated: Date? = nil,
+        usage: String? = nil
+    ) {
         self.name = name
         self.percentage = percentage
         self.resetTime = resetTime
+        self.lastUpdated = lastUpdated
         self.usage = usage
     }
 
     var id: String { name }
 
+    var resetState: QuotaResetState {
+        QuotaResetState.evaluate(resetTime: resetTime ?? "", lastUpdated: lastUpdated)
+    }
+
+    /// Countdown until the window resets, or nil when unknown or already passed.
     var formattedResetTime: String? {
-        guard let resetTime = resetTime else { return nil }
+        guard case .upcoming = resetState else { return nil }
+        return resetState.compactLabel
+    }
+}
 
-        // Try parsing with fractional seconds first, then standard format
-        let isoFormatterWithFractional = ISO8601DateFormatter()
-        isoFormatterWithFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+/// Reset countdown, or an explicit note that the window reset after this quota was
+/// fetched. Hiding a passed reset made week-old usage look current.
+private struct MenuResetLabel: View {
+    let model: ModelBadgeData
+    var fontSize: CGFloat = 9
+    var showsIcon = true
 
-        let isoFormatterStandard = ISO8601DateFormatter()
-        isoFormatterStandard.formatOptions = [.withInternetDateTime]
-
-        guard let date = isoFormatterWithFractional.date(from: resetTime)
-              ?? isoFormatterStandard.date(from: resetTime) else { return nil }
-
-        let now = Date()
-        let diff = date.timeIntervalSince(now)
-        guard diff > 0 else { return nil }
-
-        let totalMinutes = Int(diff) / 60
-        let days = totalMinutes / 1440  // 24 * 60
-        let hours = (totalMinutes % 1440) / 60
-        let minutes = totalMinutes % 60
-
-        if days > 0 {
-            return "\(days)d\(hours)h"
-        } else if hours > 0 {
-            return "\(hours)h\(minutes)m"
-        } else {
-            return "\(minutes)m"
+    var body: some View {
+        switch model.resetState {
+        case .upcoming:
+            if let label = model.resetState.compactLabel {
+                HStack(spacing: 3) {
+                    if showsIcon {
+                        Image(systemName: "clock.arrow.circlepath")
+                            .font(.system(size: fontSize - 1, weight: .medium))
+                    }
+                    Text(label)
+                        .font(.system(size: fontSize, design: .rounded))
+                        .lineLimit(1)
+                }
+                .foregroundStyle(.tertiary)
+            }
+        case .passedSinceFetch:
+            HStack(spacing: 3) {
+                Image(systemName: "arrow.clockwise.circle")
+                    .font(.system(size: fontSize - 1, weight: .medium))
+                Text("quota.reset.passed".localized())
+                    .font(.system(size: fontSize, weight: .medium, design: .rounded))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(.orange)
+            .help("quota.reset.passedHelp".localized())
+        case .unknown:
+            EmptyView()
         }
     }
 }
@@ -1877,17 +1911,26 @@ private func menuPercentText(remainingPercent: Double, displayMode: QuotaDisplay
     return "\(Int(menuDisplayPercent(remainingPercent: remainingPercent, displayMode: displayMode)))%"
 }
 
+/// System green is too light for small text on the light menu background; use a darker
+/// tone there while keeping the vivid one in dark mode.
+private let menuHealthyGreen = Color(nsColor: NSColor(name: nil) { appearance in
+    let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+    return isDark
+        ? NSColor(srgbRed: 0.29, green: 0.82, blue: 0.43, alpha: 1)
+        : NSColor(srgbRed: 0.03, green: 0.32, blue: 0.15, alpha: 1)
+})
+
 private func menuStatusColor(remainingPercent: Double, displayMode: QuotaDisplayMode) -> Color {
-    guard remainingPercent >= 0 else { return .secondary }
+    guard remainingPercent.isFinite, (0...100).contains(remainingPercent) else { return .secondary }
     let usedPercent = 100 - remainingPercent
     let checkValue = displayMode == .used ? usedPercent : remainingPercent
 
     if displayMode == .used {
-        if checkValue < 70 { return .green }
+        if checkValue < 70 { return menuHealthyGreen }
         if checkValue < 90 { return .yellow }
         return .red
     } else {
-        if checkValue > 50 { return .green }
+        if checkValue > 50 { return menuHealthyGreen }
         if checkValue > 20 { return .orange }
         return .red
     }
@@ -1912,10 +1955,10 @@ private struct LowestBarLayout: View {
     }
 
     var body: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 6) {
             if let lowest = lowest {
                 // Hero Row for Lowest with reset time
-                VStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: 4) {
                     HStack {
                         Text(lowest.name)
                             .font(.system(size: 12, weight: .semibold, design: .rounded))
@@ -1930,32 +1973,17 @@ private struct LowestBarLayout: View {
 
                     ModernProgressBar(
                         percentage: lowest.percentage,
-                        height: 8,
+                        height: 5,
                         displayMode: displayMode
                     )
 
-                    if let resetTime = lowest.formattedResetTime {
-                        HStack(spacing: 4) {
-                            Image(systemName: "clock.arrow.circlepath")
-                                .font(.system(size: 9))
-                            Text(resetTime)
-                                .font(.system(size: 9, weight: .medium, design: .rounded))
-                        }
-                        .foregroundStyle(.tertiary)
-                    }
+                    MenuResetLabel(model: lowest)
                 }
-                .padding(8)
-                .background(menuStatusColor(remainingPercent: lowest.percentage, displayMode: displayMode).opacity(0.08))
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                        .stroke(menuStatusColor(remainingPercent: lowest.percentage, displayMode: displayMode).opacity(0.2), lineWidth: 1)
-                )
             }
 
             // Others as text rows (one per line)
             if !others.isEmpty {
-                VStack(spacing: 4) {
+                VStack(spacing: 3) {
                     ForEach(others, id: \.name) { (model: ModelBadgeData) in
                         HStack(spacing: 6) {
                             Text(model.name)
@@ -1963,16 +1991,12 @@ private struct LowestBarLayout: View {
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
                             Spacer()
-                            if let resetTime = model.formattedResetTime {
-                                Text(resetTime)
-                                    .font(.system(size: 9, design: .rounded))
-                                    .foregroundStyle(.tertiary)
-                            }
+                            MenuResetLabel(model: model, showsIcon: false)
                             Text(menuPercentText(remainingPercent: model.percentage, displayMode: displayMode))
                                 .font(.system(size: 10, weight: .bold, design: .monospaced))
                                 .foregroundStyle(menuStatusColor(remainingPercent: model.percentage, displayMode: displayMode))
                         }
-                        .padding(.vertical, 2)
+                        .padding(.vertical, 1)
                     }
                 }
             }
@@ -1993,14 +2017,14 @@ private struct RingGridLayout: View {
     }
 
     private var ringSize: CGFloat {
-        columnCount >= 4 ? 36 : 40
+        columnCount >= 4 ? 32 : 36
     }
 
     var body: some View {
         // Auto-distribute 1-4 columns, cap at 4
-        LazyVGrid(columns: columns, spacing: 10) {
+        LazyVGrid(columns: columns, spacing: 6) {
             ForEach(models, id: \.name) { (model: ModelBadgeData) in
-                VStack(spacing: 4) {
+                VStack(spacing: 3) {
                     RingProgressView(percent: menuDisplayPercent(remainingPercent: model.percentage, displayMode: displayMode), size: ringSize, lineWidth: 4, tint: menuStatusColor(remainingPercent: model.percentage, displayMode: displayMode), showLabel: true)
 
                     Text(model.name)
@@ -2009,11 +2033,7 @@ private struct RingGridLayout: View {
                         .lineLimit(1)
                         .minimumScaleFactor(0.8)
 
-                    if let resetTime = model.formattedResetTime {
-                        Text(resetTime)
-                            .font(.system(size: 8, design: .rounded))
-                            .foregroundStyle(.tertiary)
-                    }
+                    MenuResetLabel(model: model, fontSize: 8, showsIcon: false)
                 }
                 .frame(maxWidth: .infinity)
             }
@@ -2025,56 +2045,48 @@ private struct CardGridLayout: View {
     let models: [ModelBadgeData]
     let displayMode: QuotaDisplayMode
 
-    private var columns: [GridItem] {
-        // Single metric: full width. Multiple: 2 columns
-        if models.count == 1 {
-            return [GridItem(.flexible())]
-        } else {
-            return [GridItem(.flexible()), GridItem(.flexible())]
-        }
-    }
-    
     var body: some View {
-        LazyVGrid(columns: columns, spacing: 8) {
-            ForEach(models, id: \.name) { (model: ModelBadgeData) in
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text(model.name)
-                            .font(.system(size: 10, weight: .medium, design: .rounded))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                        Spacer()
-                        if let resetTime = model.formattedResetTime {
-                            Text(resetTime)
-                                .font(.system(size: 9, design: .rounded))
-                                .foregroundStyle(.tertiary)
-                        }
-                        if let usage = model.usage {
-                            Text(usage)
-                                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                .foregroundStyle(.primary)
-                        } else {
-                            Text(menuPercentText(remainingPercent: model.percentage, displayMode: displayMode))
-                                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                .foregroundStyle(menuStatusColor(remainingPercent: model.percentage, displayMode: displayMode))
-                        }
-                    }
+        Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 7) {
+            ForEach(0..<((models.count + 2) / 3), id: \.self) { row in
+                GridRow(alignment: .top) {
+                    ForEach(row * 3..<min(row * 3 + 3, models.count), id: \.self) { index in
+                        let model = models[index]
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                                Text(model.name)
+                                    .font(.system(size: 9, weight: .medium, design: .rounded))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                                Spacer(minLength: 2)
+                                if let usage = model.usage {
+                                    Text(usage)
+                                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                        .foregroundStyle(.primary)
+                                } else {
+                                    Text(menuPercentText(remainingPercent: model.percentage, displayMode: displayMode))
+                                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                        .foregroundStyle(menuStatusColor(remainingPercent: model.percentage, displayMode: displayMode))
+                                }
+                            }
 
-                    if model.usage == nil {
-                        ModernProgressBar(
-                            percentage: model.percentage,
-                            height: 4,
-                            displayMode: displayMode
-                        )
+                            if model.usage == nil {
+                                ModernProgressBar(
+                                    percentage: model.percentage,
+                                    height: 3,
+                                    displayMode: displayMode
+                                )
+                            }
+
+                            MenuResetLabel(model: model, fontSize: 8)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .menuNativeTooltip(model.name)
                     }
                 }
-                .padding(8)
-                .background(Color.secondary.opacity(0.05))
-                .clipShape(RoundedRectangle(cornerRadius: 8))
             }
         }
     }
-
 }
 
 // MARK: - Shared Components

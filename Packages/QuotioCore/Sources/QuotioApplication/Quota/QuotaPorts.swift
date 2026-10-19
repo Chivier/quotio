@@ -71,6 +71,12 @@ public protocol QuotaFetching: Sendable {
     func fetch(_ request: QuotaFetchRequest) async throws -> QuotaProviderOutput
 }
 
+/// Account IDs whose quota must never be shown or persisted: accounts the user removed
+/// from Quotio (an external credential is hidden, not deleted) and disabled accounts.
+public protocol QuotaAccountVisibilityProviding: Sendable {
+    func excludedAccountIDs() async -> Set<String>
+}
+
 public protocol QuotaSnapshotStoring: Sendable {
     func load(for mode: QuotaOperatingMode) async -> QuotaSnapshot
     func save(_ snapshot: QuotaSnapshot, for mode: QuotaOperatingMode) async

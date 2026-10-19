@@ -66,6 +66,7 @@ public actor QuotaRefreshCoordinator: LifecycleCancelling {
 
     private let registry: QuotaProviderRegistry
     private let snapshots: any QuotaSnapshotStoring
+    private let visibility: (any QuotaAccountVisibilityProviding)?
     private let clock: any DateProviding
     private let retryDelay: TimeInterval
     private var inFlight: [QuotaProvider: InFlight] = [:]
@@ -82,10 +83,12 @@ public actor QuotaRefreshCoordinator: LifecycleCancelling {
         registry: QuotaProviderRegistry,
         snapshots: any QuotaSnapshotStoring,
         clock: any DateProviding,
-        retryDelay: TimeInterval = 60
+        retryDelay: TimeInterval = 60,
+        visibility: (any QuotaAccountVisibilityProviding)? = nil
     ) {
         self.registry = registry
         self.snapshots = snapshots
+        self.visibility = visibility
         self.clock = clock
         self.retryDelay = retryDelay
     }
@@ -111,9 +114,15 @@ public actor QuotaRefreshCoordinator: LifecycleCancelling {
         retryAfter.removeAll()
         publish()
 
-        let loaded = await snapshots.load(for: mode).persisted
+        var loaded = await snapshots.load(for: mode).persisted
+        let excluded = await excludedAccountIDs()
         guard bootstrapGeneration == requestedGeneration else { return snapshot }
         bootstrapGeneration = nil
+        // A snapshot written before an account was removed must not bring it back.
+        for (provider, quotas) in loaded.quotas {
+            let visible = quotas.filter { !Self.isExcluded($0.key, provider: provider, excluded: excluded) }
+            loaded.quotas[provider] = visible.isEmpty ? nil : visible
+        }
         snapshot = loaded
         publish()
         return snapshot
@@ -163,7 +172,14 @@ public actor QuotaRefreshCoordinator: LifecycleCancelling {
             publish()
         }
 
-        let output = await operation.task.value
+        var output = await operation.task.value
+        if let fetched = output {
+            output = Self.removingExcluded(
+                fetched,
+                provider: request.provider,
+                excluded: await excludedAccountIDs()
+            )
+        }
         guard !Task.isCancelled else {
             removeWaiter(waiterID, from: operation)
             return snapshot
@@ -250,6 +266,22 @@ public actor QuotaRefreshCoordinator: LifecycleCancelling {
                 || retryAccount.accountKey.caseInsensitiveCompare(account.accountKey) != .orderedSame
         }
         snapshot.lastUpdated = clock.now()
+        await snapshots.save(snapshot.persisted, for: mode)
+        publish()
+    }
+
+    /// Drops quota rows for accounts the user removed or disabled since the last refresh.
+    public func purgeExcludedAccounts(mode: QuotaOperatingMode) async {
+        let excluded = await excludedAccountIDs()
+        guard !excluded.isEmpty else { return }
+        var changed = false
+        for (provider, quotas) in snapshot.quotas {
+            let visible = quotas.filter { !Self.isExcluded($0.key, provider: provider, excluded: excluded) }
+            guard visible.count != quotas.count else { continue }
+            changed = true
+            snapshot.quotas[provider] = visible.isEmpty ? nil : visible
+        }
+        guard changed else { return }
         await snapshots.save(snapshot.persisted, for: mode)
         publish()
     }
@@ -408,18 +440,55 @@ public actor QuotaRefreshCoordinator: LifecycleCancelling {
 
         var merged = previous
         merged.merge(fresh) { _, fresh in fresh }
-        let missingCredentialQuota = credentialAccountKeys.map { keys in
-            let normalizedKeys = Set(keys.map { $0.lowercased() })
-            let normalizedFreshKeys = Set(fresh.keys.map { $0.lowercased() })
-            return !normalizedKeys.isSubset(of: normalizedFreshKeys)
-        } ?? (fresh.count < previous.count)
-        if missingCredentialQuota {
-            snapshot.issues[provider] = QuotaRefreshIssue(kind: .partial, occurredAt: now)
+        // Compare identities, not counts: a renamed key or one account failing while
+        // another appears keeps the count equal but still leaves a stale row behind.
+        let normalizedFreshKeys = Set(fresh.keys.map { $0.lowercased() })
+        let expectedKeys = credentialAccountKeys ?? Set(previous.keys)
+        let failedKeys = expectedKeys.filter { !normalizedFreshKeys.contains($0.lowercased()) }
+        clearIssue(for: provider)
+        if !failedKeys.isEmpty {
+            let issue = QuotaRefreshIssue(kind: .partial, occurredAt: now)
+            snapshot.issues[provider] = issue
+            // Only the accounts that did not refresh are affected; the others are current.
+            for key in failedKeys {
+                snapshot.accountIssues[QuotaAccountID(provider: provider, accountKey: key)] = issue
+            }
             retryAfter[.provider(provider)] = now.addingTimeInterval(retryDelay)
-        } else {
-            clearIssue(for: provider)
         }
         return merged
+    }
+
+    private func excludedAccountIDs() async -> Set<String> {
+        await visibility?.excludedAccountIDs() ?? []
+    }
+
+    private nonisolated static func isExcluded(
+        _ accountKey: String,
+        provider: QuotaProvider,
+        excluded: Set<String>
+    ) -> Bool {
+        guard !excluded.isEmpty else { return false }
+        return excluded.contains(AccountIdentity.make(
+            providerID: AccountProviderID(rawValue: provider.rawValue),
+            accountKey: accountKey
+        ).id)
+    }
+
+    private nonisolated static func removingExcluded(
+        _ output: QuotaProviderOutput,
+        provider: QuotaProvider,
+        excluded: Set<String>
+    ) -> QuotaProviderOutput {
+        guard !excluded.isEmpty else { return output }
+        var output = output
+        func visible(_ key: String) -> Bool {
+            !isExcluded(key, provider: provider, excluded: excluded)
+                && !isExcluded(output.accountAliases[key] ?? key, provider: provider, excluded: excluded)
+        }
+        output.quotas = output.quotas.filter { visible($0.key) }
+        output.subscriptions = output.subscriptions.filter { visible($0.key) }
+        output.credentialAccountKeys = output.credentialAccountKeys?.filter(visible)
+        return output
     }
 
     private func clearIssue(for provider: QuotaProvider) {

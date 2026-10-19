@@ -23,18 +23,27 @@ struct QuotaScreen: View {
     private var availableProviders: [QuotaProvider] {
         var providers = Set<QuotaProvider>()
         
-        // From proxy auth files
-        for file in proxyManagement.authFiles {
+        // From proxy auth files. Monitor mode lists discovered accounts instead, which
+        // already honor removal and disabled preferences.
+        for file in proxyManagement.authFiles where modeManager.isLocalProxyMode {
             if let provider = file.providerID {
                 providers.insert(provider)
             }
         }
-        
+
         // From direct quota data
         for provider in quota.providerQuotas.keys {
             providers.insert(provider)
         }
-        
+
+        // An account can be discovered before its first refresh succeeds; keep that
+        // provider selectable while its data is pending or failing.
+        if modeManager.isMonitorMode {
+            for account in accounts.accounts where !account.isDisabled {
+                providers.insert(account.provider)
+            }
+        }
+
         return providers.sorted { $0.displayName < $1.displayName }
     }
     
@@ -42,29 +51,37 @@ struct QuotaScreen: View {
     private func accountCount(for provider: QuotaProvider) -> Int {
         AccountInfo.merged(
             provider: provider,
-            authFiles: proxyManagement.authFiles.filter { $0.providerID == provider },
+            authFiles: modeManager.isLocalProxyMode
+                ? proxyManagement.authFiles.filter { $0.providerID == provider } : [],
             quotaData: quota.providerQuotas[provider] ?? [:],
             subscriptionInfos: quota.subscriptionInfos[provider] ?? [:],
             directAccounts: accounts.accounts,
-            aliases: quota.state.accountAliases[provider] ?? [:]
+            aliases: quota.state.accountAliases[provider] ?? [:],
+            trackedAccounts: trackedAccounts(for: provider)
         ).count
     }
     
     private func lowestQuotaPercent(for provider: QuotaProvider) -> Double? {
         guard let accounts = quota.providerQuotas[provider] else { return nil }
-        
-        var allTotals: [Double] = []
-        for (_, quotaData) in accounts {
-            let models = quotaData.models.map { (name: $0.name, percentage: $0.percentage) }
-            let total = settings.totalUsagePercent(models: models)
-            if total >= 0 {
-                allTotals.append(total)
-            }
-        }
-        
-        return allTotals.min()
+        return settings.summaryUsagePercent(for: accounts.values)
     }
     
+    private func trackedAccounts(for provider: QuotaProvider) -> [AccountInfo.TrackedAccount] {
+        guard modeManager.isMonitorMode else { return [] }
+        return accounts.accounts
+            .filter { $0.provider == provider && !$0.isDisabled }
+            .map { account in
+                let status = quotaController.monitorStatus(for: account)
+                return AccountInfo.TrackedAccount(
+                    key: account.accountKey,
+                    displayName: account.displayName,
+                    status: status.status,
+                    message: status.message,
+                    credentialAccessRequired: accounts.isCredentialUnreadable(account)
+                )
+            }
+    }
+
     /// Check if we have any data to show
     private var hasAnyData: Bool {
         if modeManager.isMonitorMode {
@@ -189,7 +206,9 @@ struct QuotaScreen: View {
                 if let provider = selectedProvider ?? availableProviders.first {
                     ProviderQuotaView(
                         provider: provider,
-                        authFiles: proxyManagement.authFiles.filter { $0.providerID == provider },
+                        authFiles: modeManager.isLocalProxyMode
+                            ? proxyManagement.authFiles.filter { $0.providerID == provider } : [],
+                        trackedAccounts: trackedAccounts(for: provider),
                         quotaData: quota.providerQuotas[provider] ?? [:],
                         subscriptionInfos: quota.subscriptionInfos[provider] ?? [:],
                         aliases: quota.state.accountAliases[provider] ?? [:],
@@ -373,6 +392,7 @@ private struct ProviderQuotaView: View {
     @Environment(AntigravityAccountScreenModel.self) private var antigravityAccounts
     let provider: QuotaProvider
     let authFiles: [ManagedAuthFile]
+    let trackedAccounts: [AccountInfo.TrackedAccount]
     let quotaData: [String: ProviderQuota]
     let subscriptionInfos: [String: QuotaSubscriptionInfo]
     let aliases: [String: String]
@@ -386,7 +406,8 @@ private struct ProviderQuotaView: View {
             quotaData: quotaData,
             subscriptionInfos: subscriptionInfos,
             directAccounts: accountsModel.accounts,
-            aliases: aliases
+            aliases: aliases,
+            trackedAccounts: trackedAccounts
         )
         let sorted = accounts.sorted { $0.email < $1.email }
 
@@ -443,7 +464,8 @@ struct AccountInfo {
         quotaData: [String: ProviderQuota],
         subscriptionInfos: [String: QuotaSubscriptionInfo],
         directAccounts: [Account],
-        aliases: [String: String]
+        aliases: [String: String],
+        trackedAccounts: [TrackedAccount] = []
     ) -> [AccountInfo] {
         var accounts: [AccountInfo] = []
 
@@ -486,7 +508,53 @@ struct AccountInfo {
             }
         }
 
+        // In Monitor mode the tracked account list is authoritative. An account whose
+        // fetch produced nothing (expired login, unreadable Keychain item, provider
+        // error) still gets a card, otherwise it silently vanishes.
+        let trackedByKey = Dictionary(
+            trackedAccounts.map { ($0.key.lowercased(), $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        accounts = accounts.map { info in
+            guard let tracked = trackedByKey[info.key.lowercased()] else { return info }
+            var updated = info
+            updated.statusMessage = tracked.status == "ready" ? nil : tracked.message
+            updated.credentialAccessRequired = tracked.credentialAccessRequired
+            return updated
+        }
+        let listed = Set(accounts.map { $0.key.lowercased() })
+        for tracked in trackedAccounts where !listed.contains(tracked.key.lowercased()) {
+            accounts.append(AccountInfo(
+                key: tracked.key,
+                email: tracked.displayName,
+                status: tracked.status ?? "pending",
+                statusColor: TrackedAccount.color(for: tracked.status),
+                authFile: nil,
+                quotaData: nil,
+                subscriptionInfo: subscriptionInfos[tracked.key],
+                statusMessage: tracked.message,
+                credentialAccessRequired: tracked.credentialAccessRequired
+            ))
+        }
+
         return accounts
+    }
+
+    struct TrackedAccount {
+        let key: String
+        let displayName: String
+        let status: String?
+        let message: String?
+        let credentialAccessRequired: Bool
+
+        static func color(for status: String?) -> Color {
+            switch status {
+            case "error": .red
+            case "outdated": .orange
+            case "ready": .green
+            default: .secondary
+            }
+        }
     }
 
 
@@ -497,6 +565,10 @@ struct AccountInfo {
     let authFile: ManagedAuthFile?
     let quotaData: ProviderQuota?
     let subscriptionInfo: QuotaSubscriptionInfo?
+    /// Why this account has no current quota, when known. Auth-file rows keep using
+    /// `authFile.humanReadableStatus`.
+    var statusMessage: String? = nil
+    var credentialAccessRequired = false
 }
 
 // MARK: - Account Quota Card V2
@@ -620,10 +692,31 @@ private struct AccountQuotaCardV2: View {
                 QuotaLoadingView()
             } else if hasQuotaData {
                 usageSection
-            } else if let message = account.authFile?.humanReadableStatus {
+                if let message = account.statusMessage {
+                    Label(message, systemImage: "exclamationmark.circle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+            } else if let message = account.statusMessage ?? account.authFile?.humanReadableStatus {
                 Text(message)
                     .font(.subheadline)
+                    .foregroundStyle(account.status == "error" ? Color.orange : .secondary)
+            } else {
+                Text("quota.noDataYet".localized())
+                    .font(.subheadline)
                     .foregroundStyle(.secondary)
+            }
+            if account.credentialAccessRequired {
+                Button {
+                    Task { await quotaController.restoreCredentialAccess(for: accountID) }
+                } label: {
+                    Label("providers.restoreCredentialAccess".localized(), systemImage: "key.viewfinder")
+                        .font(.caption)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(.orange)
+                .help("providers.restoreCredentialAccess.help".localized())
             }
         }
         .padding(16)
@@ -732,7 +825,7 @@ private struct AccountQuotaCardV2: View {
                 
                 Button {
                     Task {
-                        await quotaController.refresh(account: accountID)
+                        await quotaController.refresh(account: accountID, allowsCredentialAccessPrompt: true)
                     }
                 } label: {
                     if isRefreshing || isLoading {

@@ -17,6 +17,7 @@ struct DashboardScreen: View {
     @Environment(OperatingModeManager.self) private var modeManager
     @Environment(SettingsScreenModel.self) private var settingsModel
     @Environment(PasteboardScreenModel.self) private var pasteboard
+    @Environment(MenuBarSettingsManager.self) private var menuBarSettings
 
     @State private var selectedProvider: QuotaProvider?
     @State private var isImporterPresented = false
@@ -54,14 +55,22 @@ struct DashboardScreen: View {
         dashboard.connectedProviderCount
     }
     
-    /// Lowest quota percentage across all providers using total usage logic
-    private var lowestQuotaPercentage: Double {
-        dashboard.lowestQuotaPercentage
+    /// Summarizes account totals without weighting an account by its number of limits.
+    private var quotaPercentage: Double? {
+        menuBarSettings.summaryUsagePercent(for: quota.providerQuotas.values.lazy.flatMap { $0.values })
     }
-    
+
     /// Grouped accounts by provider (cached computation)
     private var groupedMonitorAccounts: [QuotaProvider: [Account]] {
         Dictionary(grouping: accounts.accounts) { $0.provider }
+    }
+
+    /// Providers come from tracked accounts too, so a provider stays visible even when
+    /// every request in the latest refresh failed.
+    private var quotaOverviewProviders: [QuotaProvider] {
+        Set(quota.providerQuotas.keys)
+            .union(accounts.accounts.filter { !$0.isDisabled }.map(\.provider))
+            .sorted { $0.displayName < $1.displayName }
     }
     
     var body: some View {
@@ -190,13 +199,14 @@ struct DashboardScreen: View {
                 color: .green
             )
             
-            // Show lowest quota percentage (precomputed)
+            // Dashboard summaries deliberately show remaining quota, as labeled below.
             KPICard(
-                title: "dashboard.lowestQuota".localized(),
-                value: String(format: "%.0f%%", lowestQuotaPercentage),
+                title: (menuBarSettings.modelAggregationMode == .average
+                    ? "dashboard.averageQuota" : "dashboard.lowestQuota").localized(),
+                value: QuotaOverviewSummary.formattedRemaining(quotaPercentage),
                 subtitle: "dashboard.remaining".localized(),
                 icon: "chart.bar.fill",
-                color: lowestQuotaPercentage > 50 ? .green : (lowestQuotaPercentage > 20 ? .orange : .red)
+                color: QuotaOverviewSummary.color(for: quotaPercentage)
             )
             
             if let lastRefresh = dashboard.lastRefreshTime {
@@ -213,7 +223,7 @@ struct DashboardScreen: View {
     
     private var quotaStatusSection: some View {
         GroupBox {
-            if quota.providerQuotas.isEmpty {
+            if quotaOverviewProviders.isEmpty {
                 VStack(spacing: 12) {
                     Image(systemName: "chart.bar.xaxis")
                         .font(.largeTitle)
@@ -236,10 +246,16 @@ struct DashboardScreen: View {
             } else {
                 VStack(alignment: .leading, spacing: 12) {
                     // Sort providers for stable iteration order (ForEach performance fix)
-                    ForEach(quota.providerQuotas.keys.sorted { $0.displayName < $1.displayName }) { provider in
-                        if let accounts = quota.providerQuotas[provider], !accounts.isEmpty {
-                            QuotaProviderRow(provider: provider, accounts: accounts)
-                        }
+                    ForEach(quotaOverviewProviders) { provider in
+                        let quotaAccounts = quota.providerQuotas[provider] ?? [:]
+                        QuotaProviderRow(
+                            provider: provider,
+                            accounts: quotaAccounts,
+                            accountCount: QuotaOverviewSummary.accountCount(
+                                tracked: groupedMonitorAccounts[provider]?.filter { !$0.isDisabled }.count ?? 0,
+                                withQuota: quotaAccounts.count
+                            )
+                        )
                     }
                 }
             }
@@ -800,17 +816,17 @@ struct FlowLayout: Layout {
 // MARK: - Quota Provider Row (for Quota-Only Mode Dashboard)
 
 struct QuotaProviderRow: View {
+    @Environment(MenuBarSettingsManager.self) private var menuBarSettings
     let provider: QuotaProvider
     let accounts: [String: ProviderQuota]
-    
-    private var lowestQuota: Double {
-        accounts.values.flatMap { $0.models }.map { $0.percentage }.min() ?? 100
+    let accountCount: Int
+
+    private var quotaPercentage: Double? {
+        menuBarSettings.summaryUsagePercent(for: accounts.values)
     }
-    
+
     private var quotaColor: Color {
-        if lowestQuota > 50 { return .green }
-        if lowestQuota > 20 { return .orange }
-        return .red
+        QuotaOverviewSummary.color(for: quotaPercentage)
     }
     
     var body: some View {
@@ -822,9 +838,18 @@ struct QuotaProviderRow: View {
                     .font(.subheadline)
                     .fontWeight(.medium)
                 
-                Text("\(accounts.count) " + "quota.accounts".localized())
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 4) {
+                    Text("\(accountCount) " + "quota.accounts".localized())
+
+                    if accountCount > accounts.count {
+                        Image(systemName: "exclamationmark.circle.fill")
+                            .foregroundStyle(.orange)
+                            .help("dashboard.partialQuotaCoverage".localized())
+                            .accessibilityLabel("dashboard.partialQuotaCoverage".localized())
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
             
             Spacer()
@@ -835,7 +860,7 @@ struct QuotaProviderRow: View {
                     .fill(quotaColor)
                     .frame(width: 8, height: 8)
                 
-                Text(String(format: "%.0f%%", lowestQuota))
+                Text(QuotaOverviewSummary.formattedRemaining(quotaPercentage))
                     .font(.subheadline)
                     .fontWeight(.semibold)
                     .foregroundStyle(quotaColor)
@@ -846,5 +871,26 @@ struct QuotaProviderRow: View {
             .clipShape(Capsule())
         }
         .padding(.vertical, 6)
+    }
+}
+
+enum QuotaOverviewSummary {
+    /// Tracked accounts are authoritative; quota rows are only a fallback for providers
+    /// restored before account discovery has completed.
+    static func accountCount(tracked: Int, withQuota quotaCount: Int) -> Int {
+        tracked > 0 ? tracked : quotaCount
+    }
+
+    static func formattedRemaining(_ percentage: Double?) -> String {
+        guard let percentage else { return "—" }
+        let value = QuotaDisplayMode.remaining.displayValue(from: percentage)
+        return value >= 0 ? String(format: "%.0f%%", value) : "—"
+    }
+
+    static func color(for percentage: Double?) -> Color {
+        guard let percentage else { return .secondary }
+        if percentage > 50 { return .green }
+        if percentage > 20 { return .orange }
+        return .red
     }
 }

@@ -55,10 +55,12 @@ public enum QuotaDisplayMode: String, Codable, CaseIterable, Identifiable, Senda
 
     public var id: String { rawValue }
 
+    /// Remaining is truncated so a fractional quota is never overstated; used is the
+    /// complement of the displayed remaining percentage. -1 stays the no-data sentinel.
     public func displayValue(from remainingPercent: Double) -> Double {
-        guard remainingPercent >= 0 else { return -1 }
-        let clamped = min(100, max(0, remainingPercent))
-        return self == .used ? 100 - clamped : clamped
+        guard remainingPercent.isFinite, remainingPercent >= 0 else { return -1 }
+        let remaining = min(100, max(0, remainingPercent)).rounded(.towardZero)
+        return self == .used ? 100 - remaining : remaining
     }
 }
 
@@ -82,6 +84,21 @@ public enum ModelAggregationMode: String, Codable, CaseIterable, Identifiable, S
     case average = "average"
 
     public var id: String { rawValue }
+
+    /// Unknown, non-finite and out-of-range values are not quota measurements.
+    public func aggregate<S: Sequence>(_ percentages: S) -> Double? where S.Element == Double {
+        var total = 0.0
+        var count = 0
+        for percentage in percentages where percentage.isFinite && (0...100).contains(percentage) {
+            switch self {
+            case .lowest: total = count == 0 ? percentage : min(total, percentage)
+            case .average: total += percentage
+            }
+            count += 1
+        }
+        guard count > 0 else { return nil }
+        return self == .average ? total / Double(count) : total
+    }
 }
 
 public struct MenuBarPreferences: Equatable, Sendable {
@@ -111,7 +128,7 @@ public struct MenuBarPreferences: Equatable, Sendable {
         stackPairedQuotaMetrics: Bool = true,
         hideSensitiveInfo: Bool = false,
         totalUsageMode: TotalUsageMode = .sessionOnly,
-        modelAggregationMode: ModelAggregationMode = .lowest,
+        modelAggregationMode: ModelAggregationMode = .average,
         hasUserModifiedMenuBar: Bool = false
     ) {
         self.showMenuBarIcon = showMenuBarIcon

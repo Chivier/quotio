@@ -52,6 +52,7 @@ public struct GroupedModelQuota: Identifiable, Sendable {
             .map { ISO8601DateFormatter().string(from: $0) } ?? ""
     }
 
+    @MainActor
     public var formattedResetTime: String {
         Self.relativeResetTime(resetTime)
     }
@@ -69,10 +70,13 @@ public struct GroupedModelQuota: Identifiable, Sendable {
         return fractional.date(from: value) ?? standard.date(from: value)
     }
 
+    @MainActor
     fileprivate static func relativeResetTime(_ value: String) -> String {
         guard !value.isEmpty, let date = parseISO8601Date(value) else { return "—" }
         let interval = date.timeIntervalSinceNow
-        guard interval > 0 else { return "now" }
+        // A fetch made after the reset would carry the next reset time, so a past one
+        // means the shown usage belongs to a window that has already ended.
+        guard interval > 0 else { return "quota.reset.passed".localizedStatic() }
         let totalMinutes = Int(interval / 60)
         let hours = totalMinutes / 60
         let minutes = totalMinutes % 60
@@ -317,5 +321,46 @@ public struct FactoryDroidQuotaSection: Identifiable, Sendable {
             let matching = models.filter { $0.name.hasPrefix(group.modelPrefix) }
             return matching.isEmpty ? nil : FactoryDroidQuotaSection(group: group, models: matching)
         }
+    }
+}
+
+/// Where a quota window stands relative to its reset.
+public enum QuotaResetState: Equatable, Sendable {
+    case unknown
+    case upcoming(TimeInterval)
+    /// The window reset after this quota was fetched: the shown usage is from a
+    /// finished window and needs a refresh.
+    case passedSinceFetch
+
+    public static func evaluate(
+        resetTime: String,
+        lastUpdated: Date?,
+        now: Date = Date()
+    ) -> QuotaResetState {
+        guard !resetTime.isEmpty, let date = parse(resetTime) else { return .unknown }
+        let remaining = date.timeIntervalSince(now)
+        if remaining > 0 { return .upcoming(remaining) }
+        guard let lastUpdated else { return .passedSinceFetch }
+        return lastUpdated < date ? .passedSinceFetch : .unknown
+    }
+
+    /// Compact countdown such as `5d0h`, `3h20m` or `12m`.
+    public var compactLabel: String? {
+        guard case .upcoming(let interval) = self else { return nil }
+        let totalMinutes = Int(interval) / 60
+        let days = totalMinutes / 1440
+        let hours = (totalMinutes % 1440) / 60
+        let minutes = totalMinutes % 60
+        if days > 0 { return "\(days)d\(hours)h" }
+        if hours > 0 { return "\(hours)h\(minutes)m" }
+        return "\(max(1, minutes))m"
+    }
+
+    private static func parse(_ value: String) -> Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let standard = ISO8601DateFormatter()
+        standard.formatOptions = [.withInternetDateTime]
+        return fractional.date(from: value) ?? standard.date(from: value)
     }
 }
