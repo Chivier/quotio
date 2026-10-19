@@ -135,6 +135,14 @@ public final class QuotaFeatureController {
         await refresh(account: account, allowsCredentialAccessPrompt: true)
     }
 
+    /// Refreshes Grok after the user signed in with the Grok CLI. Returns whether a
+    /// Grok login now produces an account.
+    func connectGrokAccounts() async -> Bool {
+        await refresh(provider: .grok)
+        return accounts.accounts.contains { $0.provider == .grok && !$0.isDisabled }
+            || !(quota.providerQuotas[.grok]?.isEmpty ?? true)
+    }
+
     func restoreRemovedAccounts() async {
         guard await accounts.restoreRemovedAccounts() > 0 else { return }
         await refreshAll(force: true)
