@@ -39,7 +39,9 @@ public final class SecureWarpTokenRepository: WarpTokenRepository, @unchecked Se
 
     public func save(_ tokens: [WarpToken]) async throws {
         let data = try JSONEncoder().encode(tokens)
-        guard await dataStore.save(data, accountID: Self.accountID) != nil else {
+        // Token edits come from the user; this write may rebuild an item that an
+        // earlier build owns.
+        guard await dataStore.saveUserInitiated(data, accountID: Self.accountID) != nil else {
             throw SecureWarpTokenRepositoryError.writeFailed
         }
         defaults.removeObject(forKey: UserDefaultsWarpTokenRepository.storageKey)

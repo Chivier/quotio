@@ -164,6 +164,9 @@ public actor GrokQuotaFetcher: QuotaFetching {
   private let billingURL: URL
   private let settingsURL: URL
   private let now: @Sendable () -> Date
+  /// Rotations the CLI file could not take, keyed by entry. The spent refresh token is
+  /// single-use, so the replacement must outlive the request until it is written.
+  private var heldRotations: [String: (spentRefreshToken: String?, rotated: Candidate)] = [:]
 
   public init(
     files: any QuotaCredentialFileReading = LocalQuotaCredentialFileReader(),
@@ -209,7 +212,7 @@ public actor GrokQuotaFetcher: QuotaFetching {
     }
     let candidates = Self.loadCandidates(data: data).filter {
       Self.includes($0.entryKey, in: request.scope)
-    }
+    }.map(resolvingHeldRotation)
     var quotas: [String: ProviderQuota] = [:]
     for candidate in candidates {
       if let quota = await fetchQuota(candidate) { quotas[candidate.entryKey] = quota }
@@ -385,6 +388,17 @@ public actor GrokQuotaFetcher: QuotaFetching {
     return outcome ?? nil
   }
 
+  /// Uses a held rotation while the file still carries the token it replaced.
+  private func resolvingHeldRotation(_ candidate: Candidate) -> Candidate {
+    guard let held = heldRotations[candidate.entryKey] else { return candidate }
+    guard candidate.refreshToken == held.spentRefreshToken else {
+      // The file moved on (a new login or a successful write); drop the stale copy.
+      heldRotations.removeValue(forKey: candidate.entryKey)
+      return candidate
+    }
+    return held.rotated
+  }
+
   private func refreshHoldingLock(_ candidate: Candidate, path: String) async -> Candidate? {
     // Under the lock, the file is the truth: a sibling may have rotated already.
     guard let data = await files.read(path: path),
@@ -392,6 +406,15 @@ public actor GrokQuotaFetcher: QuotaFetching {
         $0.entryKey == candidate.entryKey
       })
     else { return nil }
+    if let held = heldRotations[current.entryKey], current.refreshToken == held.spentRefreshToken {
+      // Never spend the already-used token again; retry writing the replacement.
+      let stored = try? await writer.persistRotation(
+        path: path, expected: current, accessToken: held.rotated.accessToken,
+        refreshToken: held.rotated.refreshToken, expiresAt: held.rotated.expiresAt,
+        createdAt: now())
+      if stored == true { heldRotations.removeValue(forKey: current.entryKey) }
+      return held.rotated
+    }
     guard current.accessToken == candidate.accessToken,
       current.refreshToken == candidate.refreshToken
     else { return current }
@@ -431,9 +454,13 @@ public actor GrokQuotaFetcher: QuotaFetching {
     {
       return sibling
     }
-    return current.rotated(
+    let rotated = current.rotated(
       accessToken: access, refreshToken: rotatedRefresh ?? refreshToken,
       idToken: Self.trimmed(json["id_token"] as? String) ?? current.idToken, expiresAt: expiry)
+    if stored == nil {
+      heldRotations[current.entryKey] = (refreshToken, rotated)
+    }
+    return rotated
   }
 
   nonisolated static func trimmed(_ value: String?) -> String? {

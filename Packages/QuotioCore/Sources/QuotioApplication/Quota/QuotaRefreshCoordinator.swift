@@ -147,7 +147,13 @@ public actor QuotaRefreshCoordinator: LifecycleCancelling {
         let waiterID = UUID()
         let operation: InFlight
         if var existing = inFlight[request.provider] {
-            guard existing.request == request else { return snapshot }
+            guard existing.request == request else {
+                // A user-started request must not be dropped because a scheduled one
+                // for the same provider is running; run it once that one finishes.
+                guard request.allowsUserInteraction || request.force else { return snapshot }
+                _ = await existing.task.value
+                return await refresh(request)
+            }
             existing.waiters.insert(waiterID)
             inFlight[request.provider] = existing
             operation = existing

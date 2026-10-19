@@ -310,6 +310,10 @@ actor CodexTestVault: CredentialVault {
     recorded.append(Save(credential: credential, userInitiated: false, account: metadata))
     store(credential, metadata)
   }
+  func saveRotationUserInitiated(_ credential: StoredCredential, metadata: Account) async throws {
+    try await saveUserInitiated(credential, metadata: metadata)
+  }
+
   func saveUserInitiated(_ credential: StoredCredential, metadata: Account) async throws {
     if deniedUserInitiatedSaves > 0 {
       deniedUserInitiatedSaves -= 1

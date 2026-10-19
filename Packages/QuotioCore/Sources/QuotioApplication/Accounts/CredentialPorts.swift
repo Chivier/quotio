@@ -181,6 +181,10 @@ public protocol CredentialVault: Sendable {
     /// Persist a credential produced by an explicit user action, such as completing a
     /// login or entering an API key. This is the only write path allowed to prompt.
     func saveUserInitiated(_ credential: StoredCredential, metadata: Account) async throws
+    /// Persist a token rotation produced by a user-started refresh. Like
+    /// `saveUserInitiated` it may prompt, but it is not a new login: it never restores
+    /// an account the user removed while the refresh was in flight.
+    func saveRotationUserInitiated(_ credential: StoredCredential, metadata: Account) async throws
     func credentialState(for accountID: String) async -> StoredCredentialState
 }
 
@@ -190,6 +194,10 @@ extension CredentialVault {
     }
 
     public func saveUserInitiated(_ credential: StoredCredential, metadata: Account) async throws {
+        try await save(credential, metadata: metadata)
+    }
+
+    public func saveRotationUserInitiated(_ credential: StoredCredential, metadata: Account) async throws {
         try await save(credential, metadata: metadata)
     }
 
@@ -254,7 +262,7 @@ public actor CredentialVaultService: CredentialVault {
     public func credentialForUserInitiatedAccess(for accountID: String) async -> StoredCredential? {
         let backend = await activeBackend()
         if let pending = pendingPersistence[accountID] {
-            try? await saveUserInitiated(pending.credential, metadata: pending.account)
+            try? await saveRotationUserInitiated(pending.credential, metadata: pending.account)
             return sessionCredentials[accountID] ?? pending.credential
         }
         if let cached = sessionCredentials[accountID] { return cached }
@@ -268,7 +276,21 @@ public actor CredentialVaultService: CredentialVault {
         // Under the hardware vault both paths perform the same decrypt, so retrying
         // would only cost the user a second PIN entry.
         guard backend == .keychain else { return nil }
-        return await readPersisted(accountID: accountID, userInitiated: true, backend: backend)
+        guard let credential = await readPersisted(
+            accountID: accountID,
+            userInitiated: true,
+            backend: backend
+        ) else { return nil }
+        // A one-time "Allow" lasts only for this run. Rebuild the item around the running
+        // executable so access survives a relaunch; if that fails, keep the credential
+        // in memory and retry on the next restore.
+        if let data = try? encoder.encode(credential),
+           let saved = await dataStore.saveUserInitiated(data, accountID: accountID) {
+            loadedGenerations[accountID] = saved.generation
+        } else if let account = await metadataRepository.accounts().first(where: { $0.id == accountID }) {
+            pendingPersistence[accountID] = (credential, account)
+        }
+        return credential
     }
 
     public func credentialState(for accountID: String) async -> StoredCredentialState {
@@ -327,6 +349,31 @@ public actor CredentialVaultService: CredentialVault {
                 // this session believes in, so the cached copy is stale.
                 sessionCredentials.removeValue(forKey: account.id)
                 loadedGenerations.removeValue(forKey: account.id)
+            }
+            throw CredentialVaultError.writeFailed
+        }
+        remember(saved, credential: credential, accountID: account.id, backend: backend)
+        try await metadataRepository.saveAccount(account)
+    }
+
+    public func saveRotationUserInitiated(_ credential: StoredCredential, metadata account: Account) async throws {
+        let backend = await activeBackend()
+        let generation = removalGenerations[account.id, default: 0]
+        guard await !metadataRepository.isRemoved(account.id),
+              generation == removalGenerations[account.id, default: 0] else {
+            throw CredentialVaultError.accountRemoved
+        }
+        let data = try encoder.encode(credential)
+        let saved = await dataStore.saveUserInitiated(data, accountID: account.id)
+        guard generation == removalGenerations[account.id, default: 0] else {
+            throw CredentialVaultError.accountRemoved
+        }
+        guard let saved else {
+            if backend == .keychain {
+                // Keep the single-use rotation in memory until access is restored.
+                sessionCredentials[account.id] = credential
+                pendingPersistence[account.id] = (credential, account)
+                throw CredentialVaultError.authorizationRequired
             }
             throw CredentialVaultError.writeFailed
         }
@@ -409,8 +456,20 @@ public actor CredentialVaultService: CredentialVault {
     private func activeBackend() async -> CredentialStorageBackend {
         let backend = await dataStore.backend
         if backend != .keychain {
+            // Enabling the hardware vault is a user action. Move held rotations into it
+            // before dropping plaintext, or the only valid refresh token would be lost.
+            for (accountID, pending) in pendingPersistence {
+                if let data = try? encoder.encode(pending.credential),
+                   let saved = await dataStore.save(data, accountID: accountID) {
+                    loadedGenerations[accountID] = saved.generation
+                    pendingPersistence.removeValue(forKey: accountID)
+                }
+            }
             sessionCredentials.removeAll()
-            pendingPersistence.removeAll()
+            if !pendingPersistence.isEmpty {
+                // Writing failed; keep only what cannot be recovered any other way.
+                sessionCredentials = pendingPersistence.mapValues(\.credential)
+            }
         }
         return backend
     }

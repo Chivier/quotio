@@ -505,6 +505,10 @@ private actor InteractiveVault: CredentialVault {
   }
 
   func save(_ credential: StoredCredential, metadata: Account) async throws {}
+  func saveRotationUserInitiated(_ credential: StoredCredential, metadata: Account) async throws {
+    try await saveUserInitiated(credential, metadata: metadata)
+  }
+
   func saveUserInitiated(_ credential: StoredCredential, metadata: Account) async throws {}
   func delete(accountID: String) async {}
 

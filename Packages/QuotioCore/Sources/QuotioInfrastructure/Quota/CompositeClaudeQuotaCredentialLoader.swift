@@ -128,7 +128,7 @@ public struct CompositeClaudeQuotaCredentialLoader: ClaudeQuotaCredentialLoading
     stored.expiresAt = refresh.expiresAt ?? stored.expiresAt
     do {
       if request.allowsUserInteraction {
-        try await vault.saveUserInitiated(stored, metadata: account)
+        try await vault.saveRotationUserInitiated(stored, metadata: account)
       } else {
         try await vault.save(stored, metadata: account)
       }

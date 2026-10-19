@@ -768,9 +768,11 @@ public actor MonitorOAuthAuthorizer: OAuthAuthorizing {
             guard activeAttemptID == attemptID else {
                 if let previousAccount, let previousCredential {
                     try await vault.saveUserInitiated(previousCredential, metadata: previousAccount)
-                } else {
+                } else if previousAccount == nil {
                     await vault.delete(accountID: account.id)
                 }
+                // A cancelled reconnect of an account whose old credential was
+                // unreadable keeps the new, readable one rather than removing the account.
                 finishPersistence(attemptID: attemptID)
                 throw CancellationError()
             }

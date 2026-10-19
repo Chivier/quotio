@@ -162,7 +162,7 @@ public struct CompositeCodexQuotaCredentialLoader: CodexQuotaCredentialLoading {
     stored.expiresAt = refresh.expiresAt ?? stored.expiresAt
     do {
       if userInitiated {
-        try await vault.saveUserInitiated(stored, metadata: account)
+        try await vault.saveRotationUserInitiated(stored, metadata: account)
       } else {
         try await vault.save(stored, metadata: account)
       }

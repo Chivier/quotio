@@ -81,10 +81,25 @@ enum KeychainAccessPreflight {
     }
 
     static func checkGenericPassword(service: String, account: String?) -> Outcome {
-        var result: AnyObject?
-        let status = KeychainSecurityCall.perform {
-            SecItemCopyMatching(query(service: service, account: account) as CFDictionary, &result)
+        guard !KeychainTestSafety.isBlocking else { return .notFound }
+        // The ACL inspection below uses legacy file-keychain APIs that ignore the query's
+        // no-UI controls (for example, a locked keychain would ask to be unlocked), so
+        // the whole preflight runs with process-wide user interaction disabled.
+        ProcessKeychainLock.value.lock()
+        defer { ProcessKeychainLock.value.unlock() }
+        var previous: DarwinBoolean = true
+        SecKeychainGetUserInteractionAllowed(&previous)
+        SecKeychainSetUserInteractionAllowed(false)
+        defer { SecKeychainSetUserInteractionAllowed(previous.boolValue) }
+
+        var keychainStatus = SecKeychainStatus()
+        if SecKeychainGetStatus(nil, &keychainStatus) == errSecSuccess,
+           keychainStatus & SecKeychainStatus(kSecUnlockStateStatus) == 0 {
+            return .interactionRequired
         }
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query(service: service, account: account) as CFDictionary, &result)
         switch status {
         case errSecSuccess:
             guard let attributes = result as? [String: Any],

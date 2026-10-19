@@ -125,6 +125,52 @@ final class CredentialVaultAccessTests: XCTestCase {
         XCTAssertNil(loaded, "A hardware-gated secret must not be answered from memory")
     }
 
+    func testUserStartedRotationCannotResurrectRemovedAccount() async throws {
+        let metadata = MemoryMetadata()
+        let vault = CredentialVaultService(dataStore: AccessControlledDataStore(), metadataRepository: metadata)
+        try await vault.saveUserInitiated(credential("login", refresh: "r1"), metadata: account)
+        try await metadata.setRemoved(true, accountID: account.id)
+
+        do {
+            try await vault.saveRotationUserInitiated(credential("rotated", refresh: "r2"), metadata: account)
+            XCTFail("A rotation must not bring back a removed account")
+        } catch CredentialVaultError.accountRemoved {}
+        let removed = await metadata.isRemoved(account.id)
+        XCTAssertTrue(removed)
+    }
+
+    func testRestoredAccessIsRebuiltForLaterLaunches() async throws {
+        let store = AccessControlledDataStore()
+        let metadata = MemoryMetadata()
+        try await CredentialVaultService(dataStore: store, metadataRepository: metadata)
+            .save(credential("first", refresh: "r1"), metadata: account)
+        await store.setPromptFreeReadsFail(true)
+
+        _ = await CredentialVaultService(dataStore: store, metadataRepository: metadata)
+            .credentialForUserInitiatedAccess(for: account.id)
+
+        let nextLaunch = CredentialVaultService(dataStore: store, metadataRepository: metadata)
+        let state = await nextLaunch.credentialState(for: account.id)
+        XCTAssertEqual(state, .available, "The item is rebuilt around the running build")
+    }
+
+    func testEnablingHardwareVaultKeepsHeldRotation() async throws {
+        let store = AccessControlledDataStore()
+        let metadata = MemoryMetadata()
+        let vault = CredentialVaultService(dataStore: store, metadataRepository: metadata)
+        try await vault.save(credential("first", refresh: "r1"), metadata: account)
+        _ = await vault.credential(for: account.id)
+        await store.setPromptFreeReadsFail(true)
+        try await vault.save(credential("second", refresh: "r2"), metadata: account)
+
+        await store.setPromptFreeReadsFail(false)
+        await store.setBackend(.protectedVault)
+        _ = await vault.credentialState(for: account.id)
+
+        let persisted = await store.storedRefreshToken(accountID: account.id)
+        XCTAssertEqual(persisted, "r2", "The single-use rotation moves into the new backend")
+    }
+
     private func credential(_ access: String, refresh: String?) -> StoredCredential {
         StoredCredential(
             accessToken: access,
