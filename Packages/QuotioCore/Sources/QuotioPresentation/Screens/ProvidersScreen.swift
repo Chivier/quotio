@@ -371,6 +371,26 @@ struct ProvidersScreen: View {
     @ViewBuilder
     private var accountsSection: some View {
         Section {
+            if modeManager.isMonitorMode, quotaController.unreadableCredentialCount > 0 {
+                HStack(spacing: 10) {
+                    Image(systemName: "key.viewfinder")
+                        .foregroundStyle(.orange)
+                    Text(String(
+                        format: "providers.restoreAllCredentialAccess.message".localized(),
+                        quotaController.unreadableCredentialCount
+                    ))
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    Button("providers.restoreAllCredentialAccess".localized()) {
+                        Task { await quotaController.restoreAllCredentialAccess() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.orange)
+                    .controlSize(.small)
+                }
+                .padding(.vertical, 4)
+            }
             if groupedAccounts.isEmpty {
                 // Empty state
                 AccountsEmptyState(

@@ -143,6 +143,19 @@ public final class QuotaFeatureController {
             || !(quota.providerQuotas[.grok]?.isEmpty ?? true)
     }
 
+    var unreadableCredentialCount: Int { accounts.unreadableCredentialAccountIDs.count }
+
+    /// Restores access to every owned credential this build cannot read, then refreshes.
+    /// Credentials live in one Keychain item, so this normally asks macOS once; items
+    /// left by an older build are each authorized once and then merged into it.
+    func restoreAllCredentialAccess() async {
+        let unreadable = accounts.accounts.filter(accounts.isCredentialUnreadable)
+        for account in unreadable {
+            _ = await accounts.restoreCredentialAccess(accountID: account.id)
+        }
+        await refreshAll(force: true)
+    }
+
     func restoreRemovedAccounts() async {
         guard await accounts.restoreRemovedAccounts() > 0 else { return }
         await refreshAll(force: true)

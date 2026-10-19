@@ -94,12 +94,13 @@ enum CompositionRoot {
             AmpQuotaFetcher.makeSession()
         }
         let credentialVault = CredentialVaultService(
-            dataStore: KeychainCredentialDataStore(
+            // One Keychain item holds every account, so one authorization unlocks all.
+            dataStore: BundledCredentialDataStore(inner: KeychainCredentialDataStore(
                 service: AppIdentity.keychainService(suffix: "monitor-auth"),
                 legacyServices: AppIdentity.legacyKeychainServices(suffix: "monitor-auth"),
                 canMigrateLegacy: AppIdentity.isProduction,
                 protectedStore: yubiKeyVault
-            ),
+            )),
             metadataRepository: metadataRepository
         )
         let accountDiscovery = LocalAccountDiscovery(
