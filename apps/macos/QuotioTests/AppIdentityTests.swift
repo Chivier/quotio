@@ -19,4 +19,31 @@ final class AppIdentityTests: XCTestCase {
         XCTAssertEqual(merged["legacyOnly"] as? String, "newest")
         XCTAssertEqual(merged["oldestOnly"] as? Bool, true)
     }
+
+    func testDevelopmentBuildsUseSeparateKeychainNamespace() {
+        XCTAssertEqual(
+            AppIdentity.keychainService(
+                suffix: "monitor-auth",
+                bundleIdentifier: AppIdentity.productionBundleIdentifier,
+                isDevelopmentBuild: true
+            ),
+            "app.bytrong.quotio.debug.monitor-auth"
+        )
+        XCTAssertEqual(
+            AppIdentity.keychainService(
+                suffix: "monitor-auth",
+                bundleIdentifier: AppIdentity.productionBundleIdentifier,
+                isDevelopmentBuild: false
+            ),
+            "app.bytrong.quotio.monitor-auth"
+        )
+        XCTAssertEqual(
+            AppIdentity.keychainService(
+                suffix: "monitor-auth",
+                bundleIdentifier: "app.bytrong.quotio.ui-qa",
+                isDevelopmentBuild: true
+            ),
+            "app.bytrong.quotio.ui-qa.monitor-auth"
+        )
+    }
 }

@@ -5,6 +5,7 @@ import Sparkle
 @MainActor
 public final class SparkleApplicationUpdateAdapter: NSObject, ApplicationUpdateChecking {
     private let feedURL: String
+    private let allowsSelfUpdate: Bool
     private var updaterController: SPUStandardUpdaterController?
     private var updater: SPUUpdater? { updaterController?.updater }
     private var didChangeHandler: (@MainActor () -> Void)?
@@ -14,10 +15,15 @@ public final class SparkleApplicationUpdateAdapter: NSObject, ApplicationUpdateC
     public private(set) var isInitialized = false
     public private(set) var isChecking = false
 
+    /// - Parameter allowsSelfUpdate: false for local development builds. A published
+    ///   release would replace local fixes and may use an older credential storage
+    ///   contract, so only distribution builds may install updates.
     public init(
-        feedURL: String = "https://github.com/nguyenphutrong/quotio/releases/latest/download/appcast.xml"
+        feedURL: String = "https://github.com/nguyenphutrong/quotio/releases/latest/download/appcast.xml",
+        allowsSelfUpdate: Bool = true
     ) {
         self.feedURL = feedURL
+        self.allowsSelfUpdate = allowsSelfUpdate
         super.init()
     }
 
@@ -30,7 +36,7 @@ public final class SparkleApplicationUpdateAdapter: NSObject, ApplicationUpdateC
     }
 
     public var automaticallyChecksForUpdates: Bool {
-        get { updater?.automaticallyChecksForUpdates ?? true }
+        get { updater?.automaticallyChecksForUpdates ?? allowsSelfUpdate }
         set { updater?.automaticallyChecksForUpdates = newValue }
     }
 
@@ -41,7 +47,7 @@ public final class SparkleApplicationUpdateAdapter: NSObject, ApplicationUpdateC
     }
 
     public func initializeIfNeeded() {
-        guard !isInitialized else { return }
+        guard allowsSelfUpdate, !isInitialized else { return }
         updaterController = SPUStandardUpdaterController(
             startingUpdater: true,
             updaterDelegate: self,

@@ -422,7 +422,7 @@ enum CompositionRoot {
         )
         let updatePreferences = UserDefaultsUpdatePreferencesRepository()
         let applicationUpdateController = ApplicationUpdateController(
-            checker: SparkleApplicationUpdateAdapter(),
+            checker: SparkleApplicationUpdateAdapter(allowsSelfUpdate: !AppIdentity.isDevelopmentBuild),
             preferencesRepository: updatePreferences,
             icon: AppKitUpdaterIconAdapter()
         )

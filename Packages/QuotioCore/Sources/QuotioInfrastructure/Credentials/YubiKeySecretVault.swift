@@ -228,16 +228,15 @@ nonisolated enum YubiKeySecretVault {
     }
 
     static func availableIdentityQuery() -> [String: Any] {
-        let context = LAContext()
-        context.interactionNotAllowed = true
-        return [
+        var query: [String: Any] = [
             kSecClass as String: kSecClassIdentity,
             kSecAttrAccessGroup as String: kSecAttrAccessGroupToken,
             kSecReturnAttributes as String: true,
             kSecReturnRef as String: true,
             kSecMatchLimit as String: kSecMatchLimitAll,
-            kSecUseAuthenticationContext as String: context,
         ]
+        KeychainNoUIQuery.apply(to: &query)
+        return query
     }
 
     static func availableIdentities() -> [YubiKeyPIVIdentity] {
