@@ -38,15 +38,26 @@ public struct OAuthAuthorizationRequest: Equatable, Sendable {
     public let providerID: AccountProviderID
     public let method: OAuthAuthorizationMethod
     public let automaticallyOpensBrowser: Bool
+    /// Reconnect: the ID of the Quotio-owned account this login must renew. A login
+    /// that resolves to any other account fails with `.accountMismatch` and replaces
+    /// nothing. For Codex it also restricts the browser to that ChatGPT workspace.
+    public let expectedAccountID: String?
+    /// Add: a login that resolves to an account Quotio already owns fails with
+    /// `.accountAlreadyConnected` instead of silently renewing it.
+    public let addingNewAccount: Bool
 
     public init(
         providerID: AccountProviderID,
         method: OAuthAuthorizationMethod = .providerDefault,
-        automaticallyOpensBrowser: Bool = false
+        automaticallyOpensBrowser: Bool = false,
+        expectedAccountID: String? = nil,
+        addingNewAccount: Bool = false
     ) {
         self.providerID = providerID
         self.method = method
         self.automaticallyOpensBrowser = automaticallyOpensBrowser
+        self.expectedAccountID = expectedAccountID
+        self.addingNewAccount = addingNewAccount
     }
 }
 
@@ -62,7 +73,15 @@ public enum OAuthFlowFailure: Error, Equatable, Sendable {
     case stateMismatch
     case browserOpenFailed
     case proxyCLI(ProxyCLIAuthStatus)
+    /// A sanitized provider error code (`^[A-Za-z0-9_-]{1,80}$`, else `http_<status>`).
     case provider(String)
+    /// The login resolved to a different account than the one being reconnected.
+    case accountMismatch
+    /// "Add account" resolved to an account Quotio already owns.
+    case accountAlreadyConnected
+    /// macOS refused to store the new credential. The completed authorization is kept
+    /// for the attempt, so completing it again retries the write without a new login.
+    case credentialStorageDenied
     case unknown
 }
 
@@ -178,8 +197,11 @@ public actor OAuthFlowController {
     }
 
     public func completeManualCode(_ code: String) async {
-        guard let attempt = activeAttempt,
-              case .awaitingManualCode = state else { return }
+        guard let attempt = activeAttempt else { return }
+        switch state {
+        case .awaitingManualCode, .failed(_, .credentialStorageDenied): break
+        default: return
+        }
         activeTask?.cancel()
         let authorizer = authorizer
         let controller = self
@@ -193,6 +215,8 @@ public actor OAuthFlowController {
                 await controller.complete(account: account, attemptID: attempt.id)
             } catch is CancellationError {
                 await controller.receiveCancellation(attemptID: attempt.id)
+            } catch OAuthFlowFailure.credentialStorageDenied {
+                await controller.receiveRetryableManualCodeFailure(attemptID: attempt.id)
             } catch let failure as OAuthFlowFailure {
                 await controller.receive(failure: failure, attemptID: attempt.id)
             } catch {
@@ -247,6 +271,14 @@ public actor OAuthFlowController {
         guard self.activeAttempt?.id == attemptID else { return }
         self.activeAttempt = nil
         publish(.failed(providerID: activeAttempt.request.providerID, failure: failure))
+    }
+
+    /// Keeps the attempt, and the authorization it already completed, so the write
+    /// can be retried once the user allows Keychain access.
+    private func receiveRetryableManualCodeFailure(attemptID: OAuthAttemptID) {
+        guard let activeAttempt, activeAttempt.id == attemptID else { return }
+        activeTask = nil
+        publish(.failed(providerID: activeAttempt.request.providerID, failure: .credentialStorageDenied))
     }
 
     private func receiveCancellation(attemptID: OAuthAttemptID) async {

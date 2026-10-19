@@ -19,9 +19,19 @@ public actor MonitorOAuthAuthorizer: OAuthAuthorizing {
     private let httpTransport: any OAuthHTTPTransport
     private let resolveKiroIdentity: KiroIdentityResolver
     private var activeAttemptID: OAuthAttemptID?
-    private var claudePending: (attemptID: OAuthAttemptID, state: String, verifier: String)?
+    private var activeRequest: OAuthAuthorizationRequest?
+    private var claudePending: PendingClaudeLogin?
     private var persistingAttemptID: OAuthAttemptID?
     private var persistenceWaiters: [OAuthAttemptID: [CheckedContinuation<Void, Never>]] = [:]
+
+    private struct PendingClaudeLogin: Sendable {
+        let attemptID: OAuthAttemptID
+        let state: String
+        let verifier: String
+        /// Authorization codes are single-use. The exchanged credential stays here
+        /// until it is stored, so a denied Keychain write can be retried.
+        var authorization: (account: Account, credential: StoredCredential)?
+    }
 
     public init(
         vault: any CredentialVault,
@@ -46,6 +56,7 @@ public actor MonitorOAuthAuthorizer: OAuthAuthorizing {
             throw OAuthFlowFailure.unsupportedProvider
         }
         activeAttemptID = attemptID
+        activeRequest = request
         switch provider {
         case .copilot:
             return .completed(try await githubDeviceFlow(attemptID: attemptID, progress: progress))
@@ -54,6 +65,7 @@ public actor MonitorOAuthAuthorizer: OAuthAuthorizing {
         case .codex, .antigravity:
             return .completed(try await browserPKCEFlow(
                 provider: provider,
+                request: request,
                 attemptID: attemptID,
                 progress: progress
             ))
@@ -67,6 +79,7 @@ public actor MonitorOAuthAuthorizer: OAuthAuthorizing {
     public func cancel(attemptID: OAuthAttemptID) async {
         guard activeAttemptID == attemptID else { return }
         activeAttemptID = nil
+        activeRequest = nil
         await callbackTransport.stop()
         claudePending = nil
         await waitForPersistence(attemptID: attemptID)
@@ -106,7 +119,7 @@ public actor MonitorOAuthAuthorizer: OAuthAuthorizing {
             throw OAuthFlowFailure.browserOpenFailed
         }
         try ensureActive(attemptID)
-        claudePending = (attemptID, state, verifier)
+        claudePending = PendingClaudeLogin(attemptID: attemptID, state: state, verifier: verifier)
         let prompt = OAuthPrompt(authorizationURL: url)
         await progress(prompt)
         return .awaitingManualCode(prompt: prompt, state: state)
@@ -119,7 +132,41 @@ public actor MonitorOAuthAuthorizer: OAuthAuthorizing {
         guard let pending = claudePending,
               pending.attemptID == attemptID,
               activeAttemptID == attemptID else { throw OAuthFlowFailure.expired }
-        defer { claudePending = nil }
+        let authorization: (account: Account, credential: StoredCredential)
+        if let saved = pending.authorization {
+            authorization = saved
+        } else {
+            do {
+                authorization = try await exchangeClaudeCode(rawCode, pending: pending)
+            } catch {
+                claudePending = nil
+                throw error
+            }
+            try ensureActive(attemptID)
+            claudePending?.authorization = authorization
+        }
+        if let expected = activeRequest?.expectedAccountID, expected != authorization.account.id {
+            claudePending = nil
+            throw OAuthFlowFailure.accountMismatch
+        }
+        do {
+            try await persist(authorization.credential, account: authorization.account, attemptID: attemptID)
+        } catch OAuthFlowFailure.credentialStorageDenied {
+            // Keep the exchanged credential; completing again retries the write.
+            throw OAuthFlowFailure.credentialStorageDenied
+        } catch {
+            claudePending = nil
+            throw error
+        }
+        claudePending = nil
+        activeAttemptID = nil
+        return authorization.account
+    }
+
+    private func exchangeClaudeCode(
+        _ rawCode: String,
+        pending: PendingClaudeLogin
+    ) async throws -> (account: Account, credential: StoredCredential) {
         let pieces = rawCode.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: "#", maxSplits: 1).map(String.init)
         guard let code = pieces.first, !code.isEmpty else { throw OAuthFlowFailure.invalidResponse }
         if pieces.count == 2, pieces[1] != pending.state { throw OAuthFlowFailure.stateMismatch }
@@ -134,11 +181,14 @@ public actor MonitorOAuthAuthorizer: OAuthAuthorizing {
                 "state": pending.state,
             ]
         )
-        try ensureActive(attemptID)
-        guard let accessToken = tokens["access_token"] as? String else { throw OAuthFlowFailure.invalidResponse }
-        let accountJSON = tokens["account"] as? [String: Any]
-        let email = accountJSON?["email_address"] as? String ?? "Claude"
-        let accountID = accountJSON?["uuid"] as? String
+        // A login without a refresh token would stop working within hours, and one
+        // without an email cannot be told apart from another Claude account.
+        guard let accessToken = Self.nonBlank(tokens["access_token"] as? String),
+              let refreshToken = Self.nonBlank(tokens["refresh_token"] as? String),
+              let accountJSON = tokens["account"] as? [String: Any],
+              let email = Self.nonBlank(accountJSON["email_address"] as? String) else {
+            throw OAuthFlowFailure.invalidResponse
+        }
         let account = Account.oauth(
             provider: .claude,
             accountKey: email,
@@ -148,15 +198,13 @@ public actor MonitorOAuthAuthorizer: OAuthAuthorizing {
         )
         let credential = StoredCredential(
             accessToken: accessToken,
-            refreshToken: tokens["refresh_token"] as? String,
+            refreshToken: refreshToken,
             idToken: nil,
-            accountID: accountID,
+            accountID: accountJSON["uuid"] as? String,
             expiresAt: (tokens["expires_in"] as? NSNumber).map { Date().addingTimeInterval($0.doubleValue) },
             extra: [:]
         )
-        try await persist(credential, account: account, attemptID: attemptID)
-        activeAttemptID = nil
-        return account
+        return (account, credential)
     }
 
     private struct BrowserConfiguration: Sendable {
@@ -172,6 +220,7 @@ public actor MonitorOAuthAuthorizer: OAuthAuthorizing {
 
     private func browserPKCEFlow(
         provider: QuotaProvider,
+        request: OAuthAuthorizationRequest,
         attemptID: OAuthAttemptID,
         progress: @escaping @concurrent @Sendable (OAuthPrompt) async -> Void
     ) async throws -> Account {
@@ -198,6 +247,17 @@ public actor MonitorOAuthAuthorizer: OAuthAuthorizing {
                 "code_challenge": challenge,
                 "code_challenge_method": "S256",
             ]) { _, new in new }
+            if provider == .codex, let expected = request.expectedAccountID {
+                // Reconnecting must renew that workspace, never fall through to Add.
+                guard await vault.accounts().contains(where: {
+                    $0.id == expected && $0.providerID.rawValue == QuotaProvider.codex.rawValue
+                }) else { throw OAuthFlowFailure.accountMismatch }
+                if let credential = await vault.credentialForUserInitiatedAccess(for: expected),
+                   let workspaceID = Self.codexAccountID(credential) {
+                    values["allowed_workspace_id"] = workspaceID
+                }
+                try ensureActive(attemptID)
+            }
             components.queryItems = values.sorted { $0.key < $1.key }.map {
                 URLQueryItem(name: $0.key, value: $0.value)
             }
@@ -223,6 +283,7 @@ public actor MonitorOAuthAuthorizer: OAuthAuthorizing {
             try ensureActive(attemptID)
             let account = try await saveBrowserCredential(
                 provider: provider,
+                request: request,
                 tokens: tokens,
                 attemptID: attemptID
             )
@@ -276,6 +337,7 @@ public actor MonitorOAuthAuthorizer: OAuthAuthorizing {
 
     private func saveBrowserCredential(
         provider: QuotaProvider,
+        request: OAuthAuthorizationRequest,
         tokens: [String: Any],
         attemptID: OAuthAttemptID
     ) async throws -> Account {
@@ -285,27 +347,46 @@ public actor MonitorOAuthAuthorizer: OAuthAuthorizing {
         let expiresIn = (tokens["expires_in"] as? NSNumber)?.doubleValue
         var email = OAuthIdentity.jwtString(idToken, claim: "email")
         var accountID: String?
+        let account: Account
         if provider == .codex {
-            accountID = OAuthIdentity.jwtNestedString(
-                idToken,
-                namespace: "https://api.openai.com/auth",
-                claim: "chatgpt_account_id"
+            email = email ?? OAuthIdentity.jwtString(accessToken, claim: "email")
+            accountID = Self.nonBlank(tokens["account_id"] as? String)
+                ?? OAuthIdentity.jwtNestedString(
+                    idToken,
+                    namespace: "https://api.openai.com/auth",
+                    claim: "chatgpt_account_id"
+                )
+                ?? OAuthIdentity.jwtNestedString(
+                    accessToken,
+                    namespace: "https://api.openai.com/auth",
+                    claim: "chatgpt_account_id"
+                )
+            account = await codexOwnedAccount(email: email, accountID: accountID)
+            try ensureActive(attemptID)
+            let existingIDs = Set(await vault.accounts()
+                .filter { $0.providerID.rawValue == QuotaProvider.codex.rawValue }
+                .map(\.id))
+            try Self.validateCodexAccountSelection(
+                accountID: account.id,
+                existingIDs: existingIDs,
+                expectedAccountID: request.expectedAccountID,
+                addingNewAccount: request.addingNewAccount
             )
         } else {
             let user = try? await googleUserInfo(accessToken: accessToken)
             try ensureActive(attemptID)
             email = email ?? user?.email
             accountID = user?.id
+            let key = email ?? accountID ?? "\(provider.oauthDisplayName) \(UUID().uuidString.prefix(8))"
+            account = Account.oauth(
+                provider: provider,
+                accountKey: key,
+                displayName: email ?? key,
+                source: .quotioKeychain,
+                credentialReference: "keychain",
+                canDelete: true
+            )
         }
-        let key = email ?? accountID ?? "\(provider.oauthDisplayName) \(UUID().uuidString.prefix(8))"
-        let account = Account.oauth(
-            provider: provider,
-            accountKey: key,
-            displayName: email ?? key,
-            source: .quotioKeychain,
-            credentialReference: "keychain",
-            canDelete: true
-        )
         let credential = StoredCredential(
             accessToken: accessToken,
             refreshToken: refreshToken,
@@ -318,6 +399,81 @@ public actor MonitorOAuthAuthorizer: OAuthAuthorizing {
         try await persist(credential, account: account, attemptID: attemptID)
         activeAttemptID = nil
         return account
+    }
+
+    /// Re-authenticating the same person in the same ChatGPT workspace renews the
+    /// existing account; another workspace on the same email is another account.
+    private func codexOwnedAccount(email: String?, accountID: String?) async -> Account {
+        let normalizedEmail = Self.nonBlank(email)
+        let normalizedAccountID = Self.nonBlank(accountID)
+        let key = CodexAccountKey.canonical(
+            email: normalizedEmail,
+            accountID: normalizedAccountID,
+            fallback: "Codex " + String(UUID().uuidString.prefix(8))
+        )
+        if let normalizedAccountID {
+            for existing in await vault.accounts()
+            where existing.providerID.rawValue == QuotaProvider.codex.rawValue
+                && Self.sameCodexUser(existingEmail: existing.displayName, loginEmail: normalizedEmail) {
+                // A login is user-initiated, so an item this build cannot read yet may
+                // be unlocked here; otherwise re-login would create a duplicate.
+                var credential = await vault.credential(for: existing.id)
+                if credential == nil {
+                    credential = await vault.credentialForUserInitiatedAccess(for: existing.id)
+                }
+                guard let credential,
+                      Self.codexAccountID(credential) == normalizedAccountID else { continue }
+                return Account(
+                    identity: AccountIdentity(
+                        id: existing.id,
+                        providerID: existing.providerID,
+                        accountKey: key
+                    ),
+                    displayName: normalizedEmail ?? existing.displayName,
+                    source: .quotioKeychain,
+                    credentialReference: "keychain",
+                    capabilities: [.disable, .delete],
+                    status: existing.status
+                )
+            }
+        }
+        return Account.oauth(
+            provider: .codex,
+            accountKey: key,
+            displayName: normalizedEmail ?? key,
+            source: .quotioKeychain,
+            credentialReference: "keychain",
+            canDelete: true
+        )
+    }
+
+    nonisolated static func sameCodexUser(existingEmail: String, loginEmail: String?) -> Bool {
+        guard let loginEmail = nonBlank(loginEmail) else { return false }
+        return existingEmail.trimmingCharacters(in: .whitespacesAndNewlines)
+            .caseInsensitiveCompare(loginEmail) == .orderedSame
+    }
+
+    nonisolated static func validateCodexAccountSelection(
+        accountID: String,
+        existingIDs: Set<String>,
+        expectedAccountID: String?,
+        addingNewAccount: Bool
+    ) throws {
+        if let expectedAccountID, accountID != expectedAccountID {
+            throw OAuthFlowFailure.accountMismatch
+        }
+        if addingNewAccount, existingIDs.contains(accountID) {
+            throw OAuthFlowFailure.accountAlreadyConnected
+        }
+    }
+
+    nonisolated private static func codexAccountID(_ credential: StoredCredential) -> String? {
+        nonBlank(credential.accountID)
+            ?? nonBlank(OAuthIdentity.jwtNestedString(
+                credential.idToken,
+                namespace: "https://api.openai.com/auth",
+                claim: "chatgpt_account_id"
+            ))
     }
 
     private func googleUserInfo(accessToken: String) async throws -> (email: String?, id: String?) {
@@ -541,14 +697,11 @@ public actor MonitorOAuthAuthorizer: OAuthAuthorizing {
             headers: ["Content-Type": "application/json"],
             body: try JSONSerialization.data(withJSONObject: body)
         ))
-        guard let json = try? JSONSerialization.jsonObject(with: response.body) as? [String: Any] else {
-            throw OAuthFlowFailure.invalidResponse
-        }
+        let json = try? JSONSerialization.jsonObject(with: response.body) as? [String: Any]
         guard 200...299 ~= response.statusCode else {
-            throw OAuthFlowFailure.provider(
-                (json["error"] as? String) ?? (json["errorCode"] as? String) ?? "http_\(response.statusCode)"
-            )
+            throw Self.providerFailure(json: json, statusCode: response.statusCode)
         }
+        guard let json else { throw OAuthFlowFailure.invalidResponse }
         return json
     }
 
@@ -568,11 +721,30 @@ public actor MonitorOAuthAuthorizer: OAuthAuthorizing {
             ],
             body: body
         ))
-        guard 200...299 ~= response.statusCode,
-              let json = try? JSONSerialization.jsonObject(with: response.body) as? [String: Any] else {
-            throw OAuthFlowFailure.invalidResponse
+        let json = try? JSONSerialization.jsonObject(with: response.body) as? [String: Any]
+        guard 200...299 ~= response.statusCode else {
+            throw Self.providerFailure(json: json, statusCode: response.statusCode)
         }
+        guard let json else { throw OAuthFlowFailure.invalidResponse }
         return json
+    }
+
+    /// Provider error bodies are hostile input: only a short identifier-like code is
+    /// surfaced, never free text that could carry tokens or markup.
+    nonisolated static func providerFailure(json: [String: Any]?, statusCode: Int) -> OAuthFlowFailure {
+        let nested = json?["error"] as? [String: Any]
+        let code = (json?["error"] as? String)
+            ?? (nested?["type"] as? String)
+            ?? (json?["errorCode"] as? String)
+        return .provider(safeProviderCode(code) ?? "http_\(statusCode)")
+    }
+
+    nonisolated static func safeProviderCode(_ code: String?) -> String? {
+        guard let code,
+              code.range(of: "^[A-Za-z0-9_-]{1,80}$", options: .regularExpression) != nil else {
+            return nil
+        }
+        return code
     }
 
     private func ensureActive(_ attemptID: OAuthAttemptID) throws {
@@ -590,10 +762,12 @@ public actor MonitorOAuthAuthorizer: OAuthAuthorizing {
         persistingAttemptID = attemptID
 
         do {
-            try await vault.save(credential, metadata: account)
+            // A completed login is the one write allowed to prompt; it also replaces
+            // an item owned by an older ad-hoc signature.
+            try await vault.saveUserInitiated(credential, metadata: account)
             guard activeAttemptID == attemptID else {
                 if let previousAccount, let previousCredential {
-                    try await vault.save(previousCredential, metadata: previousAccount)
+                    try await vault.saveUserInitiated(previousCredential, metadata: previousAccount)
                 } else {
                     await vault.delete(accountID: account.id)
                 }
@@ -601,6 +775,9 @@ public actor MonitorOAuthAuthorizer: OAuthAuthorizing {
                 throw CancellationError()
             }
             finishPersistence(attemptID: attemptID)
+        } catch CredentialVaultError.authorizationRequired {
+            finishPersistence(attemptID: attemptID)
+            throw OAuthFlowFailure.credentialStorageDenied
         } catch {
             finishPersistence(attemptID: attemptID)
             throw error
@@ -632,10 +809,19 @@ public actor MonitorOAuthAuthorizer: OAuthAuthorizing {
               values.first(where: { $0.name == "state" })?.value == expectedState else {
             throw OAuthFlowFailure.stateMismatch
         }
+        if let error = values.first(where: { $0.name == "error" })?.value {
+            throw OAuthFlowFailure.provider(safeProviderCode(error) ?? "authorization_failed")
+        }
         guard let code = values.first(where: { $0.name == "code" })?.value, !code.isEmpty else {
             throw OAuthFlowFailure.invalidResponse
         }
         return code
+    }
+
+    nonisolated private static func nonBlank(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else { return nil }
+        return value
     }
 
     nonisolated private static func base64URL(_ data: Data) -> String {
