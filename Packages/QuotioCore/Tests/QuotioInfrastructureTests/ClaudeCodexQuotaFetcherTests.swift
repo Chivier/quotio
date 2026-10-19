@@ -347,10 +347,13 @@ final class ClaudeCodexQuotaFetcherTests: XCTestCase {
     XCTAssertEqual(localProxy.map(\.accessToken), ["legacy-token"])
     XCTAssertEqual(monitor.map(\.accessToken), ["native-token"])
     XCTAssertEqual(monitor.map(\.accountKey), ["same@example.com-plus"])
-    XCTAssertEqual(monitor.first?.aliases, ["same@example.com"])
+    // Both the email-only key of older builds and the canonical workspace key migrate.
+    XCTAssertEqual(monitor.first?.aliases, ["same@example.com", "same@example.com • 07e99801"])
+    XCTAssertEqual(monitor.first?.source, .codexCLI)
+    XCTAssertEqual(localProxy.first?.source, .cliProxy)
   }
 
-  func testCodexMonitorMergesVaultAndLegacyIdentityAndExportsCacheAlias() async throws {
+  func testCodexMonitorKeysVaultLoginByItsUniqueLegacyFileAndExportsMetadataAlias() async throws {
     let account = Account.make(
       providerID: AccountProviderID(rawValue: "codex"),
       accountKey: "same@example.com",
@@ -369,20 +372,23 @@ final class ClaudeCodexQuotaFetcherTests: XCTestCase {
     )
 
     let credentials = await loader.credentials(for: .monitor)
-    XCTAssertEqual(credentials.map(\.accountKey), ["same@example.com"])
+    XCTAssertEqual(credentials.map(\.accountKey), ["same@example.com-pro"])
     XCTAssertEqual(credentials.map(\.accessToken), ["vault"])
-    XCTAssertEqual(credentials.first?.aliases, ["same@example.com-pro"])
+    XCTAssertEqual(credentials.first?.aliases, ["same@example.com"])
+    XCTAssertEqual(credentials.first?.source, .quotio(accountID: account.id))
 
     let output = try await CodexQuotaFetcher(
       credentials: loader,
       session: RecordingQuotaSession(body: #"{"rate_limit":{"primary_window":{"used_percent":10}}}"#)
     ).fetch(.init(provider: .codex, mode: .monitor))
-    XCTAssertEqual(output.credentialAccountKeys, ["same@example.com"])
-    XCTAssertEqual(output.accountAliases, ["same@example.com-pro": "same@example.com"])
-    XCTAssertEqual(Set(output.quotas.keys), ["same@example.com"])
+    XCTAssertEqual(output.credentialAccountKeys, ["same@example.com-pro"])
+    XCTAssertEqual(output.accountAliases, ["same@example.com": "same@example.com-pro"])
+    XCTAssertEqual(Set(output.quotas.keys), ["same@example.com-pro"])
   }
 
-  func testCodexMonitorPreservesAliasesWhileProxyRetainsSeparateSourceKeys() async {
+  /// A ChatGPT account ID names a workspace; two people in one team workspace are two
+  /// accounts and must never collapse into one row.
+  func testCodexKeepsDistinctKeysThatShareAWorkspaceIDInBothModes() async {
     let values: [CodexQuotaCredential] = [
       .init(accountKey: "same@example.com", aliases: ["native-alias"],
         accessToken: "native", accountID: "shared-id"),
@@ -395,9 +401,7 @@ final class ClaudeCodexQuotaFetcherTests: XCTestCase {
     )
     let monitor = await loader.credentials(for: .monitor)
     let proxy = await loader.credentials(for: .localProxy)
-    XCTAssertEqual(monitor.count, 1)
-    XCTAssertEqual(monitor.first?.aliases,
-      ["native-alias", "older-alias", "same@example.com-pro"])
+    XCTAssertEqual(monitor, values)
     XCTAssertEqual(proxy, values)
   }
 
