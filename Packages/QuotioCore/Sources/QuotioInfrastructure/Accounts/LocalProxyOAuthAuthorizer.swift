@@ -248,6 +248,8 @@ public actor LocalProxyOAuthAuthorizer: OAuthAuthorizing {
         case .amp: "Amp"
         case .trae: "Trae"
         case .glm: "Z.ai"
+        case .kimi: "Kimi Code"
+        case .minimax: "MiniMax"
         case .warp: "Warp"
         case .clinePass: "ClinePass"
         }
@@ -262,6 +264,7 @@ private extension ProxyManagementOAuthProvider {
         case .qwen: self = .qwen
         case .iflow: self = .iflow
         case .antigravity: self = .antigravity
+        case .kimi: self = .kimi
         default: return nil
         }
     }

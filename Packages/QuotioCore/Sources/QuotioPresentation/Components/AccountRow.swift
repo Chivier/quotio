@@ -198,7 +198,7 @@ struct AccountRowData: Identifiable, Hashable {
             canDelete: true,
             removesFromQuotioOnly: !(monitorAccount.canDelete && monitorAccount.source == .quotioKeychain),
             canEdit: monitorAccount.source == .quotioKeychain
-                && [.factoryDroid, .openRouter, .amp].contains(monitorAccount.provider),
+                && [.factoryDroid, .openRouter, .amp, .kimi, .minimax].contains(monitorAccount.provider),
             credentialAccessRequired: credentialAccessRequired
         )
     }

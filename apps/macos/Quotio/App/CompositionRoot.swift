@@ -245,6 +245,18 @@ enum CompositionRoot {
                 metadata: metadataRepository,
                 session: ampHTTPSession
             ),
+            QuotioInfrastructure.KimiQuotaFetcher(
+                vault: credentialVault,
+                metadata: metadataRepository,
+                authFiles: authFileRepository,
+                deviceIdentity: KimiDeviceIdentity(),
+                session: quotaHTTPSession
+            ),
+            QuotioInfrastructure.MiniMaxQuotaFetcher(
+                vault: credentialVault,
+                metadata: metadataRepository,
+                session: quotaHTTPSession
+            ),
             QuotioInfrastructure.DevinQuotaFetcher(session: quotaHTTPSession),
             QuotioInfrastructure.GrokQuotaFetcher(session: quotaHTTPSession),
         ])

@@ -205,6 +205,8 @@ public extension QuotaMetric {
         case "zai-weekly", "devin-weekly", "grok-weekly": "quota.metric.weekly".localizedStatic()
         case "zai-monthly": "quota.metric.monthly".localizedStatic()
         case "zai-web-searches": "quota.metric.webSearches".localizedStatic()
+        case "kimi-five-hour", "minimax-five-hour": "quota.metric.session".localizedStatic()
+        case "kimi-weekly", "minimax-weekly": "quota.metric.weekly".localizedStatic()
         case "devin-extra-balance", "factory-extra-balance": "quota.metric.extraBalance".localizedStatic()
         case "grok-extra-usage": "quota.metric.extraUsage".localizedStatic()
         case "factory-standard-five-hour": "factory.quota.standardFiveHour".localizedStatic()

@@ -184,6 +184,7 @@ public actor LocalAccountDiscovery: AccountDiscovering {
         accounts.append(contentsOf: await discoverAmpCredential())
         accounts.append(contentsOf: await discoverDevinCredential())
         accounts.append(contentsOf: await discoverGrokCredentials())
+        accounts.append(contentsOf: await KimiLocalCredentialReader(homeDirectory: homeDirectory, files: quotaFiles).accounts())
         if await antigravityDatabase.hasCredential() {
             accounts.append(Self.account(
                 provider: .antigravity,

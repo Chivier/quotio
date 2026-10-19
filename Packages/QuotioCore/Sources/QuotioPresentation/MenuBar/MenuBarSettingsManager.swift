@@ -241,6 +241,15 @@ public struct MenuBarQuotaPair: Equatable, Sendable {
                 bottomNames: ["antigravity-gemini-weekly", "antigravity-claude-gpt-weekly"],
                 bottomLabelKey: "quota.metric.weekly"
             )
+        case .kimi, .minimax:
+            return makePair(
+                from: models,
+                aggregationMode: aggregationMode,
+                topNames: ["\(provider.rawValue)-five-hour"],
+                topLabelKey: "quota.metric.session",
+                bottomNames: ["\(provider.rawValue)-weekly"],
+                bottomLabelKey: "quota.metric.weekly"
+            )
         case .devin:
             return makePair(
                 from: models,

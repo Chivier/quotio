@@ -2305,6 +2305,8 @@ private extension QuotaProvider {
         case .openRouter: return "OpenRouter"
         case .amp: return "Amp"
         case .glm: return "Z.ai"
+        case .kimi: return "Kimi"
+        case .minimax: return "MiniMax"
         case .warp: return "Warp"
         case .clinePass: return "ClinePass"
         }

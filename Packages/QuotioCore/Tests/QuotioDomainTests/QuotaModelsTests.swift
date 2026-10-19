@@ -98,11 +98,14 @@ final class QuotaModelsTests: XCTestCase {
         XCTAssertFalse(QuotaProvider.cursor.supportsManualAuth)
         XCTAssertTrue(QuotaProvider.warp.isQuotaTrackingOnly)
         for provider in [
-            QuotaProvider.factoryDroid, .devin, .grok, .openRouter, .amp, .warp,
+            QuotaProvider.factoryDroid, .devin, .grok, .openRouter, .amp, .warp, .minimax,
         ] {
             XCTAssertFalse(provider.supportsLocalProxySetup)
         }
         XCTAssertTrue(QuotaProvider.codex.supportsLocalProxySetup)
+        XCTAssertTrue(QuotaProvider.kimi.supportsLocalProxySetup)
+        XCTAssertTrue(QuotaProvider.kimi.usesAPIKeyAuth)
+        XCTAssertTrue(QuotaProvider.minimax.usesAPIKeyAuth)
         XCTAssertEqual(
             Set(QuotaProvider.allCases.filter(\.isImportedFromLocalIDE)),
             [.cursor, .trae]

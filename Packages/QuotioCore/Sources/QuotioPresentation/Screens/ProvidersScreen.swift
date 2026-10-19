@@ -38,6 +38,7 @@ struct ProvidersScreen: View {
     @State private var showAddProviderPopover = false
     @State private var switchingAccount: AccountRowData?
     @State private var recoveryHelpAccount: AccountRowData?
+    @State private var showGrokConnectionSheet = false
     
     // MARK: - Computed Properties
     
@@ -45,12 +46,13 @@ struct ProvidersScreen: View {
     private var addableProviders: [QuotaProvider] {
         if modeManager.isLocalProxyMode {
             return QuotaProvider.allCases.filter {
-                ![.factoryDroid, .openRouter, .amp].contains($0) && ($0.supportsManualAuth || $0 == .clinePass)
+                ![.factoryDroid, .openRouter, .amp, .minimax].contains($0) && ($0.supportsManualAuth || $0 == .clinePass)
             }
         } else {
             return QuotaProvider.allCases.filter {
                 $0.supportsQuotaOnlyMode
-                    && ($0.supportsManualAuth || $0 == .glm || $0 == .clinePass)
+                    && ($0.supportsManualAuth || $0 == .glm || $0 == .clinePass
+                        || ($0 == .grok && modeManager.isMonitorMode))
                     && ($0 != .amp || modeManager.isMonitorMode)
             }
         }
@@ -283,6 +285,13 @@ struct ProvidersScreen: View {
                 }
             )
         }
+        .sheet(isPresented: $showGrokConnectionSheet) {
+            GrokConnectionSheet {
+                await quotaController.connectGrokAccounts()
+            } onDismiss: {
+                showGrokConnectionSheet = false
+            }
+        }
         .sheet(item: $recoveryHelpAccount) { account in
             AccountRecoveryHelpSheet(account: account) {
                 recoveryHelpAccount = nil
@@ -385,7 +394,7 @@ struct ProvidersScreen: View {
                                 handleEditClinePassAccount(account)
                             } else if provider == .warp {
                                 handleEditWarpAccount(account)
-                            } else if [.factoryDroid, .openRouter, .amp].contains(provider) {
+                            } else if [.factoryDroid, .openRouter, .amp, .kimi, .minimax].contains(provider) {
                                 handleEditMonitorAPIKeyAccount(account)
                             }
                         },
@@ -502,6 +511,10 @@ struct ProvidersScreen: View {
     // MARK: - Helper Functions
 
     private func handleAddProvider(_ provider: QuotaProvider) {
+        if provider == .grok {
+            showGrokConnectionSheet = true
+            return
+        }
         if provider == .clinePass {
             customProviderSheetMode = .add(.clinePass)
             return
@@ -511,7 +524,8 @@ struct ProvidersScreen: View {
             showGLMConnectionSheet = true
             return
         }
-        if [.factoryDroid, .openRouter, .amp].contains(provider) {
+        if [.factoryDroid, .openRouter, .amp, .minimax].contains(provider)
+            || (modeManager.isMonitorMode && provider == .kimi) {
             editingMonitorAPIKeyAccount = nil
             monitorAPIKeyProvider = provider
             return
@@ -550,6 +564,10 @@ struct ProvidersScreen: View {
             case .warp: handleEditWarpAccount(account)
             default: handleEditMonitorAPIKeyAccount(account)
             }
+            return
+        }
+        if account.provider == .grok {
+            showGrokConnectionSheet = true
             return
         }
         if account.requiresSourceRecovery {
