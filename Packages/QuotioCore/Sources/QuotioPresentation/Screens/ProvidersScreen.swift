@@ -37,6 +37,7 @@ struct ProvidersScreen: View {
     @State private var editingMonitorAPIKeyAccount: Account?
     @State private var showAddProviderPopover = false
     @State private var switchingAccount: AccountRowData?
+    @State private var recoveryHelpAccount: AccountRowData?
     
     // MARK: - Computed Properties
     
@@ -72,7 +73,8 @@ struct ProvidersScreen: View {
                 let data = AccountRowData.from(
                     monitorAccount: account,
                     status: state.status,
-                    statusMessage: state.message
+                    statusMessage: state.message,
+                    credentialAccessRequired: accounts.isCredentialUnreadable(account)
                 )
                 groups[account.provider, default: []].append(data)
             }
@@ -263,6 +265,10 @@ struct ProvidersScreen: View {
             AddProviderPopover(
                 providers: addableProviders,
                 existingCounts: providerAccountCounts,
+                removedAccountCount: modeManager.isMonitorMode ? quotaController.removedAccountCount : 0,
+                onRestoreRemovedAccounts: {
+                    Task { await quotaController.restoreRemovedAccounts() }
+                },
                 onSelectProvider: { provider in
                     handleAddProvider(provider)
                 },
@@ -276,6 +282,19 @@ struct ProvidersScreen: View {
                     showAddProviderPopover = false
                 }
             )
+        }
+        .sheet(item: $recoveryHelpAccount) { account in
+            AccountRecoveryHelpSheet(account: account) {
+                recoveryHelpAccount = nil
+                Task {
+                    await quotaController.refresh(
+                        account: QuotaAccountID(provider: account.provider, accountKey: account.menuBarAccountKey),
+                        allowsCredentialAccessPrompt: true
+                    )
+                }
+            } onDismiss: {
+                recoveryHelpAccount = nil
+            }
         }
         .sheet(item: $switchingAccount) { account in
             SwitchAccountSheet(
@@ -370,6 +389,20 @@ struct ProvidersScreen: View {
                                 handleEditMonitorAPIKeyAccount(account)
                             }
                         },
+                        onRefreshAccount: modeManager.isMonitorMode && provider.supportsQuotaOnlyMode ? { account in
+                            Task {
+                                await quotaController.refresh(
+                                    account: QuotaAccountID(
+                                        provider: account.provider,
+                                        accountKey: account.menuBarAccountKey
+                                    ),
+                                    allowsCredentialAccessPrompt: true
+                                )
+                            }
+                        } : nil,
+                        onReconnectAccount: modeManager.isMonitorMode ? { account in
+                            handleReconnectAccount(account)
+                        } : nil,
                         onSwitchAccount: provider == .antigravity ? { account in
                             switchingAccount = account
                         } : nil,
@@ -378,6 +411,18 @@ struct ProvidersScreen: View {
                         },
                         onDownloadAccount: { account in
                             Task { await downloadAccountAuthFile(account) }
+                        },
+                        isAccountRefreshing: { account in
+                            quota.isRefreshing(account: QuotaAccountID(
+                                provider: account.provider,
+                                accountKey: account.menuBarAccountKey
+                            ))
+                        },
+                        isAccountRefreshBlocked: { account in
+                            quota.isRefreshBlocked(for: QuotaAccountID(
+                                provider: account.provider,
+                                accountKey: account.menuBarAccountKey
+                            ))
                         },
                         isAccountActive: provider == .antigravity ? { account in
                             antigravityAccounts.isActive(email: account.displayName)
@@ -489,8 +534,41 @@ struct ProvidersScreen: View {
         }
     }
     
+    /// Repairs an account in the way its credential owner allows: regain Keychain
+    /// access, edit a stored key, send the user to the owning app or CLI, or sign in
+    /// again with Quotio's own login.
+    private func handleReconnectAccount(_ account: AccountRowData) {
+        let accountID = QuotaAccountID(provider: account.provider, accountKey: account.menuBarAccountKey)
+        if account.credentialAccessRequired {
+            Task { await quotaController.restoreCredentialAccess(for: accountID) }
+            return
+        }
+        if account.canEdit {
+            switch account.provider {
+            case .glm: handleEditGlmAccount(account)
+            case .clinePass: handleEditClinePassAccount(account)
+            case .warp: handleEditWarpAccount(account)
+            default: handleEditMonitorAPIKeyAccount(account)
+            }
+            return
+        }
+        if account.requiresSourceRecovery {
+            recoveryHelpAccount = account
+            return
+        }
+        let builtInMonitorLoginProviders: Set<QuotaProvider> = [
+            .claude, .codex, .copilot, .kiro, .antigravity,
+        ]
+        if builtInMonitorLoginProviders.contains(account.provider) {
+            quotaController.cancelOAuth()
+            selectedProvider = account.provider
+        } else {
+            recoveryHelpAccount = account
+        }
+    }
+
     private func deleteAccount(_ account: AccountRowData) async {
-        // Only proxy accounts can be deleted via API
+        // AccountRowData exposes only source-safe destructive actions.
         guard account.canDelete else { return }
 
         if modeManager.isMonitorMode, case .monitor = account.source {

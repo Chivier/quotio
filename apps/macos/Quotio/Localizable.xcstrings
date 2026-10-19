@@ -6828,6 +6828,7 @@
         }
       }
     },
+    "dashboard.averageQuota" : {"localizations" : {"en" : {"stringUnit" : {"state" : "translated", "value" : "Average Quota"}}, "fr" : {"stringUnit" : {"state" : "translated", "value" : "Quota moyen"}}, "vi" : {"stringUnit" : {"state" : "translated", "value" : "Hạn mức trung bình"}}, "zh-Hans" : {"stringUnit" : {"state" : "translated", "value" : "平均配额"}}}},
     "dashboard.clickToInstall" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -7118,6 +7119,7 @@
         }
       }
     },
+    "dashboard.partialQuotaCoverage" : {"localizations" : {"en" : {"stringUnit" : {"state" : "translated", "value" : "Some tracked accounts have no quota data."}}, "fr" : {"stringUnit" : {"state" : "translated", "value" : "Les données de quota manquent pour certains comptes suivis."}}, "vi" : {"stringUnit" : {"state" : "translated", "value" : "Một số tài khoản được theo dõi chưa có dữ liệu hạn mức."}}, "zh-Hans" : {"stringUnit" : {"state" : "translated", "value" : "部分已跟踪账户暂无配额数据。"}}}},
     "dashboard.processed" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -10527,6 +10529,8 @@
         "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "Quotio" } }
       }
     },
+    "monitor.status.authenticationRequired" : {"localizations" : {"en" : {"stringUnit" : {"state" : "translated", "value" : "This login has expired. Sign in again to restore quota access."}}, "fr" : {"stringUnit" : {"state" : "translated", "value" : "Cette connexion a expiré. Reconnectez-vous pour restaurer l’accès aux quotas."}}, "vi" : {"stringUnit" : {"state" : "translated", "value" : "Phiên đăng nhập này đã hết hạn. Hãy đăng nhập lại để khôi phục quyền truy cập quota."}}, "zh-Hans" : {"stringUnit" : {"state" : "translated", "value" : "此登录已失效，请重新登录以恢复配额访问。"}}}},
+    "monitor.status.credentialUnreadable" : {"localizations" : {"en" : {"stringUnit" : {"state" : "translated", "value" : "The saved credential exists in Keychain, but this build cannot read it. Restore access and allow Quotio in the macOS prompt; you do not need to enter it again."}}, "fr" : {"stringUnit" : {"state" : "translated", "value" : "L’identifiant est enregistré dans le trousseau, mais cette version ne peut pas le lire. Restaurez l’accès et autorisez Quotio dans la fenêtre macOS, sans le saisir à nouveau."}}, "vi" : {"stringUnit" : {"state" : "translated", "value" : "Thông tin xác thực vẫn có trong Keychain nhưng bản này không đọc được. Khôi phục quyền truy cập và cho phép Quotio trong hộp thoại macOS; không cần nhập lại."}}, "zh-Hans" : {"stringUnit" : {"state" : "translated", "value" : "凭据仍保存在钥匙串中，但当前版本无法读取。请恢复访问并在 macOS 提示中允许 Quotio，无需重新输入凭据。"}}}},
     "monitor.refresh.failed" : {
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "The latest refresh failed. Showing the last successful quota." } },
@@ -12365,6 +12369,16 @@
         }
       }
     },
+    "providers.recoveryHelp.message" : {"localizations" : {"en" : {"stringUnit" : {"state" : "translated", "value" : "This account is managed by %@ through %@. Sign in again in the source app or command-line tool, then return to Quotio and refresh."}}, "fr" : {"stringUnit" : {"state" : "translated", "value" : "Ce compte %@ est géré via %@. Reconnectez-vous dans l’application source ou l’outil en ligne de commande, puis revenez dans Quotio et actualisez."}}, "vi" : {"stringUnit" : {"state" : "translated", "value" : "Tài khoản %@ này được quản lý qua %@. Hãy đăng nhập lại trong ứng dụng nguồn hoặc công cụ dòng lệnh, sau đó quay lại Quotio và làm mới."}}, "zh-Hans" : {"stringUnit" : {"state" : "translated", "value" : "此 %@ 账户通过“%@”管理。请在来源应用或命令行工具中重新登录，然后返回 Quotio 刷新。"}}}},
+    "providers.recoveryHelp.refresh" : {"localizations" : {"en" : {"stringUnit" : {"state" : "translated", "value" : "I’ve signed in — Refresh"}}, "fr" : {"stringUnit" : {"state" : "translated", "value" : "Je suis reconnecté — Actualiser"}}, "vi" : {"stringUnit" : {"state" : "translated", "value" : "Đã đăng nhập — Làm mới"}}, "zh-Hans" : {"stringUnit" : {"state" : "translated", "value" : "已重新登录，立即刷新"}}}},
+    "providers.recoveryHelp.title" : {"localizations" : {"en" : {"stringUnit" : {"state" : "translated", "value" : "Sign in at the source"}}, "fr" : {"stringUnit" : {"state" : "translated", "value" : "Se reconnecter à la source"}}, "vi" : {"stringUnit" : {"state" : "translated", "value" : "Đăng nhập lại tại nguồn"}}, "zh-Hans" : {"stringUnit" : {"state" : "translated", "value" : "在来源应用中重新登录"}}}},
+    "providers.removeConfirm" : {"localizations" : {"en" : {"stringUnit" : {"state" : "translated", "value" : "Remove Account from Quotio?"}}, "fr" : {"stringUnit" : {"state" : "translated", "value" : "Retirer le compte de Quotio ?"}}, "vi" : {"stringUnit" : {"state" : "translated", "value" : "Xóa tài khoản khỏi Quotio?"}}, "zh-Hans" : {"stringUnit" : {"state" : "translated", "value" : "从 Quotio 移除账户？"}}}},
+    "providers.removeFromQuotio" : {"localizations" : {"en" : {"stringUnit" : {"state" : "translated", "value" : "Remove from Quotio"}}, "fr" : {"stringUnit" : {"state" : "translated", "value" : "Retirer de Quotio"}}, "vi" : {"stringUnit" : {"state" : "translated", "value" : "Xóa khỏi Quotio"}}, "zh-Hans" : {"stringUnit" : {"state" : "translated", "value" : "从 Quotio 移除"}}}},
+    "providers.removeMessage" : {"localizations" : {"en" : {"stringUnit" : {"state" : "translated", "value" : "This removes the account and its saved quota from Quotio. The original login in other apps or command-line tools stays on this Mac. You can restore it later from Add Account."}}, "fr" : {"stringUnit" : {"state" : "translated", "value" : "Le compte et son quota enregistré seront retirés de Quotio. La connexion d’origine dans les autres applications ou outils reste sur ce Mac. Vous pourrez la restaurer via Ajouter un compte."}}, "vi" : {"stringUnit" : {"state" : "translated", "value" : "Thao tác này xóa tài khoản và quota đã lưu khỏi Quotio. Thông tin đăng nhập gốc trong ứng dụng hoặc công cụ dòng lệnh khác vẫn còn trên máy Mac này. Bạn có thể khôi phục sau từ Thêm tài khoản."}}, "zh-Hans" : {"stringUnit" : {"state" : "translated", "value" : "这只会从 Quotio 移除账户和已保存的配额，不会删除其他应用或命令行工具中的原始登录凭据。之后可从“添加账户”恢复。"}}}},
+    "providers.restoreCredentialAccess" : {"localizations" : {"en" : {"stringUnit" : {"state" : "translated", "value" : "Restore access"}}, "fr" : {"stringUnit" : {"state" : "translated", "value" : "Restaurer l’accès"}}, "vi" : {"stringUnit" : {"state" : "translated", "value" : "Khôi phục quyền truy cập"}}, "zh-Hans" : {"stringUnit" : {"state" : "translated", "value" : "恢复钥匙串访问"}}}},
+    "providers.restoreCredentialAccess.help" : {"localizations" : {"en" : {"stringUnit" : {"state" : "translated", "value" : "Ask macOS to let this build read the saved credential. Choose Always Allow to keep access after restarts."}}, "fr" : {"stringUnit" : {"state" : "translated", "value" : "Demander à macOS d’autoriser cette version à lire l’identifiant enregistré. Choisissez « Toujours autoriser » pour conserver l’accès après un redémarrage."}}, "vi" : {"stringUnit" : {"state" : "translated", "value" : "Yêu cầu macOS cho phép bản này đọc thông tin xác thực đã lưu. Chọn Luôn cho phép để giữ quyền sau khi khởi động lại."}}, "zh-Hans" : {"stringUnit" : {"state" : "translated", "value" : "请求 macOS 允许当前版本读取已保存的凭据。选择“始终允许”可在重启后保持访问。"}}}},
+    "providers.restoreRemovedAccounts" : {"localizations" : {"en" : {"stringUnit" : {"state" : "translated", "value" : "Restore removed accounts (%d)"}}, "fr" : {"stringUnit" : {"state" : "translated", "value" : "Restaurer les comptes retirés (%d)"}}, "vi" : {"stringUnit" : {"state" : "translated", "value" : "Khôi phục tài khoản đã xóa (%d)"}}, "zh-Hans" : {"stringUnit" : {"state" : "translated", "value" : "恢复已移除账户（%d）"}}}},
+    "providers.signInAgain" : {"localizations" : {"en" : {"stringUnit" : {"state" : "translated", "value" : "Sign In Again"}}, "fr" : {"stringUnit" : {"state" : "translated", "value" : "Se reconnecter"}}, "vi" : {"stringUnit" : {"state" : "translated", "value" : "Đăng nhập lại"}}, "zh-Hans" : {"stringUnit" : {"state" : "translated", "value" : "重新登录"}}}},
     "providers.source.disk" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -12423,6 +12437,7 @@
         }
       }
     },
+    "providers.updateCredentials" : {"localizations" : {"en" : {"stringUnit" : {"state" : "translated", "value" : "Update Credentials"}}, "fr" : {"stringUnit" : {"state" : "translated", "value" : "Mettre à jour les identifiants"}}, "vi" : {"stringUnit" : {"state" : "translated", "value" : "Cập nhật thông tin xác thực"}}, "zh-Hans" : {"stringUnit" : {"state" : "translated", "value" : "更新凭据"}}}},
     "providers.yourAccounts" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -12686,6 +12701,8 @@
         }
       }
     },
+    "quota.reset.passed" : {"localizations" : {"en" : {"stringUnit" : {"state" : "translated", "value" : "Reset since update"}}, "fr" : {"stringUnit" : {"state" : "translated", "value" : "Réinitialisé depuis"}}, "vi" : {"stringUnit" : {"state" : "translated", "value" : "Đã đặt lại"}}, "zh-Hans" : {"stringUnit" : {"state" : "translated", "value" : "已重置，待刷新"}}}},
+    "quota.reset.passedHelp" : {"localizations" : {"en" : {"stringUnit" : {"state" : "translated", "value" : "This limit reset after the shown usage was fetched. Refresh the account to see current usage."}}, "fr" : {"stringUnit" : {"state" : "translated", "value" : "Cette limite a été réinitialisée après la récupération de l’utilisation affichée. Actualisez le compte pour voir l’utilisation actuelle."}}, "vi" : {"stringUnit" : {"state" : "translated", "value" : "Giới hạn này đã được đặt lại sau khi dữ liệu sử dụng hiển thị được lấy. Làm mới tài khoản để xem mức sử dụng hiện tại."}}, "zh-Hans" : {"stringUnit" : {"state" : "translated", "value" : "显示的用量是在该额度重置之前获取的。请刷新此账户以查看当前用量。"}}}},
     "Quotio" : {
       "comment" : "The main window of the application.",
       "isCommentAutoGenerated" : true
@@ -16742,6 +16759,7 @@
         }
       }
     },
+    "settings.updates.localBuild" : {"localizations" : {"en" : {"stringUnit" : {"state" : "translated", "value" : "Updates are disabled in local development builds to preserve local changes."}}, "fr" : {"stringUnit" : {"state" : "translated", "value" : "Les mises à jour sont désactivées dans les versions de développement locales afin de préserver les modifications locales."}}, "vi" : {"stringUnit" : {"state" : "translated", "value" : "Các bản cập nhật bị tắt trong bản dựng phát triển cục bộ để giữ nguyên các thay đổi cục bộ."}}, "zh-Hans" : {"stringUnit" : {"state" : "translated", "value" : "本地开发版本已停用自动更新，避免覆盖本地修改。"}}}},
     "settings.upstreamProxy" : {
       "extractionState" : "stale",
       "localizations" : {

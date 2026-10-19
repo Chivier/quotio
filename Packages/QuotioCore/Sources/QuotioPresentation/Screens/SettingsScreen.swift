@@ -870,27 +870,37 @@ struct UpdateSettingsSection: View {
     
     var body: some View {
         Section {
-            Toggle("settings.autoCheckUpdates".localized(), isOn: autoCheckUpdatesBinding)
-            
-            HStack {
-                Text("settings.lastChecked".localized())
-                Spacer()
-                if let date = updateModel.snapshot.lastCheckDate {
-                    Text(date, style: .relative)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text("settings.never".localized())
-                        .foregroundStyle(.secondary)
-                }
+            if updateModel.isSelfUpdateAvailable {
+                updateControls
+            } else {
+                Text("settings.updates.localBuild".localized())
+                    .foregroundStyle(.secondary)
             }
-            
-            Button("settings.checkNow".localized()) {
-                updateModel.checkForUpdates()
-            }
-            .disabled(!updateModel.snapshot.canCheck)
         } header: {
             Label("settings.updates".localized(), systemImage: "arrow.down.circle")
         }
+    }
+
+    @ViewBuilder
+    private var updateControls: some View {
+        Toggle("settings.autoCheckUpdates".localized(), isOn: autoCheckUpdatesBinding)
+        
+        HStack {
+            Text("settings.lastChecked".localized())
+            Spacer()
+            if let date = updateModel.snapshot.lastCheckDate {
+                Text(date, style: .relative)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("settings.never".localized())
+                    .foregroundStyle(.secondary)
+            }
+        }
+        
+        Button("settings.checkNow".localized()) {
+            updateModel.checkForUpdates()
+        }
+        .disabled(!updateModel.snapshot.canCheck)
     }
 }
 
@@ -2209,54 +2219,13 @@ struct AboutUpdateCard: View {
                 systemImage: "arrow.down.circle",
                 color: .blue
             )
-            
-            HStack {
-                Text("settings.autoCheckUpdates".localized())
+
+            if updateModel.isSelfUpdateAvailable {
+                updateControls
+            } else {
+                Text("settings.updates.localBuild".localized())
                     .font(.subheadline)
-                Spacer()
-                Toggle("", isOn: autoCheckUpdatesBinding)
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-            }
-            
-            HStack {
-                Text("settings.updateChannel.receiveBeta".localized())
-                    .font(.subheadline)
-                Spacer()
-                Toggle("", isOn: Binding(
-                    get: { updateModel.snapshot.channel == .beta },
-                    set: { newValue in
-                        updateModel.setChannel(newValue ? .beta : .stable)
-                    }
-                ))
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-            }
-            
-            Divider()
-
-            HStack {
-                Text("settings.lastChecked".localized())
-                Spacer()
-                if let date = updateModel.snapshot.lastCheckDate {
-                    Text(date, style: .relative)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text("settings.never".localized())
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .font(.caption)
-            .foregroundStyle(.secondary)
-
-            HStack {
-                Spacer()
-
-                Button("settings.checkNow".localized()) {
-                    updateModel.checkForUpdates()
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
+                    .foregroundStyle(.secondary)
             }
         }
         .padding(16)
@@ -2274,6 +2243,58 @@ struct AboutUpdateCard: View {
             withAnimation(.easeInOut(duration: 0.2)) {
                 isHovered = hovering
             }
+        }
+    }
+
+    @ViewBuilder
+    private var updateControls: some View {
+        HStack {
+            Text("settings.autoCheckUpdates".localized())
+                .font(.subheadline)
+            Spacer()
+            Toggle("", isOn: autoCheckUpdatesBinding)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+        }
+        
+        HStack {
+            Text("settings.updateChannel.receiveBeta".localized())
+                .font(.subheadline)
+            Spacer()
+            Toggle("", isOn: Binding(
+                get: { updateModel.snapshot.channel == .beta },
+                set: { newValue in
+                    updateModel.setChannel(newValue ? .beta : .stable)
+                }
+            ))
+                .toggleStyle(.switch)
+                .controlSize(.small)
+        }
+        
+        Divider()
+
+        HStack {
+            Text("settings.lastChecked".localized())
+            Spacer()
+            if let date = updateModel.snapshot.lastCheckDate {
+                Text(date, style: .relative)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("settings.never".localized())
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+
+        HStack {
+            Spacer()
+
+            Button("settings.checkNow".localized()) {
+                updateModel.checkForUpdates()
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
         }
     }
 }

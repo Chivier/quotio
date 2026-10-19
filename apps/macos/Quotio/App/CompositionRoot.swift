@@ -428,7 +428,8 @@ enum CompositionRoot {
             icon: AppKitUpdaterIconAdapter()
         )
         let applicationUpdateModel = ApplicationUpdateScreenModel(
-            controller: applicationUpdateController
+            controller: applicationUpdateController,
+            isSelfUpdateAvailable: !AppIdentity.isDevelopmentBuild
         )
         let notificationSettingsModel = NotificationSettingsScreenModel(
             controller: notificationController

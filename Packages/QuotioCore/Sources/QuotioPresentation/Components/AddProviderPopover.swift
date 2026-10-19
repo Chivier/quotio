@@ -15,6 +15,8 @@ import SwiftUI
 struct AddProviderPopover: View {
     let providers: [QuotaProvider]
     let existingCounts: [QuotaProvider: Int]  // Number of existing accounts per provider
+    var removedAccountCount: Int = 0
+    var onRestoreRemovedAccounts: (() -> Void)?
     var onSelectProvider: (QuotaProvider) -> Void
     var onScanIDEs: () -> Void
     var onAddCustomProvider: () -> Void
@@ -67,7 +69,26 @@ struct AddProviderPopover: View {
             }
             .buttonStyle(.menuRow)
             .focusEffectDisabled()
-            
+
+            if removedAccountCount > 0, let onRestoreRemovedAccounts {
+                Button {
+                    onRestoreRemovedAccounts()
+                    onDismiss()
+                } label: {
+                    HStack {
+                        Image(systemName: "arrow.uturn.backward.circle")
+                            .foregroundStyle(.orange)
+                        Text(String(
+                            format: "providers.restoreRemovedAccounts".localized(),
+                            removedAccountCount
+                        ))
+                        Spacer()
+                    }
+                }
+                .buttonStyle(.menuRow)
+                .focusEffectDisabled()
+            }
+
             // Add Custom Provider option
             Button {
                 onAddCustomProvider()

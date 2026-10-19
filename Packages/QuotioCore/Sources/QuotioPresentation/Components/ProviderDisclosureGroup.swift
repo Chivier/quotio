@@ -18,9 +18,13 @@ struct ProviderDisclosureGroup: View {
     let accounts: [AccountRowData]
     var onDeleteAccount: ((AccountRowData) -> Void)?
     var onEditAccount: ((AccountRowData) -> Void)?
+    var onRefreshAccount: ((AccountRowData) -> Void)?
+    var onReconnectAccount: ((AccountRowData) -> Void)?
     var onSwitchAccount: ((AccountRowData) -> Void)?
     var onToggleDisabled: ((AccountRowData) -> Void)?
     var onDownloadAccount: ((AccountRowData) -> Void)?
+    var isAccountRefreshing: ((AccountRowData) -> Bool)?
+    var isAccountRefreshBlocked: ((AccountRowData) -> Bool)?
     var isAccountActive: ((AccountRowData) -> Bool)?
 
     @State private var isExpanded: Bool = true
@@ -44,11 +48,15 @@ struct ProviderDisclosureGroup: View {
                     account: account,
                     onDelete: onDeleteAccount != nil ? { onDeleteAccount?(account) } : nil,
                     onEdit: onEditAccount != nil ? { onEditAccount?(account) } : nil,
+                    onRefresh: onRefreshAccount != nil ? { onRefreshAccount?(account) } : nil,
+                    onReconnect: onReconnectAccount != nil ? { onReconnectAccount?(account) } : nil,
                     onSwitch: onSwitchAccount != nil ? { onSwitchAccount?(account) } : nil,
                     onToggleDisabled: onToggleDisabled != nil ? { onToggleDisabled?(account) } : nil,
                     onDownload: account.canDownloadAuthFile && onDownloadAccount != nil
                         ? { onDownloadAccount?(account) }
                         : nil,
+                    isRefreshing: isAccountRefreshing?(account) ?? false,
+                    isRefreshBlocked: isAccountRefreshBlocked?(account) ?? false,
                     isActiveInIDE: isAccountActive?(account) ?? false
                 )
                 .padding(.leading, 4)

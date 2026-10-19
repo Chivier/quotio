@@ -7,10 +7,14 @@ import QuotioDomain
 @Observable
 public final class ApplicationUpdateScreenModel {
     public private(set) var snapshot: ApplicationUpdateSnapshot
+    /// False for local development builds, which must never replace themselves with a
+    /// published release.
+    public let isSelfUpdateAvailable: Bool
     private let controller: any ApplicationUpdateControlling
 
-    public init(controller: any ApplicationUpdateControlling) {
+    public init(controller: any ApplicationUpdateControlling, isSelfUpdateAvailable: Bool = true) {
         self.controller = controller
+        self.isSelfUpdateAvailable = isSelfUpdateAvailable
         self.snapshot = controller.snapshot
         controller.setDidChangeHandler { [weak self] snapshot in
             self?.snapshot = snapshot
