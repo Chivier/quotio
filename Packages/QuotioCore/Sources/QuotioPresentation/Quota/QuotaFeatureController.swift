@@ -259,15 +259,21 @@ public final class QuotaFeatureController {
         await refresh(provider: provider)
     }
 
+    /// - Parameter expectedAccountID: set when re-authenticating one existing account;
+    ///   a login that resolves to a different account is rejected instead of replacing it.
     func startOAuth(
         for provider: QuotaProvider,
         method: OAuthAuthorizationMethod = .providerDefault,
-        launchMode: OAuthLaunchMode = .manual
+        launchMode: OAuthLaunchMode = .manual,
+        expectedAccountID: String? = nil
     ) async {
         await oauth.start(OAuthAuthorizationRequest(
             providerID: AccountProviderID(rawValue: provider.rawValue),
             method: method,
-            automaticallyOpensBrowser: launchMode == .autoOpen
+            automaticallyOpensBrowser: launchMode == .autoOpen,
+            expectedAccountID: expectedAccountID,
+            // Adding a Codex workspace that is already connected is reported, not merged.
+            addingNewAccount: expectedAccountID == nil && provider == .codex && operatingMode == .monitor
         ))
     }
 

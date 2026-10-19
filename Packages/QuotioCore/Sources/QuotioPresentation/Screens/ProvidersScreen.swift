@@ -39,6 +39,8 @@ struct ProvidersScreen: View {
     @State private var switchingAccount: AccountRowData?
     @State private var recoveryHelpAccount: AccountRowData?
     @State private var showGrokConnectionSheet = false
+    /// Set only while the OAuth sheet re-authenticates one existing account.
+    @State private var reconnectAccountID: String?
     
     // MARK: - Computed Properties
     
@@ -189,8 +191,9 @@ struct ProvidersScreen: View {
             toolbarContent
         }
         .sheet(item: $selectedProvider) { provider in
-            OAuthSheet(provider: provider) {
+            OAuthSheet(provider: provider, expectedAccountID: reconnectAccountID) {
                 selectedProvider = nil
+                reconnectAccountID = nil
                 quotaController.cancelOAuth()
             }
         }
@@ -544,6 +547,7 @@ struct ProvidersScreen: View {
             showWarpConnectionSheet = true
         } else {
             quotaController.cancelOAuth()
+            reconnectAccountID = nil
             selectedProvider = provider
         }
     }
@@ -579,6 +583,7 @@ struct ProvidersScreen: View {
         ]
         if builtInMonitorLoginProviders.contains(account.provider) {
             quotaController.cancelOAuth()
+            reconnectAccountID = account.id
             selectedProvider = account.provider
         } else {
             recoveryHelpAccount = account
@@ -1033,6 +1038,7 @@ struct OAuthSheet: View {
     @Environment(QuotaFeatureController.self) private var viewModel
     @Environment(OperatingModeManager.self) private var modeManager
     let provider: QuotaProvider
+    var expectedAccountID: String? = nil
     let onDismiss: () -> Void
     
     @State private var hasStartedAuth = false
@@ -1134,7 +1140,8 @@ struct OAuthSheet: View {
                         Task {
                             await viewModel.startOAuth(
                                 for: provider,
-                                method: provider == .kiro ? selectedKiroMethod : .providerDefault
+                                method: provider == .kiro ? selectedKiroMethod : .providerDefault,
+                                expectedAccountID: expectedAccountID
                             )
                         }
                     } label: {
@@ -1148,7 +1155,8 @@ struct OAuthSheet: View {
                         Task {
                             await viewModel.startOAuth(
                                 for: provider,
-                                method: provider == .kiro ? selectedKiroMethod : .providerDefault
+                                method: provider == .kiro ? selectedKiroMethod : .providerDefault,
+                                expectedAccountID: expectedAccountID
                             )
                         }
                     } label: {
