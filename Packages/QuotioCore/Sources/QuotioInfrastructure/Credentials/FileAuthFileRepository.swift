@@ -146,7 +146,7 @@ public actor FileAuthFileRepository: AuthFileRepository {
               let type = json["type"] as? String,
               let providerID = Self.providerID(for: type) else { return nil }
 
-        var email = json["email"] as? String
+        let email = json["email"] as? String
         var login = json["login"] as? String
         var legacyIdentityKeys: [String] = []
         if providerID.rawValue == "github-copilot" {
@@ -156,9 +156,21 @@ public actor FileAuthFileRepository: AuthFileRepository {
                 legacyIdentityKeys.append(rawLogin)
             }
         }
-        if providerID.rawValue == "kiro", Self.nonBlank(email) == nil,
-           let authProvider = Self.nonBlank(json["provider"] as? String) {
-            email = "Kiro (\(authProvider))"
+        // A login provider (Google/GitHub) is not an account identity. Earlier
+        // synthetic keys survive only as migration aliases for the very same file.
+        var kiroProfileARN: String?
+        if providerID.rawValue == "kiro" {
+            kiroProfileARN = Self.firstNonBlank(
+                json["profile_arn"] as? String,
+                json["profileArn"] as? String
+            )
+            legacyIdentityKeys.append(contentsOf: KiroAccountIdentity.legacyKeys(
+                email: email,
+                profileARN: kiroProfileARN,
+                filename: url.lastPathComponent,
+                loginProvider: json["provider"] as? String,
+                isNativeCredential: false
+            ).sorted())
         }
 
         let expired: Date?
@@ -180,7 +192,8 @@ public actor FileAuthFileRepository: AuthFileRepository {
             filePath: url.path,
             source: .cliProxyApi,
             filename: url.lastPathComponent,
-            legacyIdentityKeys: legacyIdentityKeys
+            legacyIdentityKeys: legacyIdentityKeys,
+            kiroProfileARN: kiroProfileARN
         )
     }
 

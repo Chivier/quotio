@@ -130,8 +130,12 @@ actor AntigravitySwitchDatabase {
     }
 
     init() {
-        databaseURL = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/Antigravity/User/globalStorage/state.vscdb")
+        self.init(databaseURL: FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Antigravity/User/globalStorage/state.vscdb"))
+    }
+
+    init(databaseURL: URL) {
+        self.databaseURL = databaseURL
         backupURL = databaseURL.appendingPathExtension("quotio.backup")
     }
 

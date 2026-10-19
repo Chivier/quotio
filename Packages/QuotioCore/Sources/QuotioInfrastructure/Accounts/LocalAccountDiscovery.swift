@@ -15,6 +15,8 @@ public actor LocalAccountDiscovery: AccountDiscovering {
     private let devinDatabase: any DevinCredentialDatabaseReading
     private let claudeDesktop: ClaudeDesktopCredentialReader
     private let antigravityDatabase: AntigravitySwitchDatabase
+    private var provenAliases: [String: Set<String>] = [:]
+    private var discoveryTail: Task<[Account], Never>?
 
     public init(
         vault: any CredentialVault,
@@ -67,22 +69,53 @@ public actor LocalAccountDiscovery: AccountDiscovering {
     }
 
     public func discoverAccounts() async -> [Account] {
+        // Discoveries run one at a time: each collects the aliases it proves in
+        // `provenAliases`, and an interleaved run would reconcile a partial set.
+        let previous = discoveryTail
+        let task = Task {
+            _ = await previous?.value
+            return await self.performDiscovery()
+        }
+        discoveryTail = task
+        return await task.value
+    }
+
+    private func performDiscovery() async -> [Account] {
         let legacyFiles = await authFiles.scanAllAuthFiles()
         let aliases = Self.codexAliases(from: legacyFiles)
+        provenAliases = [:]
         var candidates = await canonicalizeCodexAccounts(await vault.accounts(), aliases: aliases)
         candidates.append(contentsOf: await discoverNativeFiles(codexAliases: aliases))
         candidates.append(contentsOf: await discoverNativeKeychains(codexAliases: aliases))
         candidates.append(contentsOf: legacyFiles.map(Self.legacyAccount))
-        return AccountSelectionPolicy.preferred(
+        for file in legacyFiles where file.providerID.rawValue == QuotaProvider.kiro.rawValue {
+            prove(Self.legacyAccount(file), aliases: Set(file.legacyIdentityKeys))
+        }
+        // Proven aliases let disabled and removed markers recorded under an older key
+        // keep following the account after its key is canonicalized. A failed write
+        // only delays that migration to the next discovery.
+        try? await metadata.reconcileAliases(provenAliases)
+        let preferred = AccountSelectionPolicy.preferred(
             candidates,
             disabledIDs: await metadata.disabledAccountIDs()
         )
+        return await metadata.filteringAccounts(preferred)
+    }
+
+    /// Records that `aliases` (account keys older builds used) name `account`.
+    private func prove(_ account: Account, aliases: Set<String>) {
+        let ids = Set(aliases.map {
+            AccountIdentity.make(providerID: account.providerID, accountKey: $0).id
+        }).subtracting([account.id])
+        guard !ids.isEmpty else { return }
+        provenAliases[account.id, default: []].formUnion(ids)
     }
 
     static func legacyAccount(_ file: AuthFileDescriptor) -> Account {
         let accountKey: String
         switch file.providerID.rawValue {
-        case QuotaProvider.codex.rawValue, QuotaProvider.copilot.rawValue, "copilot":
+        case QuotaProvider.codex.rawValue, QuotaProvider.copilot.rawValue, "copilot",
+             QuotaProvider.kiro.rawValue:
             accountKey = file.menuBarAccountKey
         default:
             accountKey = nonBlank(file.email)
@@ -97,23 +130,34 @@ public actor LocalAccountDiscovery: AccountDiscovering {
         )
     }
 
+    /// Keys a Codex account by `CodexAccountKey`, keeping its ID so Quotio-owned
+    /// credentials stay addressable.
     static func canonicalizeCodexAccount(
         _ account: Account,
         accountID: String?,
         aliases: [String: String]
     ) -> Account {
         guard account.providerID.rawValue == QuotaProvider.codex.rawValue,
-              let accountID = nonBlank(accountID),
-              let canonicalKey = aliases[accountID] else {
+              let accountID = nonBlank(accountID) else {
             return account
         }
-        return Account(
+        let canonicalKey = CodexAccountKey.canonical(
+            email: account.displayName,
+            accountID: accountID,
+            aliases: aliases,
+            fallback: account.accountKey
+        )
+        return rekeyed(account, accountKey: canonicalKey, displayName: account.displayName)
+    }
+
+    private static func rekeyed(_ account: Account, accountKey: String, displayName: String) -> Account {
+        Account(
             identity: AccountIdentity(
                 id: account.id,
                 providerID: account.providerID,
-                accountKey: canonicalKey
+                accountKey: accountKey
             ),
-            displayName: account.displayName,
+            displayName: displayName,
             source: account.source,
             credentialReference: account.credentialReference,
             capabilities: account.capabilities,
@@ -147,21 +191,27 @@ public actor LocalAccountDiscovery: AccountDiscovering {
     ) async -> [Account] {
         var result: [Account] = []
         for account in accounts {
+            if account.providerID.rawValue == QuotaProvider.kiro.rawValue,
+               let profile = Self.nonBlank(await vault.credential(for: account.id)?.extra["profileArn"]) {
+                // A Quotio login of a profile that is also present on disk is one account.
+                let profileID = AccountIdentity.make(providerID: account.providerID, accountKey: profile).id
+                if profileID != account.id { provenAliases[profileID, default: []].insert(account.id) }
+            }
             guard account.providerID.rawValue == QuotaProvider.codex.rawValue,
                   let credential = await vault.credential(for: account.id) else {
                 result.append(account)
                 continue
             }
-            let accountID = credential.accountID
-                ?? Self.jwtNestedString(
-                    credential.idToken,
-                    namespace: "https://api.openai.com/auth",
-                    claim: "chatgpt_account_id"
-                )
-            result.append(Self.canonicalizeCodexAccount(
+            // The same key the quota fetcher derives, so the row and its quota meet.
+            let owned = CompositeCodexQuotaCredentialLoader.ownedCredential(
+                credential,
+                account: account,
+                legacyAliases: aliases
+            )
+            result.append(Self.rekeyed(
                 account,
-                accountID: accountID,
-                aliases: aliases
+                accountKey: owned.accountKey,
+                displayName: owned.displayName ?? account.displayName
             ))
         }
         return result
@@ -252,7 +302,7 @@ public actor LocalAccountDiscovery: AccountDiscovering {
     }
 
     private func discoverGrokCredentials() async -> [Account] {
-        let path = homeDirectory.appendingPathComponent(".grok/auth.json").path
+        let path = GrokQuotaFetcher.authPath(environment: environment, homeDirectory: homeDirectory)
         guard let data = await quotaFiles.read(path: path) else { return [] }
         return GrokQuotaFetcher.loadCandidates(data: data).map { candidate in
             Self.account(
@@ -266,28 +316,34 @@ public actor LocalAccountDiscovery: AccountDiscovering {
     }
 
     private func discoverCodexFiles(aliases: [String: String]) -> [Account] {
-        var paths: [String] = []
-        if let codexHome = Self.nonBlank(environment["CODEX_HOME"]) {
-            paths.append(URL(fileURLWithPath: codexHome).appendingPathComponent("auth.json").path)
-        }
-        paths.append(homeDirectory.appendingPathComponent(".config/codex/auth.json").path)
-        paths.append(homeDirectory.appendingPathComponent(".codex/auth.json").path)
-        return paths.compactMap { path in
+        LocalCodexQuotaCredentialLoader.nativeAuthPaths(
+            environment: environment,
+            homeDirectory: homeDirectory
+        ).compactMap { path in
             guard let credential = LocalCodexQuotaCredentialLoader.loadNative(path: path) else {
                 return nil
             }
-            let account = Self.account(
-                provider: .codex,
-                accountKey: credential.accountKey,
-                source: .nativeCredential,
-                credentialReference: path
-            )
-            return Self.canonicalizeCodexAccount(
-                account,
-                accountID: credential.accountID,
-                aliases: aliases
-            )
+            return codexAccount(credential, aliases: aliases, credentialReference: path)
         }
+    }
+
+    /// One row per ChatGPT workspace, named by its email, with the key older builds
+    /// used kept as a proven alias.
+    private func codexAccount(
+        _ native: CodexQuotaCredential,
+        aliases: [String: String],
+        credentialReference: String
+    ) -> Account {
+        let credential = LocalCodexQuotaCredentialLoader.applyingLegacyAlias(native, aliases: aliases)
+        let account = Self.account(
+            provider: .codex,
+            accountKey: credential.accountKey,
+            displayName: credential.displayName,
+            source: .nativeCredential,
+            credentialReference: credentialReference
+        )
+        prove(account, aliases: credential.aliases)
+        return account
     }
 
     private func discoverClaudeFile() -> [Account] {
@@ -322,32 +378,35 @@ public actor LocalAccountDiscovery: AccountDiscovering {
     }
 
     private func discoverKiroFile() async -> [Account] {
-        await kiroCredentials.credentials().compactMap { credential in
+        var accounts: [Account] = []
+        for credential in await kiroCredentials.credentials() {
             guard let path = credential.filePath,
-                  path.contains("/.aws/sso/cache/") else { return nil }
-            return Self.account(
+                  path.contains("/.aws/sso/cache/") else { continue }
+            let account = Self.account(
                 provider: .kiro,
                 accountKey: credential.accountKey,
                 source: .nativeCredential,
                 credentialReference: path
             )
+            prove(account, aliases: credential.aliases)
+            accounts.append(account)
         }
+        return accounts
     }
 
     private func discoverNativeKeychains(codexAliases: [String: String]) async -> [Account] {
         var accounts: [Account] = []
-        if let record = await externalCredentials.read(service: "Codex Auth", account: nil),
-           let credential = LocalCodexQuotaCredentialLoader.loadNative(data: record.data) {
-            let account = Self.account(
-                provider: .codex,
-                accountKey: credential.accountKey == "Codex User" ? "Codex" : credential.accountKey,
-                source: .nativeCredential,
+        if let record = await externalCredentials.read(
+            service: CompositeCodexQuotaCredentialLoader.keychainService,
+            account: nil
+        ), let credential = LocalCodexQuotaCredentialLoader.loadNative(
+            data: record.data,
+            fallbackAccountKey: "Codex"
+        ) {
+            accounts.append(codexAccount(
+                credential,
+                aliases: codexAliases,
                 credentialReference: "keychain:Codex Auth"
-            )
-            accounts.append(Self.canonicalizeCodexAccount(
-                account,
-                accountID: credential.accountID,
-                aliases: codexAliases
             ))
         }
         if let record = await externalCredentials.read(

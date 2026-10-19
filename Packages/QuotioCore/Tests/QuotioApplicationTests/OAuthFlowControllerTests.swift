@@ -87,6 +87,42 @@ final class OAuthFlowControllerTests: XCTestCase {
         }
     }
 
+    func testDeniedCredentialWriteKeepsTheAttemptSoCompletingAgainRetries() async {
+        let authorizer = ControllableOAuthAuthorizer(manualProvider: "claude", deniedManualWrites: 1)
+        let controller = OAuthFlowController(authorizer: authorizer)
+        let providerID = AccountProviderID(rawValue: "claude")
+
+        await controller.start(OAuthAuthorizationRequest(providerID: providerID))
+        await waitUntil {
+            if case .awaitingManualCode = await controller.state { return true }
+            return false
+        }
+        await controller.completeManualCode("code#state")
+        await waitUntil {
+            await controller.state == .failed(providerID: providerID, failure: .credentialStorageDenied)
+        }
+        let attemptsCancelled = await authorizer.cancelledCount()
+        XCTAssertEqual(attemptsCancelled, 0)
+
+        await controller.completeManualCode("code#state")
+        await waitUntil {
+            if case .succeeded = await controller.state { return true }
+            return false
+        }
+    }
+
+    func testRequestCarriesReconnectAndAddIntentWithCompatibleDefaults() {
+        let plain = OAuthAuthorizationRequest(providerID: AccountProviderID(rawValue: "codex"))
+        let reconnect = OAuthAuthorizationRequest(
+            providerID: AccountProviderID(rawValue: "codex"),
+            expectedAccountID: "monitor-1",
+            addingNewAccount: false
+        )
+        XCTAssertNil(plain.expectedAccountID)
+        XCTAssertFalse(plain.addingNewAccount)
+        XCTAssertEqual(reconnect.expectedAccountID, "monitor-1")
+    }
+
     private func waitUntil(
         timeout: Duration = .seconds(1),
         condition: @escaping @Sendable () async -> Bool
@@ -109,12 +145,16 @@ private actor ControllableOAuthAuthorizer: OAuthAuthorizing {
     }
 
     private let manualProvider: String?
+    private var deniedManualWrites: Int
     private var pending: [OAuthAttemptID: Pending] = [:]
     private var cancelled: Set<OAuthAttemptID> = []
 
-    init(manualProvider: String? = nil) {
+    init(manualProvider: String? = nil, deniedManualWrites: Int = 0) {
         self.manualProvider = manualProvider
+        self.deniedManualWrites = deniedManualWrites
     }
+
+    func cancelledCount() -> Int { cancelled.count }
 
     func begin(
         request: OAuthAuthorizationRequest,
@@ -141,8 +181,12 @@ private actor ControllableOAuthAuthorizer: OAuthAuthorizing {
         _ code: String,
         providerID: AccountProviderID,
         attemptID: OAuthAttemptID
-    ) -> Account {
-        Account.make(
+    ) throws -> Account {
+        if deniedManualWrites > 0 {
+            deniedManualWrites -= 1
+            throw OAuthFlowFailure.credentialStorageDenied
+        }
+        return Account.make(
             providerID: providerID,
             accountKey: "person@example.com",
             source: .quotioKeychain,

@@ -17,6 +17,8 @@ public struct AuthFileDescriptor: Identifiable, Hashable, Sendable {
     public let source: AuthFileSource
     public let filename: String
     public var legacyIdentityKeys: [String]
+    /// The Kiro profile ARN recorded in the file, which names one Kiro profile.
+    public var kiroProfileARN: String?
 
     public init(
         id: String,
@@ -28,7 +30,8 @@ public struct AuthFileDescriptor: Identifiable, Hashable, Sendable {
         filePath: String,
         source: AuthFileSource,
         filename: String,
-        legacyIdentityKeys: [String] = []
+        legacyIdentityKeys: [String] = [],
+        kiroProfileARN: String? = nil
     ) {
         self.id = id
         self.providerID = providerID
@@ -40,6 +43,7 @@ public struct AuthFileDescriptor: Identifiable, Hashable, Sendable {
         self.source = source
         self.filename = filename
         self.legacyIdentityKeys = legacyIdentityKeys
+        self.kiroProfileARN = kiroProfileARN
     }
 
     public var isExpired: Bool {
@@ -58,7 +62,11 @@ public struct AuthFileDescriptor: Identifiable, Hashable, Sendable {
             return login?.nilIfBlank
                 ?? filename.removing(prefix: "github-copilot-").removing(suffix: ".json")
         case "kiro":
-            return email?.nilIfBlank ?? filename.removing(suffix: ".json")
+            return KiroAccountIdentity.canonicalKey(
+                email: email,
+                profileARN: kiroProfileARN,
+                filename: filename
+            )
         default:
             return email?.nilIfBlank ?? filename
         }

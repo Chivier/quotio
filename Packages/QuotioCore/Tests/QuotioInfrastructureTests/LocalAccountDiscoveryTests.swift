@@ -61,7 +61,8 @@ final class LocalAccountDiscoveryTests: XCTestCase {
         )
 
         XCTAssertEqual(canonical.accountKey, "same@example.com-pro")
-        XCTAssertEqual(distinct.accountKey, "same@example.com")
+        // Without a unique legacy file the workspace qualifies the email.
+        XCTAssertEqual(distinct.accountKey, "same@example.com • 703039e8")
     }
 
     private func descriptor(

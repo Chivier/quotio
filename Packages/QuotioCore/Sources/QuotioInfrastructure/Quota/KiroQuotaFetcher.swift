@@ -14,12 +14,15 @@ public struct KiroQuotaCredential: Equatable, Sendable {
   public var profileARN: String?
   public var region: String?
   public let accountKey: String
+  /// Keys earlier builds used for this credential; see ``KiroAccountIdentity``.
+  public let aliases: Set<String>
   public let filePath: String?
 
   public init(
     accessToken: String, refreshToken: String? = nil, expiresAt: Date? = nil,
     clientID: String? = nil, clientSecret: String? = nil, authMethod: String = "IdC",
-    profileARN: String? = nil, region: String? = nil, accountKey: String, filePath: String? = nil
+    profileARN: String? = nil, region: String? = nil, accountKey: String,
+    aliases: Set<String> = [], filePath: String? = nil
   ) {
     self.accessToken = accessToken
     self.refreshToken = refreshToken
@@ -30,6 +33,7 @@ public struct KiroQuotaCredential: Equatable, Sendable {
     self.profileARN = profileARN
     self.region = region
     self.accountKey = accountKey
+    self.aliases = aliases
     self.filePath = filePath
   }
 }
@@ -95,9 +99,13 @@ public actor LocalKiroQuotaCredentialSource: KiroQuotaCredentialSourcing {
       let access = string(object, "access_token", "accessToken")
     else { return nil }
     let profile = string(object, "profile_arn", "profileArn")
-    let filename = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
-    let providerKey = string(object, "provider").map { "Kiro (\($0))" }
-    let key = string(object, "email") ?? providerKey ?? profile ?? filename
+    let filename = URL(fileURLWithPath: path).lastPathComponent
+    let email = string(object, "email")
+    let key = KiroAccountIdentity.canonicalKey(email: email, profileARN: profile, filename: filename)
+    let aliases = KiroAccountIdentity.legacyKeys(
+      email: email, profileARN: profile, filename: filename,
+      loginProvider: string(object, "provider"),
+      isNativeCredential: path.contains("/.aws/sso/cache/"))
     return .init(
       accessToken: access, refreshToken: string(object, "refresh_token", "refreshToken"),
       expiresAt: Self.date(
@@ -105,7 +113,7 @@ public actor LocalKiroQuotaCredentialSource: KiroQuotaCredentialSourcing {
         number: object["expired"] as? NSNumber), clientID: string(object, "client_id", "clientId"),
       clientSecret: string(object, "client_secret", "clientSecret"),
       authMethod: string(object, "auth_method", "authMethod") ?? "IdC", profileARN: profile,
-      region: string(object, "region"), accountKey: key, filePath: path)
+      region: string(object, "region"), accountKey: key, aliases: aliases, filePath: path)
   }
 
   private func string(_ object: [String: Any], _ keys: String...) -> String? {
@@ -164,18 +172,22 @@ public actor KiroQuotaFetcher: QuotaFetching {
 
   public func fetch(_ request: QuotaFetchRequest) async throws -> QuotaProviderOutput {
     var candidates: [(KiroQuotaCredential, Account?)] = []
+    let excluded = request.mode == .monitor ? await metadata.excludedQuotaAccountIDs() : []
     if request.mode == .monitor {
-      let disabled = await metadata.disabledAccountIDs()
       for account in await vault.accounts()
-      where account.providerID.rawValue == provider.rawValue && !disabled.contains(account.id) {
+      where account.providerID.rawValue == provider.rawValue && !account.isDisabled
+        && !excluded.contains(account.id)
+      {
         guard let stored = await vault.credential(for: account.id), !stored.accessToken.isEmpty else {
           continue
         }
         candidates.append((Self.from(stored, key: account.accountKey), account))
       }
     }
-    candidates += await credentials.credentials().map { ($0, nil) }
-    let applicable = candidates.filter { Self.includes($0.0.accountKey, request.scope) }
+    candidates += await credentials.credentials().compactMap { credential in
+      excluded.contains(Self.accountID(for: credential.accountKey)) ? nil : (credential, nil)
+    }
+    let applicable = candidates.filter { Self.includes($0.0, request.scope) }
     var quotas: [String: ProviderQuota] = [:]
     var seen = Set<String>()
     for (credential, account) in applicable where seen.insert(credential.accountKey).inserted {
@@ -186,8 +198,34 @@ public actor KiroQuotaFetcher: QuotaFetching {
     return .init(
       quotas: quotas,
       credentialAvailability: applicable.isEmpty ? .missing : .present,
-      credentialAccountKeys: Set(applicable.map { $0.0.accountKey })
+      credentialAccountKeys: Set(applicable.map { $0.0.accountKey }),
+      accountAliases: Self.accountAliases(candidates.map(\.0))
     )
+  }
+
+  /// Old keys that name exactly one current credential, so cached rows migrate onto
+  /// the canonical key. A label shared by several profiles proves nothing.
+  nonisolated static func accountAliases(_ credentials: [KiroQuotaCredential]) -> [String: String] {
+    let currentKeys = Set(credentials.map(\.accountKey))
+    var targets: [String: Set<String>] = [:]
+    for credential in credentials {
+      for alias in credential.aliases where alias != credential.accountKey {
+        targets[alias, default: []].insert(credential.accountKey)
+      }
+    }
+    return targets.reduce(into: [:]) { result, entry in
+      guard entry.value.count == 1, let key = entry.value.first,
+        !currentKeys.contains(entry.key)
+      else { return }
+      result[entry.key] = key
+    }
+  }
+
+  private nonisolated static func accountID(for accountKey: String) -> String {
+    AccountIdentity.make(
+      providerID: AccountProviderID(rawValue: QuotaProvider.kiro.rawValue),
+      accountKey: accountKey
+    ).id
   }
 
   public func refreshAllLocalTokensIfNeeded() async -> Int {
@@ -236,13 +274,12 @@ public actor KiroQuotaFetcher: QuotaFetching {
     var credential = original
     var refreshed = false
     if credential.expiresAt.map({ $0.timeIntervalSince(now()) < 300 }) == true {
-      guard let value = await refresh(credential, account: account) else {
-        return ProviderQuota(
-          lastUpdated: now(), isForbidden: true, planType: "Expired",
-          tokenExpiresAt: credential.expiresAt)
-      }
-      credential = value
+      // A failed refresh is not proof of invalid authentication; the usage endpoint
+      // decides with the existing token.
       refreshed = true
+      if let value = await refresh(credential, account: account) {
+        credential = value
+      }
     }
     var response = await usage(credential)
     if (response.status == 401 || response.status == 403) && !refreshed {
@@ -397,11 +434,14 @@ public actor KiroQuotaFetcher: QuotaFetching {
     if let value = value.region { result["region"] = value }
     return result
   }
-  private nonisolated static func includes(_ key: String, _ scope: QuotaFetchScope) -> Bool {
+  private nonisolated static func includes(
+    _ credential: KiroQuotaCredential, _ scope: QuotaFetchScope
+  ) -> Bool {
+    let keys = credential.aliases.union([credential.accountKey])
     switch scope {
-    case .provider: true
-    case .account(let value): key == value
-    case .importedAccounts(let values): values.contains(key)
+    case .provider: return true
+    case .account(let value): return keys.contains(value)
+    case .importedAccounts(let values): return !keys.isDisjoint(with: values)
     }
   }
   private nonisolated static func resolvedRegion(
@@ -440,9 +480,10 @@ public actor KiroQuotaFetcher: QuotaFetching {
     var metrics: [QuotaMetric] = []
     for item in response.usageBreakdownList ?? [] {
       let name = item.resourceType ?? item.displayName ?? "kiro-standard"
-      if item.freeTrialInfo?.freeTrialStatus == "ACTIVE", let trial = item.freeTrialInfo {
+      if item.freeTrialInfo?.freeTrialStatus == "ACTIVE", let trial = item.freeTrialInfo,
+        let limit = trial.usageLimitWithPrecision ?? trial.usageLimit, limit.isFinite, limit > 0
+      {
         let used = trial.currentUsageWithPrecision ?? trial.currentUsage ?? 0
-        let limit = trial.usageLimitWithPrecision ?? trial.usageLimit ?? 0
         let reset =
           trial.freeTrialExpiry.map { Date(timeIntervalSince1970: $0).ISO8601Format() }
           ?? commonReset
@@ -453,7 +494,7 @@ public actor KiroQuotaFetcher: QuotaFetching {
       }
       let used = item.currentUsageWithPrecision ?? item.currentUsage ?? 0
       let limit = item.usageLimitWithPrecision ?? item.usageLimit ?? 0
-      if limit > 0 {
+      if limit.isFinite, limit > 0 {
         metrics.append(
           .init(
             name: "kiro-\(name)", percentage: percent(used, limit),
@@ -462,9 +503,8 @@ public actor KiroQuotaFetcher: QuotaFetching {
             remaining: Int(max(0, limit - used))))
       }
     }
-    if metrics.isEmpty {
-      metrics.append(.init(name: "kiro-standard", percentage: 100, resetTime: commonReset))
-    }
+    // No limits means no quota to show; a fabricated 100% row would read as an
+    // untouched allowance.
     return .init(
       models: metrics, lastUpdated: now,
       planType: response.subscriptionInfo?.subscriptionTitle ?? "Standard", tokenExpiresAt: expiry)

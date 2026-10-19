@@ -512,7 +512,7 @@ struct QuotaOAuthState: Identifiable, Equatable {
             providerID = id
             prompt = nil
             status = .error
-            error = failure.displayMessage
+            error = failure.displayMessage(for: id)
         }
         guard let provider = QuotaProvider(rawValue: providerID.rawValue) else { return nil }
         self.provider = provider
@@ -533,7 +533,7 @@ struct QuotaOAuthState: Identifiable, Equatable {
 
 private extension OAuthFlowFailure {
     @MainActor
-    var displayMessage: String {
+    func displayMessage(for providerID: AccountProviderID) -> String {
         switch self {
         case .unsupportedProvider:
             "Quotio-managed login is not available for this provider."
@@ -549,6 +549,14 @@ private extension OAuthFlowFailure {
             status.localizedText
         case .provider(let message):
             message
+        case .accountMismatch:
+            providerID.rawValue == QuotaProvider.claude.rawValue
+                ? "oauth.claude.accountMismatch".localized()
+                : "oauth.codex.accountMismatch".localized()
+        case .accountAlreadyConnected:
+            "oauth.codex.alreadyConnected".localized()
+        case .credentialStorageDenied:
+            "monitor.error.keychainAuthorizationRequired".localized()
         case .unknown:
             "The OAuth request failed. Please try again."
         }
