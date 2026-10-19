@@ -294,11 +294,13 @@ public final class QuotaFeatureController {
         // A Quotio-owned API key does not expire because a quota endpoint is briefly
         // unavailable; only an explicit 401/403 proves the credential needs attention.
         let hasStoredAPIKey = provider.usesAPIKeyAuth && account.source == .quotioKeychain
-        if current?.isForbidden == true {
-            return ("error", "monitor.status.authenticationRequired".localized())
-        }
+        // An unreadable item is reported first: fetchers mark such an account as
+        // forbidden, but signing in again is not needed, only restoring access.
         if accounts.isCredentialUnreadable(account) {
             return ("error", "monitor.status.credentialUnreadable".localized())
+        }
+        if current?.isForbidden == true {
+            return ("error", "monitor.status.authenticationRequired".localized())
         }
         if let issue = quota.state.accountIssues[accountID], updated == nil || updated! <= issue.occurredAt {
             return (hasStoredAPIKey ? "ready" : "outdated", message(for: issue))
