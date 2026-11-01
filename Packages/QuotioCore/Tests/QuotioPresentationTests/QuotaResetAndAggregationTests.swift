@@ -54,8 +54,10 @@ final class QuotaResetAndAggregationTests: XCTestCase {
                 presentation: .amount(value: 5, unit: .usd, semantics: .balance)
             ),
         ]
-        let pair = try XCTUnwrap(MenuBarQuotaPair.resolve(for: .claude, from: models, aggregationMode: .average))
+        XCTAssertNil(MenuBarQuotaPair.resolve(for: .claude, from: models, aggregationMode: .average))
+        let withSession = models + [QuotaMetric(name: "five-hour-session", percentage: 60, resetTime: "")]
+        let pair = try XCTUnwrap(MenuBarQuotaPair.resolve(for: .claude, from: withSession, aggregationMode: .average))
         XCTAssertEqual(pair.bottom.remainingPercentage, 50)
-        XCTAssertEqual(pair.top.remainingPercentage, -1)
+        XCTAssertEqual(pair.top.remainingPercentage, 60)
     }
 }

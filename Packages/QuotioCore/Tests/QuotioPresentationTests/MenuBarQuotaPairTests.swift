@@ -5,6 +5,23 @@ import XCTest
 @testable import QuotioPresentation
 
 final class MenuBarQuotaPairTests: XCTestCase {
+    func testClaudeWithoutSessionDoesNotInventAFiveHourRow() {
+        let models = [QuotaMetric(name: "seven-day-weekly", percentage: 42, resetTime: "")]
+
+        XCTAssertNil(MenuBarQuotaPair.resolve(for: .claude, from: models))
+    }
+
+    func testClaudeIncludesNewModelWeeklyLimitsInThePair() throws {
+        let models = [
+            QuotaMetric(name: "five-hour-session", percentage: 81, resetTime: ""),
+            QuotaMetric(name: "seven-day-weekly", percentage: 63, resetTime: ""),
+            QuotaMetric(name: "seven-day-model-fable", percentage: 12, resetTime: ""),
+        ]
+
+        let pair = try XCTUnwrap(MenuBarQuotaPair.resolve(for: .claude, from: models))
+        XCTAssertEqual(pair.bottom.remainingPercentage, 12)
+    }
+
     func testClaudeUsesFiveHourAndLowestWeeklyLimit() throws {
         let models = [
             QuotaMetric(name: "five-hour-session", percentage: 81, resetTime: ""),

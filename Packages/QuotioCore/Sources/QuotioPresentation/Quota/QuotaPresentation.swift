@@ -190,6 +190,12 @@ public extension QuotaMetric {
         case "seven-day-weekly", "weekly-usage": "Weekly"
         case "seven-day-sonnet", "sonnet-only": "Sonnet"
         case "seven-day-opus": "Opus"
+        case "seven-day-oauth-apps": "quota.metric.oauthAppsWeekly".localizedStatic()
+        case "seven-day-routines": "quota.metric.routinesWeekly".localizedStatic()
+        case let value where value.hasPrefix("seven-day-model-"):
+            String(format: "quota.metric.modelWeekly".localizedStatic(),
+                value.dropFirst("seven-day-model-".count).split(separator: "-")
+                    .map { $0.prefix(1).uppercased() + $0.dropFirst() }.joined(separator: " "))
         case "extra-usage": "Extra"
         case "gemini-quota": "Gemini"
         case "premium-fast": "Fast Requests"

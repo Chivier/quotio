@@ -19943,6 +19943,9 @@
         "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "每日" } }
       }
     },
+    "quota.metric.oauthAppsWeekly" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "OAuth apps weekly"}}, "fr": {"stringUnit": {"state": "translated", "value": "Apps OAuth par semaine"}}, "vi": {"stringUnit": {"state": "translated", "value": "Ứng dụng OAuth hàng tuần"}}, "zh-Hans": {"stringUnit": {"state": "translated", "value": "OAuth 应用周额度"}}}},
+    "quota.metric.routinesWeekly" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "Routines weekly"}}, "fr": {"stringUnit": {"state": "translated", "value": "Routines par semaine"}}, "vi": {"stringUnit": {"state": "translated", "value": "Quy trình hàng tuần"}}, "zh-Hans": {"stringUnit": {"state": "translated", "value": "例行任务周额度"}}}},
+    "quota.metric.modelWeekly" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "%@ weekly"}}, "fr": {"stringUnit": {"state": "translated", "value": "%@ par semaine"}}, "vi": {"stringUnit": {"state": "translated", "value": "%@ hàng tuần"}}, "zh-Hans": {"stringUnit": {"state": "translated", "value": "%@ 周额度"}}}},
     "quota.metric.fiveHour" : {
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "5-hour" } },

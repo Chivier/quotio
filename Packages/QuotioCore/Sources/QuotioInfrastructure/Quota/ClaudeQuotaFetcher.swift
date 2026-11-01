@@ -491,14 +491,42 @@ public actor ClaudeQuotaFetcher: QuotaFetching {
       ("seven_day", "seven-day-weekly"),
       ("seven_day_sonnet", "seven-day-sonnet"),
       ("seven_day_opus", "seven-day-opus"),
+      ("seven_day_oauth_apps", "seven-day-oauth-apps"),
     ]
-    var metrics = definitions.compactMap { source, name -> QuotaMetric? in
-      guard let value = json[source] as? [String: Any],
-        let used = (value["utilization"] as? NSNumber)?.doubleValue
+    func metric(_ value: Any?, name: String, percentKey: String = "utilization") -> QuotaMetric? {
+      guard let value = value as? [String: Any],
+        let used = (value[percentKey] as? NSNumber)?.doubleValue, used.isFinite
       else { return nil }
       return QuotaMetric(
         name: name, percentage: max(0, min(100, 100 - used)),
         resetTime: value["resets_at"] as? String ?? "")
+    }
+    var metrics = definitions.compactMap { source, name in metric(json[source], name: name) }
+    // These aliases describe the same allowance; take the first usable window.
+    for key in ["seven_day_routines", "seven_day_claude_routines", "claude_routines",
+                "routines", "routine", "seven_day_cowork", "cowork"] {
+      if let window = metric(json[key], name: "seven-day-routines") {
+        metrics.append(window)
+        break
+      }
+    }
+    var names = Set(metrics.map(\.name))
+    for limit in json["limits"] as? [[String: Any]] ?? [] {
+      guard limit["kind"] as? String == "weekly_scoped",
+        limit["is_active"] as? Bool != false,
+        let scope = limit["scope"] as? [String: Any],
+        let model = scope["model"] as? [String: Any],
+        let displayName = model["display_name"] as? String,
+        displayName.count <= 128,
+        !displayName.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })
+      else { continue }
+      let slug = displayName.lowercased().map { $0.isLetter || $0.isNumber ? String($0) : "-" }
+        .joined().split(separator: "-").joined(separator: "-")
+      guard !slug.isEmpty,
+        let window = metric(limit, name: "seven-day-model-" + slug, percentKey: "percent"),
+        names.insert(window.name).inserted
+      else { continue }
+      metrics.append(window)
     }
     if let extra = json["extra_usage"] as? [String: Any], extra["is_enabled"] as? Bool == true,
       let usedPercent = (extra["utilization"] as? NSNumber)?.doubleValue

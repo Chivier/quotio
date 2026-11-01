@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Hide Claude's five-hour menu bar row when the account only reports weekly limits, and include scoped model, OAuth app, and routine weekly allowances.
+- Preserve both windows for new Codex model limits, keep valid windows when a sibling is malformed, and use relative reset times when no reset timestamp is supplied.
+
 ## [0.33.1] - 2026-10-03
 
 ### Fixed

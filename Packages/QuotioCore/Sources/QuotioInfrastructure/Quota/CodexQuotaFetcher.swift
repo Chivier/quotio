@@ -469,23 +469,26 @@ public actor CodexQuotaFetcher: QuotaFetching {
     let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     var metrics: [QuotaMetric] = []
     var kinds = Set<String>()
+    func append(_ window: Window, name: String) {
+      guard kinds.insert(name).inserted else { return }
+      let reset = window.resetAt.map { Date(timeIntervalSince1970: TimeInterval($0)) }
+        ?? window.resetAfter.map { now.addingTimeInterval(TimeInterval($0)) }
+      metrics.append(.init(
+        name: name, percentage: 100 - window.usedPercent,
+        resetTime: reset.map { ISO8601DateFormatter().string(from: $0) } ?? ""))
+    }
+    func name(for window: Window, session: String, weekly: String, fallback: String) -> String {
+      window.windowSeconds.map {
+        $0 >= 518_400 ? weekly : ($0 <= 86_400 ? session : fallback)
+      } ?? (window.resetAfter.map { $0 > 86_400 ? weekly : fallback } ?? fallback)
+    }
     for (window, fallback) in [
       (response.rateLimit?.primary, "codex-session"),
       (response.rateLimit?.secondary, "codex-weekly"),
     ] {
       guard let window else { continue }
-      let name =
-        window.windowSeconds.map {
-          $0 >= 518_400 ? "codex-weekly" : ($0 <= 86_400 ? "codex-session" : fallback)
-        }
-        ?? (window.resetAfter.map { $0 > 86_400 ? "codex-weekly" : fallback } ?? fallback)
-      guard kinds.insert(name).inserted else { continue }
-      metrics.append(
-        .init(
-          name: name, percentage: Double(100 - window.usedPercent),
-          resetTime: window.resetAt.map {
-            ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: TimeInterval($0)))
-          } ?? ""))
+      append(window, name: name(
+        for: window, session: "codex-session", weekly: "codex-weekly", fallback: fallback))
     }
     for limit in response.additional ?? [] {
       let spark = [limit.name, limit.feature].compactMap { $0?.lowercased() }.contains {
@@ -497,30 +500,23 @@ public actor CodexQuotaFetcher: QuotaFetching {
           (limit.rateLimit?.secondary, "codex-spark-weekly"),
         ] {
           guard let window else { continue }
-          let name =
-            window.windowSeconds.map { $0 >= 518_400 ? "codex-spark-weekly" : "codex-spark" }
-            ?? fallback
-          guard kinds.insert(name).inserted else { continue }
-          metrics.append(
-            .init(
-              name: name, percentage: Double(100 - window.usedPercent),
-              resetTime: window.resetAt.map {
-                ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: TimeInterval($0)))
-              } ?? ""))
+          append(window, name: name(
+            for: window, session: "codex-spark", weekly: "codex-spark-weekly", fallback: fallback))
         }
-      } else if let source = nonEmpty(limit.feature) ?? nonEmpty(limit.name),
-        let window = limit.rateLimit?.primary ?? limit.rateLimit?.secondary
-      {
+      } else if let source = nonEmpty(limit.feature) ?? nonEmpty(limit.name) {
         let slug = source.lowercased().map { $0.isLetter || $0.isNumber ? String($0) : "-" }
           .joined().split(separator: "-").joined(separator: "-")
-        let name = "codex-" + slug
-        guard kinds.insert(name).inserted else { continue }
-        metrics.append(
-          .init(
-            name: name, percentage: Double(100 - window.usedPercent),
-            resetTime: window.resetAt.map {
-              ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: TimeInterval($0)))
-            } ?? ""))
+        guard !slug.isEmpty else { continue }
+        let sessionName = "codex-" + slug
+        let weeklyName = sessionName + "-weekly"
+        for (window, fallback) in [
+          (limit.rateLimit?.primary, sessionName),
+          (limit.rateLimit?.secondary, weeklyName),
+        ] {
+          guard let window else { continue }
+          append(window, name: name(
+            for: window, session: sessionName, weekly: weeklyName, fallback: fallback))
+        }
       }
     }
     return ProviderQuota(
@@ -822,6 +818,13 @@ public actor CodexQuotaFetcher: QuotaFetching {
       case primary = "primary_window"
       case secondary = "secondary_window"
     }
+
+    init(from decoder: Decoder) throws {
+      let values = try decoder.container(keyedBy: CodingKeys.self)
+      reached = try? values.decode(Bool.self, forKey: .reached)
+      primary = try? values.decode(Window.self, forKey: .primary)
+      secondary = try? values.decode(Window.self, forKey: .secondary)
+    }
   }
   private struct Additional: Decodable {
     let name: String?
@@ -841,7 +844,7 @@ public actor CodexQuotaFetcher: QuotaFetching {
     }
   }
   private struct Window: Decodable {
-    let usedPercent: Int
+    let usedPercent: Double
     let resetAt: Int?
     let resetAfter: Int?
     let windowSeconds: Int?
@@ -853,7 +856,7 @@ public actor CodexQuotaFetcher: QuotaFetching {
     }
     init(from decoder: Decoder) throws {
       let values = try decoder.container(keyedBy: CodingKeys.self)
-      usedPercent = max(0, min(100, try Self.number(values, .usedPercent)))
+      usedPercent = max(0, min(100, try Self.numeric(values, .usedPercent)))
       resetAt = try? Self.number(values, .resetAt)
       resetAfter = try? Self.number(values, .resetAfter)
       windowSeconds = try? Self.number(values, .windowSeconds)
@@ -861,11 +864,16 @@ public actor CodexQuotaFetcher: QuotaFetching {
     private static func number(_ values: KeyedDecodingContainer<CodingKeys>, _ key: CodingKeys)
       throws -> Int
     {
-      if let value = try? values.decode(Int.self, forKey: key) { return value }
-      if let value = try? values.decode(Double.self, forKey: key) { return Int(value.rounded()) }
-      if let value = try? values.decode(String.self, forKey: key), let number = Double(value) {
-        return Int(number.rounded())
-      }
+      if let value = Int(exactly: try numeric(values, key).rounded()) { return value }
+      throw DecodingError.dataCorruptedError(
+        forKey: key, in: values, debugDescription: "Expected a bounded number")
+    }
+    private static func numeric(_ values: KeyedDecodingContainer<CodingKeys>, _ key: CodingKeys)
+      throws -> Double
+    {
+      let value = (try? values.decode(Double.self, forKey: key))
+        ?? (try? values.decode(String.self, forKey: key)).flatMap(Double.init)
+      if let value, value.isFinite { return value }
       throw DecodingError.dataCorruptedError(
         forKey: key, in: values, debugDescription: "Expected number")
     }

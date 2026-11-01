@@ -6,6 +6,87 @@ import XCTest
 @testable import QuotioInfrastructure
 
 final class ClaudeCodexQuotaFetcherTests: XCTestCase {
+  func testClaudeWeeklyOnlyRefreshRemovesTheRetiredSession() async throws {
+    let session = RecordingQuotaSession(responses: [
+      (#"{"five_hour":{"utilization":25},"seven_day":{"utilization":40}}"#, 200),
+      (#"{"five_hour":null,"seven_day":{"utilization":45}}"#, 200),
+    ])
+    let fetcher = ClaudeQuotaFetcher(
+      credentials: ClaudeLoader([.init(accountKey: "Claude", accessToken: "token")]),
+      session: session)
+
+    _ = try await fetcher.fetch(.init(provider: .claude, mode: .monitor))
+    let output = try await fetcher.fetch(.init(provider: .claude, mode: .monitor, force: true))
+
+    XCTAssertEqual(output.quotas["Claude"]?.models.map(\.name), ["seven-day-weekly"])
+    XCTAssertEqual(output.quotas["Claude"]?.models.first?.percentage, 55)
+  }
+
+  func testClaudeMapsScopedWeeklyLimitsWithoutASession() throws {
+    let quota = try XCTUnwrap(ClaudeQuotaFetcher.mapUsage(Data(#"""
+      {
+        "seven_day":{"utilization":20},
+        "seven_day_oauth_apps":{"utilization":30},
+        "seven_day_routines":{"utilization":40},
+        "limits":[
+          {"kind":"weekly_scoped","is_active":true,"percent":65,
+           "scope":{"model":{"display_name":"Fable"}},"resets_at":"2030-01-01T00:00:00Z"},
+          {"kind":"weekly_scoped","is_active":false,"percent":99,
+           "scope":{"model":{"display_name":"Inactive"}}}
+        ]
+      }
+      """#.utf8)))
+
+    XCTAssertEqual(quota.models.map(\.name), [
+      "seven-day-weekly", "seven-day-oauth-apps", "seven-day-routines", "seven-day-model-fable",
+    ])
+    XCTAssertEqual(quota.models.map(\.percentage), [80, 70, 60, 35])
+    XCTAssertEqual(quota.models.last?.resetTime, "2030-01-01T00:00:00Z")
+  }
+
+  func testClaudeStillShowsAnUnusedSessionWhenTheAPIReportsIt() throws {
+    let quota = try XCTUnwrap(ClaudeQuotaFetcher.mapUsage(Data(
+      #"{"five_hour":{"utilization":0},"seven_day":{"utilization":25}}"#.utf8)))
+
+    XCTAssertEqual(quota.models.map(\.name), ["five-hour-session", "seven-day-weekly"])
+    XCTAssertEqual(quota.models.map(\.percentage), [100, 75])
+  }
+
+  func testCodexPreservesBothWindowsForNewModelLimits() throws {
+    let quota = try CodexQuotaFetcher.mapUsage(Data(#"""
+      {"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":20,"limit_window_seconds":604800}},
+       "additional_rate_limits":[{"limit_name":"GPT New","rate_limit":{
+         "primary_window":{"used_percent":30,"limit_window_seconds":18000,"reset_after_seconds":3600},
+         "secondary_window":{"used_percent":70,"limit_window_seconds":604800}}}]}
+      """#.utf8))
+
+    XCTAssertEqual(quota.models.map(\.name), ["codex-weekly", "codex-gpt-new", "codex-gpt-new-weekly"])
+    XCTAssertEqual(quota.models.map(\.percentage), [80, 70, 30])
+    XCTAssertFalse(quota.models[1].resetTime.isEmpty)
+  }
+
+  func testCodexMalformedSessionDoesNotDiscardValidWeeklyWindow() throws {
+    let quota = try CodexQuotaFetcher.mapUsage(Data(#"""
+      {"rate_limit":{"primary_window":{"used_percent":"invalid"},
+       "secondary_window":{"used_percent":35,"limit_window_seconds":604800}}}
+      """#.utf8))
+
+    XCTAssertEqual(quota.models.map(\.name), ["codex-weekly"])
+    XCTAssertEqual(quota.models.first?.percentage, 65)
+  }
+
+  func testCodexNumericStringsPreserveFractionsAndRejectNonfiniteWindows() throws {
+    let now = Date(timeIntervalSince1970: 1_000)
+    let quota = try CodexQuotaFetcher.mapUsage(Data(#"""
+      {"rate_limit":{"primary_window":{"used_percent":"12.5","reset_at":"1e100","reset_after_seconds":60},
+       "secondary_window":{"used_percent":"NaN","limit_window_seconds":604800}}}
+      """#.utf8), now: now)
+
+    XCTAssertEqual(quota.models.map(\.name), ["codex-session"])
+    XCTAssertEqual(quota.models.first?.percentage, 87.5)
+    XCTAssertEqual(quota.models.first?.resetTime, "1970-01-01T00:17:40Z")
+  }
+
   func testClaudeMapsStableMetricsAndUsesSameRequestInBothModes() async throws {
     let body =
       #"{"five_hour":{"utilization":25,"resets_at":"2030-01-01T00:00:00Z"},"seven_day":{"utilization":70,"resets_at":null},"extra_usage":{"is_enabled":true,"monthly_limit":200,"used_credits":50,"utilization":25}}"#

@@ -205,8 +205,9 @@ public struct MenuBarQuotaPair: Equatable, Sendable {
                 aggregationMode: aggregationMode,
                 topNames: ["five-hour-session"],
                 topLabelKey: "quota.metric.fiveHour",
-                bottomNames: ["seven-day-weekly", "seven-day-sonnet", "seven-day-opus"],
-                bottomLabelKey: "quota.metric.weekly"
+                bottomNames: Set(models.map(\.name).filter { $0.hasPrefix("seven-day-") }),
+                bottomLabelKey: "quota.metric.weekly",
+                requiresBoth: true
             )
         case .codex:
             let sessionNames: Set<String> = ["codex-session", "codex-spark"]
